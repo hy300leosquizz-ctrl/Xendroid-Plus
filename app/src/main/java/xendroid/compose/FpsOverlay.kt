@@ -356,8 +356,9 @@ fun FpsOverlay(
             if (generatedNs - previousGeneratedNs >= 1_000_000_000L) {
                 val state = runCatching { session.presentationState() }.getOrNull()
                 val active = state != null && state.requested && state.state == 2
-                fgFps = if (active && previousGenerated >= 0 && state!!.generated >= previousGenerated)
-                    currentFps + (state.generated - previousGenerated) * 1e9 / (generatedNs - previousGeneratedNs) else null
+                fgFps = if (session.zeroFgMainSurfaceActive()) session.outputFps().takeIf { it > 0 }
+                    else if (active && previousGenerated >= 0 && state!!.generated >= previousGenerated)
+                        currentFps + (state.generated - previousGenerated) * 1e9 / (generatedNs - previousGeneratedNs) else null
                 previousGenerated = if (active) state!!.generated else -1L
                 previousGeneratedNs = generatedNs
             }

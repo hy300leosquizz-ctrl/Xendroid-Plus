@@ -4,6 +4,7 @@ package xendroid.compose.settings
  *  [Setting.desc] by the schema helpers. */
 object SettingDescriptions {
     val byName: Map<String, String> = mapOf(
+        "zerofg_mode" to "Zero generates the halfway frame with the quality engine; ReallyZero uses the lighter engine. Off preserves normal presentation. You can also switch these modes while playing from the Frame generation menu. Only one frame-generation engine runs at a time. Requires a Vulkan 1.3 device with the required features enabled",
         // Redesign: the core's own cvars the app now shows; texts follow the core's descriptions.
         "internal_display_resolution_x" to "Width reported to the game when the display mode is Custom. The core accepts 1 to 1920",
         "internal_display_resolution_y" to "Height reported to the game when the display mode is Custom. The core accepts 1 to 1080",
@@ -123,7 +124,7 @@ object SettingDescriptions {
         "occlusion_query" to "How visibility queries (lens flares, culling, auto-exposure) are answered: faked, async, or exact",
         "postprocess_antialiasing" to "Apply FXAA post-process anti-aliasing to smooth edges; recommended when CAS or FSR is active",
         "postprocess_dither" to "Dither the final image down to 8-bit color for smoother gradients; disable on true 10-bit displays",
-        "postprocess_scaling_and_sharpening" to "Upscaling filter for the final image, from plain bilinear to AMD CAS sharpening, FSR upscaling, Qualcomm SGSR (experimental), Lanczos (sharp edges without halos) or a CRT look (scanlines and darker corners); the cost of SGSR, Lanczos and CRT on a phone is not measured yet",
+        "postprocess_scaling_and_sharpening" to "Upscaling filter for the final image, from plain bilinear to AMD CAS sharpening, FSR upscaling, Qualcomm SGSR (experimental), SGSR1 Edge Direction, Lanczos (sharp edges without halos) or a CRT look (scanlines and darker corners); the cost of these spatial filters on a phone depends on the selected variant",
         "present_letterbox" to "Keep the game's aspect ratio by adding black bars instead of stretching to fill the screen",
         "present_render_pass_clear" to "Clear the whole screen via the render pass instead of separate clears of the letterbox bars",
         "protect_on_release" to "Locks freed memory so any later access faults, catching use-after-free bugs",

@@ -13,6 +13,8 @@
 
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 
+#include "xenia/ui/vulkan/zerofg_config.h"
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -1031,6 +1033,14 @@ bool VulkanCommandProcessor::SetupContext() {
     XELOGE("Failed to initialize base command processor context");
     return false;
   }
+
+  // Keep the optional guest pacing ready for an in-game Off -> On switch.
+  // The live flag, not the boot-time selector, gates every pacing action.
+  guest_fps_limit_ns_ = cvars::zerofg_fps_limit
+                            ? 1000000000ull / cvars::zerofg_fps_limit
+                            : 0;
+  guest_vblank_pull_enabled_ = cvars::zerofg_guest_vblank_pull;
+  guest_pacing_live_ = &xe::ui::vulkan::ZeroFGGuestPacingLive();
 
   // Check if debug markers should be enabled (CVAR or RenderDoc detection).
   UpdateDebugMarkersEnabled();
