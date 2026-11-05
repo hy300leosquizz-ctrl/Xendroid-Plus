@@ -1,0 +1,292 @@
+#version 460
+#ifdef ZFG_DIRT_LABEL_HALF
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+#ifdef ZFG_DIRT_QCOM_BOX
+#extension GL_QCOM_image_processing : require
+#endif
+#extension GL_GOOGLE_include_directive : require
+#include "dirt_box.glsl"
+// RC4 dirt filter, the slim form (testbed profile key dirtgpu=2). The same idea as dirt_filter.comp (blur the finished picture where D5's own decisions
+// fragment it), in a form that costs a small fraction of it: the decision labels and the mask live at one sample per B x B block, and the only
+// full-resolution work is one copy-with-blur into the output, which early-outs where the mask is zero (most of a real picture).
+//   step 0  one label per block: the hypothesis that explains the picture at the block's centre pixel (the base vector D5 would use there, or the H0 of its
+//           4 parent cells at confidence >= 0.05), flag 1 when none is within 0.06, flag 2 when one more than 1.5 px away explains it within 0.03
+//   step 1  per block: the label changes to the right and below, their density over 3 x 3 blocks, smoothstep 0.08 .. 0.25, a 3 x 3 binomial over the
+//           blocks, times 2, clamped: the mask, in an R8 image at block resolution
+//   step 2  per pixel: the mask by the hardware bilinear filter; where it is zero the picture is copied, elsewhere it is mixed with its 5 x 5 box blur (nine
+//           bilinear taps: -1.5, 0, +1.5 on each axis with weights 0.4, 0.2, 0.4)
+// D5 wrote the picture into `scratch` (not the output); this pass writes the output. The CPU reference is DirtFilter mode 8 with dirtblur=2.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(constant_id = 0) const uint ZFG_DIRT_MASK = 0u;        // 0 Compat window, 1 shared tile (same mask)
+layout(constant_id = 1) const uint ZFG_DIRT_LABEL_PREC = 0u;  // 1 half colour mean; decisions and motion stay FP32
+layout(constant_id = 2) const uint ZFG_DIRT_BOX = 5u;         // Compat box width 5 (frozen) or 9
+layout(constant_id = 3) const uint ZFG_DIRT_QCOM = 0u;        // 1 uses dedicated QCOM box descriptor (QCOM module only)
+// RC6 (2026-10-29, the owner: "LSFG applies the soft where it is needed most"): a block that no hypothesis explains (flag 1) also counts as this
+// many label changes, so a wide region where D5 only guesses (flowing water, a far wall entering at the picture's edge in a fast swing) is blurred
+// in its interior too, not only at its border. 0 = the frozen RC4 rule.
+layout(constant_id = 4) const uint ZFG_DIRT_UNEXP = 0u;
+#ifdef ZFG_DIRT_ALT
+// RC6 (2026-10-29): where the mask is up, the picture is mixed with the RC5 dense flow's own middle picture (soft where it fails, like the
+// owner saw LSFG be) instead of its box blur. The RC5 picture is the source picture's size (the run extent may be padded beyond it).
+layout(binding = 9) uniform sampler2D alt_picture;
+#endif
+
+layout(binding = 0) uniform sampler2D source_a;
+layout(binding = 1) uniform sampler2D source_b;
+layout(std430, binding = 2) readonly buffer Field { vec4 cells[]; };  // H0 per cell: motion, confidence, confidence
+layout(binding = 3) uniform sampler2D scratch;                          // the finished picture
+layout(rgb10_a2, binding = 4) uniform writeonly image2D out_image;
+layout(std430, binding = 5) buffer Label { uvec2 label[]; };            // packHalf2x16(vector), flag
+layout(r8, binding = 6) uniform writeonly image2D mask_image;
+layout(binding = 7) uniform sampler2D mask_tex;
+#ifdef ZFG_DIRT_QCOM_BOX
+// Only textureBoxFilterQCOM may use this IMAGE_PROCESSING_BIT_QCOM sampler.
+// Keep scratch/binding3 ordinary for texelFetch, Compat blur and label decisions.
+layout(binding = 8) uniform sampler2D scratch_box;
+#endif
+
+layout(push_constant) uniform SlimPush {
+  ivec2 extent;
+  ivec2 field_extent;
+  ivec2 blocks;
+  int block;
+  int step;
+  int bypass;  // 1: copy the picture, no blur (the unfiltered reference)
+  int prot;    // dirtprot bits: 1 border rule, 2 static pixels out of the labels, 4 static pixels never blurred
+  int pad1, pad2;
+} pc;
+
+float SStep(float e0, float e1, float v) {
+  float t = clamp((v - e0) / (e1 - e0), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+bool Differ(ivec2 a, ivec2 b) {
+  uvec2 la = label[a.y * pc.blocks.x + a.x], lb = label[b.y * pc.blocks.x + b.x];
+  if (la.y == 2u || lb.y == 2u) return false;
+  if (la.y != lb.y) return true;
+  if (la.y != 0u) return false;
+  return length(unpackHalf2x16(la.x) - unpackHalf2x16(lb.x)) > 1.5;
+}
+
+// An 8x8 output tile needs changes at [-2,+9], including each change's
+// right/bottom label. Every lane loads/produces entries before each barrier,
+// including lanes outside the final partial tile. No clamped label contributes
+// unless the original change's right AND bottom neighbours both exist.
+shared uvec2 slim_labels[13 * 13];
+shared float slim_changes[12 * 12];
+shared float slim_density[10 * 10];
+
+bool DifferShared(uvec2 a, uvec2 b) {
+  if (a.y == 2u || b.y == 2u) return false;
+  if (a.y != b.y) return true;
+  if (a.y != 0u) return false;
+  return length(unpackHalf2x16(a.x) - unpackHalf2x16(b.x)) > 1.5;
+}
+
+void SharedMask(ivec2 p) {
+  const ivec2 origin = ivec2(gl_WorkGroupID.xy) * 8;
+  const int lane = int(gl_LocalInvocationIndex);
+  for (int i = lane; i < 13 * 13; i += 64) {
+    ivec2 q = clamp(origin + ivec2(i % 13, i / 13) - 2, ivec2(0), pc.blocks - 1);
+    slim_labels[i] = label[q.y * pc.blocks.x + q.x];
+  }
+  barrier();
+  for (int i = lane; i < 12 * 12; i += 64) {
+    ivec2 q = origin + ivec2(i % 12, i / 12) - 2;
+    float v = 0.0;
+    if (q.x >= 0 && q.y >= 0 && q.x + 1 < pc.blocks.x && q.y + 1 < pc.blocks.y) {
+      int at = (i / 12) * 13 + i % 12;
+      v = float(DifferShared(slim_labels[at], slim_labels[at + 1])) +
+          float(DifferShared(slim_labels[at], slim_labels[at + 13]));
+    }
+    slim_changes[i] = v;
+  }
+  barrier();
+  for (int i = lane; i < 10 * 10; i += 64) {
+    ivec2 c = clamp(origin + ivec2(i % 10, i / 10) - 1, ivec2(0), pc.blocks - 1);
+    float sum = 0.0;
+    int cnt = 0;
+    for (int dj = -1; dj <= 1; ++dj)
+      for (int dk = -1; dk <= 1; ++dk) {
+        ivec2 q = c + ivec2(dk, dj);
+        if (q.x < 0 || q.y < 0 || q.x + 1 >= pc.blocks.x || q.y + 1 >= pc.blocks.y) continue;
+        ivec2 rel = q - origin + 2;
+        sum += slim_changes[rel.y * 12 + rel.x];
+        cnt += 2;
+      }
+    slim_density[i] = cnt > 0 ? SStep(0.08, 0.25, sum / float(cnt)) : 0.0;
+  }
+  barrier();
+  if (any(greaterThanEqual(p, pc.blocks))) return;
+  const float kb[3] = float[3](0.25, 0.5, 0.25);
+  const ivec2 local = ivec2(gl_LocalInvocationID.xy);
+  float acc = 0.0;
+  for (int j = -1; j <= 1; ++j)
+    for (int k = -1; k <= 1; ++k)
+      acc += kb[j + 1] * kb[k + 1] * slim_density[(local.y + j + 1) * 10 + local.x + k + 1];
+  imageStore(mask_image, p, vec4(clamp(2.0 * acc, 0.0, 1.0), 0.0, 0.0, 0.0));
+}
+
+// A static-structure pixel (a HUD): A and B agree at it, the zero vector explains the picture there, and A has an edge at it.
+bool StaticPx(ivec2 p, vec3 o) {
+  vec3 a = texelFetch(source_a, p, 0).rgb;
+  vec3 b = texelFetch(source_b, p, 0).rgb;
+  vec3 ab = abs(a - b);
+  vec3 z = abs(0.5 * (a + b) - o);
+  if (max(ab.r, max(ab.g, ab.b)) > 0.03 || max(z.r, max(z.g, z.b)) > 0.03) return false;
+  ivec2 hi = pc.extent - 1;
+  float edge = 0.0;
+  vec3 d0 = abs(a - texelFetch(source_a, clamp(p + ivec2(1, 0), ivec2(0), hi), 0).rgb);
+  vec3 d1 = abs(a - texelFetch(source_a, clamp(p + ivec2(-1, 0), ivec2(0), hi), 0).rgb);
+  vec3 d2 = abs(a - texelFetch(source_a, clamp(p + ivec2(0, 1), ivec2(0), hi), 0).rgb);
+  vec3 d3 = abs(a - texelFetch(source_a, clamp(p + ivec2(0, -1), ivec2(0), hi), 0).rgb);
+  edge = max(max(max(d0.r, max(d0.g, d0.b)), max(d1.r, max(d1.g, d1.b))), max(max(d2.r, max(d2.g, d2.b)), max(d3.r, max(d3.g, d3.b))));
+  return edge > 0.06;
+}
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (pc.step == 0) {
+    if (any(greaterThanEqual(p, pc.blocks))) return;
+    ivec2 c = min(p * pc.block + pc.block / 2, pc.extent - 1);
+    vec3 o = texelFetch(scratch, c, 0).rgb;
+    vec2 px = vec2(c) + 0.5;
+    vec2 g = px * vec2(pc.field_extent) / vec2(pc.extent) - 0.5;
+    ivec2 b = ivec2(floor(g));
+    vec2 u = g - vec2(b);
+    vec2 pv[4];
+    float pconf[4], pw[4];
+    bool pok[4];
+    int anchor = 0;
+    for (int k = 0; k < 4; ++k) {
+      ivec2 q = clamp(b + ivec2(k & 1, k >> 1), ivec2(0), pc.field_extent - 1);
+      vec4 cell = cells[q.y * pc.field_extent.x + q.x];
+      pv[k] = cell.xy;
+      pconf[k] = clamp(cell.z, 0.0, 1.0);
+      pok[k] = cell.z >= 0.05;
+      pw[k] = (((k & 1) != 0) ? u.x : 1.0 - u.x) * (((k >> 1) != 0) ? u.y : 1.0 - u.y);
+      if (pw[k] * pconf[k] > pw[anchor] * pconf[anchor]) anchor = k;
+    }
+    float sw = 0.0;
+    vec2 sv = vec2(0.0);
+    for (int k = 0; k < 4; ++k) {
+      vec2 d = 0.5 * (pv[k] - pv[anchor]);
+      float wk = pw[k] * pconf[k] / (1.0 + dot(d, d));
+      sw += wk;
+      sv += wk * pv[k];
+    }
+    vec2 hv[5];
+    int nh = 0;
+    hv[nh++] = (sw > 1e-6) ? sv / sw : vec2(0.0);
+    for (int k = 0; k < 4; ++k)
+      if (pok[k]) hv[nh++] = pv[k];
+    float dist[5];
+    float best = 1e9;
+    int bk = 0;
+    for (int k = 0; k < nh; ++k) {
+      vec3 e;
+#ifdef ZFG_DIRT_LABEL_HALF
+      if (ZFG_DIRT_LABEL_PREC == 1u) {
+        // Only the sampled colour mean is half arithmetic. Error reduction,
+        // thresholds, winner/rival comparisons, static protection and geometry
+        // below retain the original FP32 expressions.
+        f16vec3 ra = f16vec3(texture(source_a, (px - 0.5 * hv[k]) / vec2(pc.extent)).rgb);
+        f16vec3 rb = f16vec3(texture(source_b, (px + 0.5 * hv[k]) / vec2(pc.extent)).rgb);
+        e = abs(vec3(float16_t(0.5) * (ra + rb)) - o);
+      } else
+#endif
+      {
+        vec3 ra = texture(source_a, (px - 0.5 * hv[k]) / vec2(pc.extent)).rgb;
+        vec3 rb = texture(source_b, (px + 0.5 * hv[k]) / vec2(pc.extent)).rgb;
+        e = abs(0.5 * (ra + rb) - o);
+      }
+      dist[k] = max(e.r, max(e.g, e.b));
+      if ((pc.prot & 1) != 0) {
+        // A hypothesis with a sample outside the picture testifies nothing (the border: there is no reference there).
+        vec2 pa = px - 0.5 * hv[k], pb = px + 0.5 * hv[k];
+        if (any(lessThan(pa, vec2(0.0))) || any(greaterThan(pa, vec2(pc.extent))) || any(lessThan(pb, vec2(0.0))) || any(greaterThan(pb, vec2(pc.extent)))) dist[k] = 1e9;
+      }
+      if (dist[k] < best) { best = dist[k]; bk = k; }
+    }
+    float rival = 1e9;
+    for (int k = 0; k < nh; ++k)
+      if (length(hv[k] - hv[bk]) > 1.5) rival = min(rival, dist[k]);
+    uint flag = best > 0.06 ? 1u : ((rival - best < 0.03) ? 2u : 0u);
+    if ((pc.prot & 1) != 0 && best >= 1e9) flag = 2u;
+    if ((pc.prot & 2) != 0 && StaticPx(c, o)) flag = 2u;
+    label[p.y * pc.blocks.x + p.x] = uvec2(packHalf2x16(hv[bk]), flag);
+  } else if (pc.step == 1) {
+    if (ZFG_DIRT_MASK == 1u) {
+      SharedMask(p);
+      return;
+    }
+    if (any(greaterThanEqual(p, pc.blocks))) return;
+    // The label changes of the 5 x 5 blocks around p (right and below each, valid while the neighbour exists).
+    float chb[25];
+    for (int j = -2; j <= 2; ++j)
+      for (int k = -2; k <= 2; ++k) {
+        ivec2 q = p + ivec2(k, j);
+        float v = 0.0;
+        if (q.x >= 0 && q.y >= 0 && q.x + 1 < pc.blocks.x && q.y + 1 < pc.blocks.y) {
+          v = float(Differ(q, q + ivec2(1, 0))) + float(Differ(q, q + ivec2(0, 1)));
+          if (ZFG_DIRT_UNEXP != 0u && label[q.y * pc.blocks.x + q.x].y == 1u) v = max(v, float(ZFG_DIRT_UNEXP));
+        }
+        chb[(j + 2) * 5 + (k + 2)] = v;
+      }
+    // The density at each block of the 3 x 3 around p (a block clamped to the grid keeps its own window), then the binomial.
+    const float kb[3] = float[3](0.25, 0.5, 0.25);
+    float acc = 0.0;
+    for (int j = -1; j <= 1; ++j)
+      for (int k = -1; k <= 1; ++k) {
+        ivec2 c = clamp(p + ivec2(k, j), ivec2(0), pc.blocks - 1);
+        float sum = 0.0;
+        int cnt = 0;
+        for (int dj = -1; dj <= 1; ++dj)
+          for (int dk = -1; dk <= 1; ++dk) {
+            ivec2 q = c + ivec2(dk, dj);
+            if (q.x < 0 || q.y < 0 || q.x + 1 >= pc.blocks.x || q.y + 1 >= pc.blocks.y) continue;
+            ivec2 rel = q - p + 2;
+            sum += chb[rel.y * 5 + rel.x];
+            cnt += 2;
+          }
+        float d = cnt > 0 ? SStep(0.08, 0.25, sum / float(cnt)) : 0.0;
+        acc += kb[j + 1] * kb[k + 1] * d;
+      }
+    imageStore(mask_image, p, vec4(clamp(2.0 * acc, 0.0, 1.0), 0.0, 0.0, 0.0));
+  } else if (pc.step == 2) {
+    if (any(greaterThanEqual(p, pc.extent))) return;
+    vec4 o = texelFetch(scratch, p, 0);
+    float t = 0.0;
+    if (pc.bypass == 0) t = texture(mask_tex, ((vec2(p) + 0.5) / float(pc.block)) / vec2(pc.blocks)).r;
+    if (t <= 0.0 || ((pc.prot & 4) != 0 && StaticPx(p, o.rgb))) {
+      imageStore(out_image, p, o);
+      return;
+    }
+    vec3 s = vec3(0.0);
+    vec2 c = vec2(p) + 0.5;
+#ifdef ZFG_DIRT_ALT
+    s = texelFetch(alt_picture, min(p, textureSize(alt_picture, 0) - 1), 0).rgb;
+    if (true) {
+    } else
+#endif
+#ifdef ZFG_DIRT_QCOM_BOX
+    if (ZFG_DIRT_QCOM != 0u) {
+      // Both kernel sizes are in texels, even though P is normalized. A box
+      // centred at p+.5 with odd integer size covers whole pixel footprints.
+      s = textureBoxFilterQCOM(scratch_box, c / vec2(pc.extent), vec2(float(ZFG_DIRT_BOX))).rgb;
+    } else
+#endif
+    if (ZFG_DIRT_BOX == 9u) {
+      s = DirtBox9Compat(scratch, c, pc.extent);
+    } else {
+      // Frozen box5 oracle: preserve its exact tap order/weights with all keys off.
+      const float off[3] = float[3](-1.5, 0.0, 1.5);
+      const float wt[3] = float[3](0.4, 0.2, 0.4);
+      for (int j = 0; j < 3; ++j)
+        for (int k = 0; k < 3; ++k) s += wt[j] * wt[k] * texture(scratch, (c + vec2(off[k], off[j])) / vec2(pc.extent)).rgb;
+    }
+    imageStore(out_image, p, vec4(mix(o.rgb, s, t), o.a));
+  }
+}
