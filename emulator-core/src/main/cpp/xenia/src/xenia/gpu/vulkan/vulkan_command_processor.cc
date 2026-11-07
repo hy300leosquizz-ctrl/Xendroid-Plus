@@ -3945,10 +3945,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  xe::SourceBoundaryInflightScope source_issue_inflight_scope(
+      xe::SourceBoundaryInflightScope::Kind::kIssue);
 
   // Count one presented guest frame for the debug overlay's FPS / frame-time
   // stats (the game's real frame rate, independent of the host present path).
   xe::RecordGuestPresent();
+  // Source qualification and publication identity use this same real-frame
+  // boundary independently of the raw guest FPS counter.
+  xe::RecordSourcePresent();
 
   PollDebugPropertyOverrides(*this);
   PollFrameDump();

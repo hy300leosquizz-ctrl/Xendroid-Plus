@@ -3034,9 +3034,19 @@ struct ZeroFGIndependentPresenter::Impl {
   }
 
 
+  void BindLatencyConnection(uint32_t new_mode) {
+    // UI/owner thread, after disconnect joined the previous presenter and
+    // before this connection starts its worker. Never read a live UI request:
+    // the caller supplies the selection used to prewarm the bound engine.
+    latency_mode = new_mode <= 2 ? new_mode : 0;
+    const char* mode = latency_mode == 1 ? "REALLYZERO"
+                       : latency_mode == 2 ? "ZERO" : "UNKNOWN";
+    XELOGI("ZeroFGLatencyCohort mode={} generation={}", mode, generation);
+  }
+
   bool Connect(void* native_window_pointer, VkExtent2D new_extent,
                VkFormat new_final_output_format,
-               VkSurfaceKHR new_main_surface) {
+               VkSurfaceKHR new_main_surface, uint32_t new_latency_mode) {
     if (!native_window_pointer || !new_extent.width || !new_extent.height ||
         surface_connected) {
       return false;
@@ -3066,6 +3076,7 @@ struct ZeroFGIndependentPresenter::Impl {
     if (!generation) {
       ++generation;
     }
+    BindLatencyConnection(new_latency_mode);
     for (uint32_t i = 0; i < kCapturePoolSize; ++i) {
       if (!AllocateCaptureSlot(capture_slots[i], i, extent)) {
         for (uint32_t j = 0; j < i; ++j) {
@@ -16229,6 +16240,10 @@ struct ZeroFGIndependentPresenter::Impl {
     request.slot = logical.final_output_index;
     request.sequence_id = logical.sequence_id;
     request.synthetic = logical.candidate.kind == CandidateKind::kSynthetic;
+    request.source_id = logical.candidate.source_id;
+    request.issue_time_ns = logical.candidate.issue_time_ns;
+    request.latency_mode = latency_mode;
+    request.latency_generation = generation;
     request.desired_present_ns = present_not_before_ns;
     request.output_quantum_ns = logical.candidate.semantic_output_quantum_ns;
     request.image = output.image;
@@ -18101,12 +18116,21 @@ struct ZeroFGIndependentPresenter::Impl {
             : 0;
     const uint64_t interval_average_ns =
         delta_samples ? delta_total_ns / delta_samples : 0;
+    const float telemetry_output_fps = xe::GetOutputFps();
+    const uint64_t telemetry_reset_generation =
+        xe::internal::frame_telemetry_reset_generation().load(
+            std::memory_order_acquire);
+    const uint64_t telemetry_output_sequence =
+        xe::internal::final_output_telemetry_ring().sequence.load(
+            std::memory_order_acquire);
     XELOGI(
         "ZeroFGC0Summary generation={} accepting={} residency={}/{} high_water={} state="
         "free/transfer/ready={}/{}/{} source reserve/submit/publish/handoff/"
         "miss={}/{}/{}/{}/{} presenter consumed/applied/release="
         "{}/{}/{} ready_wait_us p50/p90/p99/max={}/{}/{}/{} "
         "release_us p50/p90/p99/max={}/{}/{}/{} applied_fps={:.2f} "
+        "telemetry_output_fps={:.2f} telemetry_reset_generation={} "
+        "telemetry_output_sequence={} "
         "post passes={} submits={} final_pool={}/{} high_water={} "
         "post_queue_wait_us p90/max={}/{} post_submit_host_us p90/max={}/{} "
         "post_gpu_us p50/p90/p99/max={}/{}/{}/{} "
@@ -18140,6 +18164,8 @@ struct ZeroFGIndependentPresenter::Impl {
         release_latency_ns.Quantile(99, 100) / 1000,
         release_latency_ns.maximum() / 1000,
         applied_timestamps.RateHz(),
+        telemetry_output_fps, telemetry_reset_generation,
+        telemetry_output_sequence,
         post_effect_count, post_submit_total.load(std::memory_order_relaxed),
         CountUsedFinalOutputs(), kFinalOutputPoolSize,
         final_output_high_water.load(std::memory_order_relaxed),
@@ -18647,6 +18673,8 @@ struct ZeroFGIndependentPresenter::Impl {
   VulkanDevice* vulkan_device = nullptr;
   const bool elevated_presenter_priority = false;
   const uint64_t synthetic_cost_seed_ns = 0;
+  // Per surface connection, not per persistent Impl or pending UI request.
+  uint32_t latency_mode = 0;
   IngressSourceAcquireCallback ingress_source_acquire_callback;
   PaintConfigProvider paint_config_provider;
   GenerationCallback generation_callback;
@@ -20004,10 +20032,11 @@ ZeroFGIndependentPresenter::Create(
 bool ZeroFGIndependentPresenter::Connect(void* native_window,
                                            VkExtent2D extent,
                                            VkFormat final_output_format,
-                                           VkSurfaceKHR main_surface) {
+                                           VkSurfaceKHR main_surface,
+                                           uint32_t latency_mode) {
 #if (XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid)
   return impl_ && impl_->Connect(native_window, extent, final_output_format,
-                                 main_surface);
+                                 main_surface, latency_mode);
 #else
   return false;
 #endif

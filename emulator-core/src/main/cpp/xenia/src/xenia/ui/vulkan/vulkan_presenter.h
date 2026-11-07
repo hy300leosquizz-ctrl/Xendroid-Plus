@@ -609,9 +609,11 @@ class VulkanPresenter final : public Presenter {
   // the frame's actual display. Paint thread only.
   struct NativeLatencyRecord {
     uint32_t present_id = 0;
+    uint64_t source_id = 0;
     uint64_t issue_ns = 0;
   };
   static constexpr size_t kNativeLatencyRecordCount = 32;
+  static constexpr size_t kNativeLatencySampleLimit = 1024;
   static constexpr uint64_t kNativeLatencyLogPeriodNs = 5000000000ull;
   std::array<NativeLatencyRecord, kNativeLatencyRecordCount>
       native_latency_records_ = {};
@@ -620,6 +622,11 @@ class VulkanPresenter final : public Presenter {
   uint64_t native_latency_last_source_id_ = 0;
   std::vector<uint64_t> native_latency_samples_ns_;
   uint64_t native_latency_window_begin_ns_ = 0;
+  VkSwapchainKHR native_latency_swapchain_ = VK_NULL_HANDLE;
+  uint64_t native_latency_invalid_samples_ = 0;
+  uint64_t native_latency_overflow_samples_ = 0;
+  uint64_t native_latency_unmatched_timings_ = 0;
+  uint64_t native_latency_overwritten_records_ = 0;
   void PollNativeLatency();
 };
 

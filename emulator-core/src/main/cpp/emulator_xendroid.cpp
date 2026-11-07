@@ -1348,7 +1348,39 @@ static jboolean j_zerofg_main_surface_active(JNIEnv* env, jobject thiz) {
 }
 
 static jdouble j_output_fps(JNIEnv* env, jobject thiz) {
-    return jdouble(xe::GetOutputFps());
+    const float fps = xe::GetOutputFps();
+    if (xe::IsZeroFGMainSurfaceActive()) {
+        // Compare the exact JNI result with the presenter's existing summary.
+        // A single atomic claim bounds diagnostics across all polling callers.
+        static std::atomic<uint64_t> next_log_ns{0};
+        const uint64_t now_ns = xe::internal::FrameTelemetryNowNs();
+        uint64_t next = next_log_ns.load(std::memory_order_relaxed);
+        if (now_ns >= next && next_log_ns.compare_exchange_strong(
+                next, now_ns + 5000000000ull, std::memory_order_relaxed)) {
+            const uint64_t reset_generation = xe::internal::frame_telemetry_reset_generation().load(
+                std::memory_order_acquire);
+            const auto& ring = xe::internal::final_output_telemetry_ring();
+            const uint64_t sequence = ring.sequence.load(std::memory_order_acquire);
+            uint64_t newest_sequence = 0, newest_generation = 0, newest_timestamp_ns = 0;
+            bool newest_consistent = false;
+            if (sequence) {
+                const auto& slot = ring.slots[(sequence - 1) % xe::internal::kFrameTelemetrySampleCapacity];
+                newest_sequence = slot.sequence.load(std::memory_order_acquire);
+                newest_generation = slot.generation.load(std::memory_order_relaxed);
+                newest_timestamp_ns = slot.timestamp_ns.load(std::memory_order_relaxed);
+                newest_consistent = newest_sequence != 0 && newest_sequence == sequence &&
+                    slot.sequence.load(std::memory_order_acquire) == newest_sequence;
+            }
+            XELOGI(
+                "ZeroFGOutputTelemetry observer=JNI fps={:.2f} reset_generation={} sequence={} "
+                "newest_sequence={} newest_generation={} newest_timestamp_ns={} newest_age_us={} "
+                "newest_future={} newest_consistent={}",
+                fps, reset_generation, sequence, newest_sequence, newest_generation, newest_timestamp_ns,
+                newest_timestamp_ns && now_ns >= newest_timestamp_ns ? (now_ns - newest_timestamp_ns) / 1000 : 0,
+                newest_timestamp_ns > now_ns, newest_consistent);
+        }
+    }
+    return jdouble(fps);
 }
 
 static jlongArray j_presentation_state(JNIEnv* env, jobject thiz) {

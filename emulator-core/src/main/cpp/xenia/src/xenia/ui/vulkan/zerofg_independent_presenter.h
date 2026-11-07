@@ -338,7 +338,10 @@ class ZeroFGIndependentPresenter final {
   // destroyed here) by Main Surface Authority; ignored otherwise.
   bool Connect(void* native_window, VkExtent2D extent,
                VkFormat final_output_format,
-               VkSurfaceKHR main_surface = VK_NULL_HANDLE);
+               VkSurfaceKHR main_surface = VK_NULL_HANDLE,
+               // Bound engine for this connection: 0=unknown, 1=RZ, 2=Zero.
+               // The Impl persists across hot-swap, so not a Create property.
+               uint32_t latency_mode = 0);
   void BeginSurfaceDisconnect();
   void DestroySurfaceResourcesAfterSourceIdle();
 

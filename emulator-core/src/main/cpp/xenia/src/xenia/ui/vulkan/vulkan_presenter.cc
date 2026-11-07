@@ -1134,12 +1134,19 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
       }
     }
     // Main Surface Authority borrows A's VkSurfaceKHR.
+    const ZeroFGSelection bound_selection =
+        zerofg_bound_selection_.load(std::memory_order_acquire);
     const bool connected = generation_context_ready &&
                            zerofg_independent_presenter_->Connect(
                                android_native_window_surface.window(),
                                paint_context_.swapchain_extent,
                                paint_context_.swapchain_render_pass_format,
-                               paint_context_.vulkan_surface);
+                               paint_context_.vulkan_surface,
+                               bound_selection == ZeroFGSelection::kReallyZero
+                                   ? 1u
+                                   : bound_selection == ZeroFGSelection::kZero
+                                         ? 2u
+                                         : 0u);
     if (generation_context_ready && !connected) {
       XELOGW("ZeroFGC0: independent surface unavailable; preserving the "
              "normal XenDroid presenter");
@@ -1909,6 +1916,11 @@ void VulkanPresenter::RetireSwapchainForMainSurfaceAuthority() {
         vulkan_device_->device(), old_swapchain, nullptr);
   }
   XELOGI("ZeroFGMainSurface A retired its swapchain; surface kept for B");
+  // Telemetry only: no native timing may survive a surface-authority change.
+  native_latency_swapchain_ = VK_NULL_HANDLE;
+  native_latency_records_ = {};
+  native_latency_samples_ns_.clear();
+  native_latency_window_begin_ns_ = 0;
   zerofg_independent_presenter_->MainSurfaceReleasedByA();
 }
 
@@ -1927,19 +1939,38 @@ void VulkanPresenter::PollNativeLatency() {
   const VkResult result =
       get_past_timing(vulkan_device_->device(), paint_context_.swapchain,
                       &count, timings.data());
+  const uint64_t observation_ns = GetZeroFGMonotonicTimeNs();
   if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+    // A query fault invalidates this observation batch, just as on B.
+    ++native_latency_invalid_samples_;
     return;
   }
   for (uint32_t i = 0; i < count; ++i) {
+    // Repaints of the same Real are untagged. Only tagged Reals enter the
+    // measurement; a default ID zero is not an unmatched tagged Real.
+    if (!timings[i].presentID) continue;
+    bool matched = false;
     for (NativeLatencyRecord& record : native_latency_records_) {
       if (record.present_id && record.present_id == timings[i].presentID) {
-        if (timings[i].actualPresentTime > record.issue_ns) {
-          native_latency_samples_ns_.push_back(timings[i].actualPresentTime -
-                                               record.issue_ns);
+        matched = true;
+        if (record.source_id && record.issue_ns &&
+            timings[i].actualPresentTime > record.issue_ns &&
+            timings[i].actualPresentTime <= observation_ns) {
+          if (native_latency_samples_ns_.size() < kNativeLatencySampleLimit) {
+            native_latency_samples_ns_.push_back(timings[i].actualPresentTime -
+                                                 record.issue_ns);
+          } else {
+            ++native_latency_overflow_samples_;
+          }
+        } else {
+          ++native_latency_invalid_samples_;
         }
         record = {};
         break;
       }
+    }
+    if (!matched) {
+      ++native_latency_unmatched_timings_;
     }
   }
   const uint64_t now_ns = GetZeroFGMonotonicTimeNs();
@@ -1949,19 +1980,43 @@ void VulkanPresenter::PollNativeLatency() {
   if (now_ns - native_latency_window_begin_ns_ < kNativeLatencyLogPeriodNs) {
     return;
   }
-  native_latency_window_begin_ns_ = now_ns;
   std::vector<uint64_t>& samples = native_latency_samples_ns_;
   if (samples.empty()) {
+    native_latency_window_begin_ns_ = now_ns;
     return;
   }
   std::sort(samples.begin(), samples.end());
   const auto quantile = [&samples](size_t percent) {
-    return samples[(samples.size() - 1) * percent / 100];
+    return samples[(samples.size() * percent + 99) / 100 - 1];
   };
   XELOGI(
-      "Latency path=native issue_to_shown_us p50/p90/max={}/{}/{} samples={}",
-      quantile(50) / 1000, quantile(90) / 1000, samples.back() / 1000,
+      "Latency path=native mode=OFF kind=real "
+      "issue_to_shown_us p50/p90/p99/max={}/{}/{}/{} samples={}",
+      quantile(50) / 1000, quantile(90) / 1000, quantile(99) / 1000,
+      samples.back() / 1000,
       samples.size());
+  std::string samples_us;
+  for (uint64_t sample_ns : samples) {
+    if (!samples_us.empty()) samples_us.push_back(',');
+    samples_us.append(std::to_string(sample_ns / 1000));
+  }
+  XELOGI(
+      "ZeroFGLatencyBatch path=native mode=OFF kind=real "
+      "window_start_ns={} window_end_ns={} samples={} invalid={} "
+      "overflow={} unmatched={} overwritten={} complete=true reliable={} "
+      "samples_us={}",
+      native_latency_window_begin_ns_, now_ns, samples.size(),
+      native_latency_invalid_samples_, native_latency_overflow_samples_,
+      native_latency_unmatched_timings_, native_latency_overwritten_records_,
+      !native_latency_invalid_samples_ && !native_latency_overflow_samples_ &&
+          !native_latency_unmatched_timings_ &&
+          !native_latency_overwritten_records_,
+      samples_us);
+  native_latency_window_begin_ns_ = now_ns;
+  native_latency_invalid_samples_ = 0;
+  native_latency_overflow_samples_ = 0;
+  native_latency_unmatched_timings_ = 0;
+  native_latency_overwritten_records_ = 0;
   samples.clear();
 #endif
 }
@@ -2816,6 +2871,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
       VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
   const SourcePublicationTelemetry& painted_source =
       guest_output_properties.source_publication;
+  if (native_latency_swapchain_ != paint_context_.swapchain) {
+    native_latency_swapchain_ = paint_context_.swapchain;
+    native_latency_records_ = {};
+    native_latency_samples_ns_.clear();
+    native_latency_window_begin_ns_ = GetZeroFGMonotonicTimeNs();
+    native_latency_last_source_id_ = 0;
+    native_latency_invalid_samples_ = 0;
+    native_latency_overflow_samples_ = 0;
+    native_latency_unmatched_timings_ = 0;
+    native_latency_overwritten_records_ = 0;
+  }
   if (vulkan_device_->vkGetPastPresentationTimingGOOGLE() &&
       guest_output_image && painted_source.issue_time_ns &&
       painted_source.source_id &&
@@ -2828,8 +2894,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     native_present_times.swapchainCount = 1;
     native_present_times.pTimes = &native_present_time;
     present_info.pNext = &native_present_times;
+    if (native_latency_records_[native_latency_record_next_].present_id) {
+      ++native_latency_overwritten_records_;
+    }
     native_latency_records_[native_latency_record_next_] = {
-        native_latency_present_id_, painted_source.issue_time_ns};
+        native_latency_present_id_, painted_source.source_id,
+        painted_source.issue_time_ns};
     native_latency_record_next_ =
         (native_latency_record_next_ + 1) % kNativeLatencyRecordCount;
   }
