@@ -14,4 +14,7 @@ void main() {
     // Only a scene that moves teaches the memory: when everything repeats in place, nothing says what is the screen.
     plan[planOf(P_HUD, 1, p)] = mix(plan[planOf(P_HUD, 1, p)], plan[planOf(P_HUD, 0, p)], float(u.cfg3.w) * 0.01);
   }
+  // pc.a.x == 1: the GS modes' screen (rc7_hudgs.comp, written beside the guess on the memory's side, unused while the memory is off) is
+  // the host's word, added after the rule: the rule never takes it back.
+  if (pc.a.x == 1) plan[planOf(P_HUD, 0, p)] = max(plan[planOf(P_HUD, 0, p)], plan[planOf(P_HUD, 1, p)]);
 }

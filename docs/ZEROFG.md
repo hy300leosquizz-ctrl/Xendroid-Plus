@@ -1,7 +1,7 @@
 # ZeroFG in Xendroid+
 
 ZeroFG is an optional frame-generation engine. It has two choices: **Zero**
-(RC7, quality) and **ReallyZero** (RC5+, lower cost). It is **off by default**.
+(RC7, quality) and **ReallyZero** (the dense flow, lower cost). It is **off by default**.
 The pinned engine source and compiled shader headers are included in
 `emulator-core/src/main/cpp/zerofg`; see its `SOURCE.md` and `LICENSE`.
 
@@ -21,8 +21,8 @@ so it does not describe an uncompleted transition as an active new engine.
 ## Integration boundaries
 
 This ports the existing XenDroid independent-presenter integration, using the
-approved core `38dcc6f`. Zero maps explicitly to `Mode::kRC7`, and ReallyZero to
-`Mode::kDenseFlow`; the historical `kZero`/`kReallyZero` aliases are RC3 modes.
+ZeroFG release v1.1.0 (`2b7711e`). Zero maps explicitly to `Mode::kRC7`, and ReallyZero to
+`Mode::kDenseFlow`, the same engines as 1.1's `kZero`/`kReallyZero`.
 The engine records commands; the host owns queues, synchronization and pacing.
 The approved presenter retains the normal integration's active defaults:
 frequency/rate lock, presentation advance, reanchor cutover, phase recovery,
@@ -74,7 +74,7 @@ Validated on 2026-11-05:
 - SGSR1 and SGSR1+dither compiled SPIR-V stayed byte-identical to the pre-Edge
   baseline (2,078 and 3,474 words respectively).
 - Both Edge shaders passed `spirv-val --target-env vulkan1.0`.
-- Engine snapshot comparison: 170 imported files match approved `38dcc6f`.
+- Engine snapshot comparison: every imported engine file matches the v1.1.0 release blob for blob.
 
 These are build, static and CPU results. The initial Plus APK was installed on
 2026-11-05. Its first game checks on stock and Turnip failed activation: device B

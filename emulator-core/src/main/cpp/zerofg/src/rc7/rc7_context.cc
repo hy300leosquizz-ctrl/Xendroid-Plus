@@ -1,4 +1,4 @@
-// RC7 (Mode::kRC7), the lean layered form of the laboratory's `rc7m` (testbed/src/core/rc7_gpu.cc on the algorithm repository): the pair is explained as surfaces, a front, a screen and what only one picture
+// Zero (Mode::kZero, RC7), the lean layered form of the laboratory's `rc7m` (testbed/src/core/rc7_gpu.cc on the algorithm repository): the pair is explained as surfaces, a front, a screen and what only one picture
 // has, on top of the RC5 picture. Everything is recorded into the host's command buffer; nothing stops and nothing is read back. Which surfaces there are changes slowly: the search runs in the background, a few steps
 // per pair along with the layers' passes, on the GPU. How each one moves changes every pair: this pair's flow brings them up to its motion. Wide passes with short loops. Phase 0.5 only.
 
@@ -35,6 +35,7 @@
 #include "rc7_quarter.h"
 #include "rc7_hud.h"
 #include "rc7_hudrule.h"
+#include "rc7_hudgs.h"
 #include "rc7_jump.h"
 #include "rc7_mix.h"
 #include "rc7_morph.h"
@@ -146,7 +147,7 @@ struct Push {
 enum Pipe : uint32_t {
   kCrop, kHalf, kHalf1, kQuarter, kQuarter1, kFList, kSoft, kSoft1, kStats, kStats1, kHud, kHudRule, kCost, kCost1, kCost2, kCost3, kSeed, kJump, kJump1, kRaw, kBlockPass, kBlockPass1, kStand, kStand1, kGhost, kMorph, kFront, kFront1, kFSmooth, kFSmooth1, kUnfold, kUnfold1, kHole, kCons, kExtend, kAlpha,
   kRender, kRenderOne, kRenderOne5 = kRenderOne + 5, kTrust, kMix, kFine, kFine1, kGuide, kGuide1, kTile,
-  kSCell, kSStart, kSList, kSHyp, kSFit, kSRefit, kSInl, kSEcho, kSDone, kSOrder, kSGate, kTBlock, kTFit, kTGuide, kOut, kStatsSharp, kPipeCount
+  kSCell, kSStart, kSList, kSHyp, kSFit, kSRefit, kSInl, kSEcho, kSDone, kSOrder, kSGate, kTBlock, kTFit, kTGuide, kOut, kStatsSharp, kHudGs, kPipeCount
 };
 
 class Rc7Context final : public AlgorithmContext {
@@ -209,6 +210,8 @@ class Rc7Context final : public AlgorithmContext {
     return Status::kSuccess;
   }
 
+  void SetScreenTruth(const Image* screen) override { screen_truth_ = screen ? *screen : Image{}; }
+
   Status Interpolate(VkCommandBuffer cmd, const Image& previous, const Image& current, float phase, const Image& output) override {
     // A failed record must not advertise a newly prepared Real to the next call.
     const bool prep_was_valid = prep_valid_;
@@ -264,6 +267,9 @@ class Rc7Context final : public AlgorithmContext {
     const VkDescriptorSet set_now = sets_[slot_], decide_now = decide_sets_[slot_];
     BindImage(set_now, 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler_, view_a, layout_a);
     BindImage(set_now, 12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler_, view_b, layout_b);
+    // The screen from the host (SetScreenTruth): this record's copy of the set only.
+    screen_now_ = screen_truth_.view != VK_NULL_HANDLE;
+    if (screen_now_) BindImage(set_now, 38, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler_, screen_truth_.view, screen_truth_.layout);
     const bool decide_half = width_ >= kHalfFrom;
     BindImage(decide_now, 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler_, decide_half ? quarter_[prep_a_].view() : view_a, decide_half ? VK_IMAGE_LAYOUT_GENERAL : layout_a);
     BindImage(decide_now, 12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler_, decide_half ? quarter_[prep_b_].view() : view_b, decide_half ? VK_IMAGE_LAYOUT_GENERAL : layout_b);
@@ -491,9 +497,9 @@ class Rc7Context final : public AlgorithmContext {
   // One layout for every pass, bindings as in shaders/rc7/rc7_common.glsl, 33 the output. Two sets, which differ in the pictures only: the decisions may read the half-size ones.
   Status CreatePipelines() {
     const VkDescriptorType kS = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kI = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kB = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    std::vector<VkDescriptorType> types(38, kB);
+    std::vector<VkDescriptorType> types(39, kB);
     types[0] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    types[9] = types[11] = types[12] = types[13] = types[14] = types[22] = types[23] = types[30] = types[31] = kS;
+    types[9] = types[11] = types[12] = types[13] = types[14] = types[22] = types[23] = types[30] = types[31] = types[38] = kS;
     types[15] = types[16] = types[28] = types[29] = types[33] = types[34] = types[35] = types[36] = types[37] = kI;
     std::vector<VkDescriptorSetLayoutBinding> layout_bindings;
     for (uint32_t i = 0; i < types.size(); ++i) {
@@ -517,7 +523,7 @@ class Rc7Context final : public AlgorithmContext {
     if (dispatch_.create_pipeline_layout(vulkan_.device, &pl, vulkan_.allocator, &layout_) != VK_SUCCESS) return Status::kVulkanError;
     // One copy of the sets per frame context: a record writes the Reals and the output into its own copy, while the record before may still be running.
     const uint32_t copies = std::max(1u, create_info_.frame_context_count);
-    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * copies}, {kS, 18 * copies}, {kI, 18 * copies}, {kB, 38 * copies}};
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * copies}, {kS, 20 * copies}, {kI, 18 * copies}, {kB, 38 * copies}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 2 * copies;
     dpi.poolSizeCount = 4;
@@ -586,7 +592,7 @@ class Rc7Context final : public AlgorithmContext {
                           RC7_SPEC(kTrust, trust), RC7_SPEC(kMix, mix), RC7_SIDES(kFine, fine, 0), RC7_SIDES(kGuide, guide, 1), RC7_SPEC(kTile, tile), RC7_SPEC(kSCell, scell), RC7_SPEC(kSStart, sstart),
                           RC7_SPEC(kSList, slist), RC7_SPEC(kSHyp, shyp), RC7_SPEC(kSFit, sfit), RC7_SPEC(kSRefit, srefit), RC7_SPEC(kSInl, sinl), RC7_SPEC(kSEcho, secho),
                           RC7_SPEC(kSDone, sdone), RC7_SPEC(kSOrder, sorder), RC7_SPEC(kSGate, sgate), RC7_SPEC(kTBlock, tblock), RC7_SPEC(kTFit, tfit), RC7_SPEC(kTGuide, tguide), RC7_SPEC(kOut, out),
-                          {kStatsSharp, zerofg_rc7_stats_spv, sizeof(zerofg_rc7_stats_spv), 0, 1, -1}};
+                          {kStatsSharp, zerofg_rc7_stats_spv, sizeof(zerofg_rc7_stats_spv), 0, 1, -1}, RC7_SPEC(kHudGs, hudgs)};
 #undef RC7_ONE
 #undef RC7_COST
 #undef RC7_SIDES
@@ -670,6 +676,7 @@ class Rc7Context final : public AlgorithmContext {
     BindSampled(14, soft_[1].view(), general);
     BindSampled(22, bend_.view(), general);
     BindSampled(23, guide_.view(), general);
+    BindSampled(38, base_.view(), general);  // the host's screen (SetScreenTruth), bound per record when there is one
     BindStorageImage(34, guide_.view());
     BindStorageImage(35, bend_.view());
     BindStorageImage(15, soft_[0].view());
@@ -997,12 +1004,17 @@ class Rc7Context final : public AlgorithmContext {
       MemoryBarrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
       hud_memory_ = true;
     }
-    // The screen and the gates: nothing of one reads anything of the other, so they go along, step by step.
+    // The screen and the gates: nothing of one reads anything of the other, so they go along, step by step. A screen the host knows (the
+    // GS modes' HUD planes, SetScreenTruth) is added to the guess, never put in its place: the planes miss what the GS rule cannot see (a
+    // cursor drawn with the character), the guess catches that. It packs into the steps already there: it goes along with the guess (it
+    // reads only the host's code image) on the memory's side, and the rule adds it after its own decision; no step or barrier of its own.
+    static_assert(kHudMemory == 0, "the host's screen is written on the screen's memory side: with the memory on it needs a plan of its own");
     Lat(kHud);
+    if (screen_now_) Lat(kHudGs);
     Lat(kSeed, 0, 1);
     Lat(kSeed, 1, 1);
     Barrier();
-    Lat(kHudRule);
+    Lat(kHudRule, screen_now_ ? 1 : 0);
     Run(kSGate, Groups(std::max(1u, lw_ / 2), 8), Groups(std::max(1u, lh_ / 2), 8), 1);
     Run(kSGate, Groups(std::max(1u, lw_ / 4), 8), Groups(std::max(1u, lh_ / 4), 8), 3);
     Barrier();
@@ -1200,6 +1212,8 @@ class Rc7Context final : public AlgorithmContext {
   std::unique_ptr<DenseFlowSource> dense_;
   OwnedImage soft_[2], half_[2], quarter_[2], base_, fallback_, tight_[2], guide_, bend_;
   bool hud_memory_ = false;  // the screen's memory is cleared once per size
+  Image screen_truth_{};     // SetScreenTruth: the host's screen, codes as in shaders/rc7/rc7_hudgs.comp
+  bool screen_now_ = false;  // this record adds it to the guess
   OwnedBuffer params_, search_, cost_, label_, plan_, stat_, front_, palpha_, cells_, out_, disagree_, counter_, blocks_, tiles_, thumb_, flist_, snap_, dummy_;
   VkSampler sampler_ = VK_NULL_HANDLE, cubic_sampler_ = VK_NULL_HANDLE;
   struct Step {

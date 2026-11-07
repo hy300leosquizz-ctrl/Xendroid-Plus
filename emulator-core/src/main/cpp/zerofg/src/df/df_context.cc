@@ -1,4 +1,4 @@
-// The dense-flow preview (Mode::kDenseFlow): RC5 seed 2 from the ZeroFG laboratory, the Eco form of its `df` profile
+// ReallyZero (Mode::kReallyZero), the dense flow: RC5 seed 2 from the ZeroFG laboratory, the Eco form of its `df` profile
 // (testbed/src/core/df_runner.cc on the algorithm repository), written from the published algorithms (DIS, Kroeger et al. 2016; the Super SloMo
 // midpoint flow) and the laboratory's own cleanup:
 //

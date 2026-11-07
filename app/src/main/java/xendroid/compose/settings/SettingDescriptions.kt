@@ -4,7 +4,7 @@ package xendroid.compose.settings
  *  [Setting.desc] by the schema helpers. */
 object SettingDescriptions {
     val byName: Map<String, String> = mapOf(
-        "zerofg_mode" to "Zero generates the halfway frame with the quality engine; ReallyZero uses the lighter engine. Off preserves normal presentation. You can also switch these modes while playing from the Frame generation menu. Only one frame-generation engine runs at a time. Requires a Vulkan 1.3 device with the required features enabled",
+        "zerofg_mode" to "Mobile-native frame generation engine, optimized end to end for performance and image quality at 2X rate. Zero: highest quality. ReallyZero: high quality, lowest cost. Vulkan 1.3 required. Hot-swappable from the Frame generation menu",
         // Redesign: the core's own cvars the app now shows; texts follow the core's descriptions.
         "internal_display_resolution_x" to "Width reported to the game when the display mode is Custom. The core accepts 1 to 1920",
         "internal_display_resolution_y" to "Height reported to the game when the display mode is Custom. The core accepts 1 to 1080",
