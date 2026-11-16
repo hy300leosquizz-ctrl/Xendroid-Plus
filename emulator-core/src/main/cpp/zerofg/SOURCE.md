@@ -1,11 +1,18 @@
 # ZeroFG source snapshot
 
-This directory contains the ZeroFG engine **v1.1.0**, published at
-https://github.com/hy300leosquizz-ctrl/ZeroFG (tag `v1.1.0`, commit
-`2b7711e47680c25dd461110c182ee5dd4a637f99`). The engine sources, public headers,
-shader sources, shipped SPIR-V headers, shader compiler and CMake file are that
-commit's, byte for byte. No laboratory recordings, runtime binaries, device
-identifiers or experimental environment controls are included.
+This directory contains the ZeroFG engine of the MFG development branch `mfg/core`. It is not published yet. It sits on top of v1.1.0 and the
+license commit `10e68b6`. ZeroFG is `Apache-2.0 OR GPL-2.0-or-later` since that commit; it is used here under Apache-2.0, `LICENSE`.
+
+The branch adds:
+- any phase between the Reals (x3 / x4), with the same-pair contract;
+- Zero's screen by cells (`kHudCells`);
+- Zero's light gain (`kLightGain`).
+
+At the middle, with both switches off, it is bit-identical to v1.1.0. The engine sources, public headers, shader sources, shipped SPIR-V
+headers, shader compiler and CMake file are that branch's, byte for byte. Until it is published this snapshot is for internal builds, and
+the published v1.1.0 snapshot is `f9b0b5cef`.
+
+No laboratory recordings, runtime binaries, device identifiers or experimental environment controls are included.
 
 The host adapter in `integration/xenia/` is the thin adapter from the same
 release's `host/xendroid/` directory. Xendroid's presenter owns recording order,

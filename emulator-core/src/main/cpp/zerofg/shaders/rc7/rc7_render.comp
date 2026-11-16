@@ -32,6 +32,22 @@ vec3 sharpSample(int side, vec2 pos) {
   return clamp(c / n, vec3(0.0), vec3(1.0));
 }
 
+// The screen by cells, one pixel of a remembered cell: it is the screen's when it repeats in place, A and B the same here (HUD_SAME) or
+// clearly closer in place than where the cell's motion takes it (a letter's edge under a codec's noise); what follows the motion stays the
+// layers'. A pixel taken in place agrees with itself in A and B better than with the motion, so a background glued to the screen cannot
+// come out twice.
+bool screenPixel(ivec2 x, vec2 pos) {
+  vec3 a = texelFetch(cubicA, x, 0).rgb;
+  float in_place = l1(a, texelFetch(cubicB, x, 0).rgb);
+  if (in_place < HUD_SAME) return true;
+  if (in_place >= 0.12) return false;
+  ivec2 cq = clamp(ivec2(pos / u.cell.xy), ivec2(0), ivec2(u.cfg2.x - 1, u.cfg2.y - 1));
+  vec2 v = cells[cq.y * u.cfg2.x + cq.x].zw;
+  if (length(v) < 1.0) return false;
+  ivec2 there = clamp(x + ivec2(round(v)), ivec2(0), ivec2(W - 1, H_ - 1));
+  return 2.0 * in_place < l1(a, texelFetch(cubicB, there, 0).rgb);
+}
+
 int orderAt(int rank) { return rank < 4 ? u.order[rank] : u.order2[rank - 4]; }
 // What exists in the block of a place inside the picture.
 uint tileAt(vec2 at) {
@@ -50,8 +66,8 @@ void oneSurface(int k, int pass_i, vec2 pos, int cover_plane, bool cover_a) {
   // The model's true middle, the surface's fine step on top of it: half of it from each side.
   vec2 a0 = ba, b0 = bb;
   for (int it = 0; it < R_BEND; ++it) {
-    ba = a0 - 0.5 * bendAt(0, k, ba);
-    bb = b0 - 0.5 * bendAt(1, k, bb);
+    ba = a0 - PH_A * bendAt(0, k, ba);
+    bb = b0 - PH_B * bendAt(1, k, bb);
   }
   bool in_a = insideP(ba), in_b = insideP(bb);
   float matte_a = matteAt(0, k, ba), matte_b = matteAt(1, k, bb);
@@ -79,6 +95,12 @@ void oneSurface(int k, int pass_i, vec2 pos, int cover_plane, bool cover_a) {
   // A sample that weighs 0 adds 0: every lane of the wave takes both.
   vec3 ca = sharpSample(0, ba), cb = sharpSample(1, bb);
   vec3 c3 = (wa * ca + wb * cb) / (wa + wb);
+#ifdef ZFG_PHASE
+  {  // the nearer Real weighs more in time; the test of the two samples below keeps the plain weights
+    float ua = wa * 2.0 * PH_B, ub = wb * 2.0 * PH_A;
+    c3 = (ua * ca + ub * cb) / (ua + ub);
+  }
+#endif
   bool first_on_top = !top_seen && claim >= 0.5;
   float differ = l1(sampleSoft(0, ba), sampleSoft(1, bb));
   dis_out = first_on_top && min(wa, wb) > 0.2 * (wa + wb) ? differ : dis_out;
@@ -107,8 +129,8 @@ void main() {
     float fra = 0.0, frb = 0.0;
     if (has_front) {
       for (int it = 0; it < R_FRONT; ++it) {
-        fa = pos - 0.5 * frontAt(0, fa);
-        fb = pos - 0.5 * frontAt(1, fb);
+        fa = pos - PH_A * frontAt(0, fa);
+        fb = pos - PH_B * frontAt(1, fb);
       }
       in_a = insideP(fa);
       in_b = insideP(fb);
@@ -150,12 +172,28 @@ void main() {
       if (wa > 0.0) ca = sharpSample(0, fa);
       if (wb > 0.0) cb = sharpSample(1, fb);
       front_c = (wa * ca + wb * cb) / (wa + wb);
+#ifdef ZFG_PHASE
+      {
+        float ua = wa * 2.0 * PH_B, ub = wb * 2.0 * PH_A;
+        front_c = (ua * ca + ub * cb) / (ua + ub);
+      }
+#endif
       dis = 0.0;
       if (min(wa, wb) > 0.2 * (wa + wb)) dis = l1(sampleSoft(0, fa), sampleSoft(1, fb));
     }
     float t_h = (here & 256u) != 0u ? planAt(P_HUD, 0, pos) : 0.0;
+    if (O_HUDCELL && (here & 256u) != 0u) {
+      // A remembered cell (review 12.4): its pixels that are the same in both pictures are the screen's, one by one; what moves in the cell
+      // stays the layers'. A cell remembered by mistake is harmless: a pixel the same in A and B shown in place is right.
+      float t_p = planAt(P_HUDMEM, 1, pos);
+      if (t_p > 0.01 && screenPixel(q, pos)) t_h = max(t_h, t_p);
+    }
     if (t_h > 0.01) {
+#ifdef ZFG_PHASE
+      vec3 c3 = mix(sampleReal(0, pos), sampleReal(1, pos), PH_A);
+#else
       vec3 c3 = 0.5 * (sampleReal(0, pos) + sampleReal(1, pos));
+#endif
       colour += rem * t_h * c3;
       rem *= 1.0 - t_h;
     }

@@ -4198,7 +4198,7 @@ bool VulkanPresenter::ProcessZeroFGGeneration(
                 request.previous_layout, request.previous_source_id),
       wrap_real(request.current_image, request.current_view,
                 request.current_layout, request.current_source_id),
-      0.5f,
+      request.phase,  // MFG: 0.5 at x2; k / N for a pair's k-th frame
       wrap_internal(*context.outputs[selected]));
   if (interpolate_status != zerofg::Status::kSuccess) {
     dfn.vkResetCommandPool(device, command.command_pool, 0);
