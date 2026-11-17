@@ -1,14 +1,16 @@
 # ZeroFG source snapshot
 
-This directory contains the ZeroFG engine of the MFG development branch `mfg/core`. It is not published yet. It sits on top of v1.1.0 and the
+This directory contains the ZeroFG engine of the MFG development branch `mfg/core` (local, at `db3a05b`). It is not published yet. It sits on top of v1.1.0 and the
 license commit `10e68b6`. ZeroFG is `Apache-2.0 OR GPL-2.0-or-later` since that commit; it is used here under Apache-2.0, `LICENSE`.
 
 The branch adds:
 - any phase between the Reals (x3 / x4), with the same-pair contract;
 - Zero's screen by cells (`kHudCells`);
-- Zero's light gain (`kLightGain`).
+- Zero's light gain (`kLightGain`);
+- Zero's stop rule (`kStopStill`): when the camera stops, the fallback surface holds still instead of carrying the last search's
+  motion; and a switch for the base's cleanup (`kBaseClean`, kept on).
 
-At the middle, with both switches off, it is bit-identical to v1.1.0. The engine sources, public headers, shader sources, shipped SPIR-V
+At the middle, with the switches off (`kHudCells`, `kLightGain`, `kStopStill` 0; `kBaseClean` 1), it is bit-identical to v1.1.0. The engine sources, public headers, shader sources, shipped SPIR-V
 headers, shader compiler and CMake file are that branch's, byte for byte. Until it is published this snapshot is for internal builds, and
 the published v1.1.0 snapshot is `f9b0b5cef`.
 
