@@ -8690,6 +8690,15 @@ struct ZeroFGIndependentPresenter::Impl {
         return 2;
       }
       const double r = double(period_ns) / double(refresh_ns);
+      // Hysteresis (Gears of War 3 at a 30 lock wanders 33 - 36 ms, 2026-11-18: N went 4 - 2 - 4 at every reanchor): the epoch's
+      // N > 2 holds while r / N stays within 12 % of a whole number; a new N needs the 3 % rule.
+      if (stable_output_n > 2 && stable_output_n <= ceiling && double(stable_output_n) <= r * 1.12) {
+        const double per = r / double(stable_output_n);
+        const double whole = std::round(per);
+        if (whole >= 1.0 && std::abs(per - whole) <= 0.12 * whole) {
+          return stable_output_n;
+        }
+      }
       for (uint32_t n = ceiling; n >= 3; --n) {
         if (double(n) > r * 1.03) {
           continue;
@@ -11524,7 +11533,15 @@ struct ZeroFGIndependentPresenter::Impl {
       if (!source_rate_transition_reanchor_pending && !source_phase_reanchor_pending &&
           !CountLiveUnanchoredSynthetics()) {
         const uint64_t lattice_period_ns = FrequencyAuthorityPeriodNs();
-        if (lattice_period_ns && MfgNForPeriod(lattice_period_ns) != stable_output_n) {
+        const uint32_t desired_n = lattice_period_ns ? MfgNForPeriod(lattice_period_ns) : stable_output_n;
+        // A new N must hold 1.5 s before it asks for the reanchor (one change, not a flutter).
+        if (desired_n == stable_output_n) {
+          mfg_desired_n = 0;
+        } else if (desired_n != mfg_desired_n) {
+          mfg_desired_n = desired_n;
+          mfg_desired_since_ns = current_time_ns;
+        } else if (current_time_ns - mfg_desired_since_ns >= 1500000000ull) {
+          mfg_desired_n = 0;
           source_rate_transition_reanchor_pending = true;
           ++mfg_n_reanchor_request_total;
         }
@@ -16030,13 +16047,16 @@ struct ZeroFGIndependentPresenter::Impl {
                     last_applied_real_commitment.semantic_tick_index,
                     SaturatingMultiplyNs(
                         pair_lattice_distance,
-                        transition_real_only ? 1 : 2))
+                        transition_real_only
+                            ? 1
+                            : last_applied_real_commitment.mfg_n))
               : 0;
       pair_normal_boundary_tick =
           pair_timing_valid
               ? SaturatingAddNs(
                     last_applied_real_commitment.semantic_tick_index,
-                    SaturatingMultiplyNs(pair_lattice_distance, 2))
+                    SaturatingMultiplyNs(pair_lattice_distance,
+                                         last_applied_real_commitment.mfg_n))
               : 0;
       // H14.1: the pair boundary is allowed to become B's first commitment
       // only here, while B is the ordered head, and only while A and the
@@ -16484,8 +16504,12 @@ struct ZeroFGIndependentPresenter::Impl {
     const bool real_order_bad =
         logical.candidate.kind == CandidateKind::kReal && previous_source &&
         logical.candidate.source_id <= previous_source;
+    // MFG: S_k sits k * d_lat ticks after its A (x2: k = 1).
     const uint64_t synthetic_pair_quantum_ns =
-        logical.candidate.semantic_output_quantum_ns;
+        logical.candidate.semantic_output_quantum_ns *
+        (logical.candidate.kind == CandidateKind::kSynthetic
+             ? std::max<uint32_t>(logical.candidate.mfg_k, 1)
+             : 1);
     const bool synthetic_pair_target_bad =
         logical.candidate.kind == CandidateKind::kSynthetic &&
         (!synthetic_pair_distance_valid ||
@@ -19591,6 +19615,8 @@ struct ZeroFGIndependentPresenter::Impl {
   uint64_t mfg_step_down_total = 0;
   uint64_t mfg_step_up_retry_total = 0;
   uint64_t mfg_pair_short_total = 0;  // pairs that got fewer than N - 1 frames (no room or no timing)
+  uint32_t mfg_desired_n = 0;  // a different N the rule wants, and since when (debounce)
+  uint64_t mfg_desired_since_ns = 0;
   uint64_t operating_latency_ns = 0;
   uint64_t latency_required_last_ns = 0;
   uint64_t next_semantic_target_ns = 0;
