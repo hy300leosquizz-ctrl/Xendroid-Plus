@@ -188,6 +188,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private val session = EmulatorSession()
     private val zeroFgMode = mutableStateOf(ZeroFgMode.OFF)
+    /** MFG (internal test branch): the multiplier ceiling shown under the mode; the presenter takes it at its next reanchor. */
+    private val zeroFgMultiplier = mutableIntStateOf(2)
     private val zeroFgDisplayVote = xendroid.compose.core.ZeroFgDisplayVote()
     private var zeroFgSurfaceGeneration = 0
     private val zeroFgActive = mutableStateOf(false)
@@ -1449,6 +1451,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         if (!booted) return@LaunchedEffect
                         while (isActive) {
                             zeroFgMode.value = session.zeroFgMode()
+                            zeroFgMultiplier.intValue = session.zeroFgMultiplier()
                             val active = session.zeroFgMainSurfaceActive()
                             zeroFgDisplayVote.update(active,
                                 externalDisplay?.outputSurfaceView ?: surfaceView,
@@ -3285,6 +3288,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 stringResource(R.string.menu_zerofg_reallyzero), stringResource(R.string.menu_zerofg_zero)),
                 selected = zeroFgMode.value.value, own = ZEROFG_KEY in own,
                 note = if (zeroFgMode.value != ZeroFgMode.OFF) zeroFgStatus() else null),
+            InGameAction.ZEROFG_MULTIPLIER to MenuValue(text = "x${zeroFgMultiplier.intValue}",
+                enabled = zeroFgMode.value != ZeroFgMode.OFF),
             InGameAction.WINFG to MenuValue(on = presentation.requested && presentation.engine == 0),
             InGameAction.WINFG_PRESET to MenuValue(text = stringResource(listOf(R.string.menu_preset_quality, R.string.menu_preset_balanced,
                 R.string.menu_preset_performance)[fgPreset.intValue.coerceIn(0, 2)])),
@@ -3734,6 +3739,14 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         cfg.copy(globals = cfg.globals.copy(splitScreen = around(xendroid.compose.gamepad.SplitScreenMode.entries, mode).key))
                     }
                 }.onFailure { Log.w(TAG, "Saving the split screen mode failed", it) }
+            }
+            InGameAction.ZEROFG_MULTIPLIER -> {
+                val next = if (zeroFgMultiplier.intValue >= 4) 2 else zeroFgMultiplier.intValue + 1
+                zeroFgMultiplier.intValue = next
+                session.setZeroFgMultiplier(next)
+                rememberLive("Vulkan|zerofg_multiplier", null)
+                keepChange("Vulkan|zerofg_multiplier", next.toString())
+                recordEvent("zerofg", "multiplier x$next requested")
             }
             InGameAction.WINFG_PRESET -> {
                 fgPreset.intValue = around(listOf(0, 1, 2), fgPreset.intValue)
