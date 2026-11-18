@@ -17,11 +17,11 @@ class SettingsSchemaTest {
     // less APU|mute and GPU|readback_memexport, which the core never defined (ajustes-2.md).
     // Display|host_present_from_non_ui_thread is intentionally absent (forced true natively).
     // Plus adds Vulkan|zerofg_mode, in its own ZeroFG section, and System link's Network|systemlink and
-    // Network|systemlink_peers: 176.
-    @Test fun total_entry_count_is_176() {
-        assertEquals(176, all.size)
+    // Network|systemlink_peers: 176. The MFG test branch adds Vulkan|zerofg_multiplier: 177.
+    @Test fun total_entry_count_is_177() {
+        assertEquals(177, all.size)
         assertEquals(
-            176,
+            177,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
@@ -30,7 +30,7 @@ class SettingsSchemaTest {
     @Test fun counts_by_type_match_verified_inventory() {
         assertEquals(120, all.count { it is Setting.Bool })        // 103 + 18 new - 2 the core never had + systemlink
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
-        assertEquals(31, all.count { it is Setting.ListChoice })   // 27 + 3 new + zerofg_mode
+        assertEquals(32, all.count { it is Setting.ListChoice })   // 27 + 3 new + zerofg_mode + zerofg_multiplier
         assertEquals(2, all.count { it is Setting.Action })
         assertEquals(3, all.count { it is Setting.Text })          // launch_module, cl, systemlink_peers
     }

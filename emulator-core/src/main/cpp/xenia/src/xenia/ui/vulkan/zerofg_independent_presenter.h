@@ -39,7 +39,8 @@ class ZeroFGIndependentPresenter final {
   // MFG (ZeroFG-DEV MFG_DESIGN_2026-11.md, section 3): the most outputs per pair, one Real and N - 1 generated. A compile-time ceiling:
   // every published build keeps 2, and with 2 every pool below is today's number and a pair's frames are one. An internal build sets 4.
 #ifndef ZEROFG_MFG_MAX_N
-#define ZEROFG_MFG_MAX_N 2
+// Branch zerofg-mfg (internal test builds, never published): 4. Published builds keep 2 until T2 and T4 pass (MFG_DESIGN 3.7).
+#define ZEROFG_MFG_MAX_N 4
 #endif
   static constexpr uint32_t kZeroFGMfgMaxN = ZEROFG_MFG_MAX_N;
   static_assert(kZeroFGMfgMaxN >= 2 && kZeroFGMfgMaxN <= 4);

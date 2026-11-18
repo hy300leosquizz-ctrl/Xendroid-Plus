@@ -136,6 +136,14 @@ DEFINE_bool(
     "only the newest (~60 of 120 shown for minutes). Off: the logical target "
     "is the desired present time. Startup-only; default on.",
     "Vulkan");
+DEFINE_uint32(
+    zerofg_multiplier, 2,
+    "Frame generation multiplier ceiling: 2 (one generated frame per game "
+    "frame), 3 or 4. ZeroFG takes the largest N up to it whose N x the "
+    "game's rate fits the display's refresh evenly (30 fps on 120 Hz: x4; "
+    "40 fps: x3; 60 fps: x2), steps down when the GPU cannot keep up, and "
+    "needs the vsync quantizer and free output. Read at each reanchor.",
+    "Vulkan");
 DEFINE_bool(
     zerofg_phase_recovery, true,
     "Keep the output calendar on the game's own clock under the rate lock: "

@@ -132,7 +132,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         private const val ZEROFG_KEY = "Vulkan|zerofg_mode"
         private val MENU_CONFIG_KEYS = listOf(FPS_KEY, SCALING_KEY, AA_KEY, CAS_KEY, DITHER_KEY, TOUCH_KEY, VOLUME_KEY, ZEROFG_KEY) +
             xendroid.compose.core.GpuLiveOption.entries.map { it.key }
-        private val FPS_CHOICES = listOf(0, 30, 45, 60, 90, 120)
+        // 15, 20 and 40: sources for the generator's x3 / x4 tests (40 -> 120 at x3, 30 -> 120 and 15 -> 60 at x4, 20 -> 60 at x3).
+        private val FPS_CHOICES = listOf(0, 15, 20, 30, 40, 45, 60, 90, 120)
         private val HUD_DETAILS = listOf(xendroid.compose.core.HudDetail.COMPACT, xendroid.compose.core.HudDetail.FULL,
             xendroid.compose.core.HudDetail.PANEL)
         private const val HUD_SCALE_SPAN = xendroid.compose.core.HudPlacements.MAX_SCALE - xendroid.compose.core.HudPlacements.MIN_SCALE
