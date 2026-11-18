@@ -526,6 +526,8 @@ struct ZeroFGIndependentPresenter::Impl {
   static constexpr uint32_t kLogicalOutputCapacity =
       kLogicalRealReserve + kLogicalSyntheticCapacity;
   static_assert(kFinalOutputPoolSize > 1);
+  // The egress keeps a copy context per FinalOutput slot (MFG: 9 at x4 broke a session at slot 8 when the egress held 8).
+  static_assert(kFinalOutputPoolSize <= ZeroFGMainSurfaceEgress::kMaxSlots);
   static_assert(kRealResidencyCapacity > 2);
   static_assert(kCapturePoolSize >= kMailboxCount);
   static_assert(kPoolSize > kCandidateReserveTarget);

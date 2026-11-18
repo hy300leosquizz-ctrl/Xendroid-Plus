@@ -80,7 +80,8 @@ class ZeroFGMainSurfaceProducer {
 // back as a completion once the copy that read it has finished.
 class ZeroFGMainSurfaceEgress {
  public:
-  static constexpr uint32_t kMaxSlots = 8;
+  // The presenter's FinalOutput pool: 2 N + 1 (9 at the MFG ceiling of 4). One slot per FinalOutput, so it must hold all of them.
+  static constexpr uint32_t kMaxSlots = 9;
 
   enum class Failure : uint32_t {
     kNone,
