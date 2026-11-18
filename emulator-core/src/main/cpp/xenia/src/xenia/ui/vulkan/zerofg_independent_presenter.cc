@@ -8673,14 +8673,20 @@ struct ZeroFGIndependentPresenter::Impl {
     }
   }
 
-  // MFG_DESIGN 3.5: N is the largest n up to the selector (and the overload's ceiling) with n <= r and r / n within 3 % of a
-  // whole number, r the refreshes per game frame on the panel's observed cycle; 2 when there is none, when the selector is x2, or
-  // without the vsync quantizer and free output (3.4: N outputs producible at once need one vsync each).
+  // The owner, 2026-11-18, after the first x3 / x4 runs: "tirar as proteções... cair automático é roubada, porque framerate
+  // flutua naturalmente... só mandar fazer e pronto". N is the selector, as chosen: no fit rule against the refresh and no step
+  // down (kMfgForced). It still needs the vsync quantizer and free output (3.4: N outputs producible at once need one vsync each).
+  // With kMfgForced false it is MFG_DESIGN 3.5: the largest n up to the selector with n <= r and r / n within 3 % of a whole
+  // number, r the refreshes per game frame, with 12 % hysteresis for the epoch's N.
+  static constexpr bool kMfgForced = true;
   uint32_t MfgNForPeriod(uint64_t period_ns) const {
     if constexpr (kZeroFGMfgMaxN == 2) {
       return 2;
     } else {
       const uint32_t selector = std::clamp<uint32_t>(cvars::zerofg_multiplier, 2, kZeroFGMfgMaxN);
+      if (kMfgForced) {
+        return cvars::zerofg_free_output && cvars::zerofg_vsync_quantizer ? selector : 2;
+      }
       const uint32_t ceiling = std::min(selector, mfg_overload_ceiling);
       if (ceiling <= 2 || !period_ns || !cvars::zerofg_free_output || !cvars::zerofg_vsync_quantizer) {
         return 2;
@@ -11529,7 +11535,9 @@ struct ZeroFGIndependentPresenter::Impl {
     // MFG (MFG_DESIGN 3.2, 3.5): N changes only at a reanchor, future-only, through the confirmed-transition path a period change
     // takes, and only while no S waits for its A (an unanchored S was made for the epoch's N; its A must commit in that epoch).
     if constexpr (kZeroFGMfgMaxN > 2) {
-      ObserveMfgOverload(current_time_ns);
+      if (!kMfgForced) {
+        ObserveMfgOverload(current_time_ns);
+      }
       if (!source_rate_transition_reanchor_pending && !source_phase_reanchor_pending &&
           !CountLiveUnanchoredSynthetics()) {
         const uint64_t lattice_period_ns = FrequencyAuthorityPeriodNs();
@@ -11540,7 +11548,7 @@ struct ZeroFGIndependentPresenter::Impl {
         } else if (desired_n != mfg_desired_n) {
           mfg_desired_n = desired_n;
           mfg_desired_since_ns = current_time_ns;
-        } else if (current_time_ns - mfg_desired_since_ns >= 1500000000ull) {
+        } else if (kMfgForced || current_time_ns - mfg_desired_since_ns >= 1500000000ull) {
           mfg_desired_n = 0;
           source_rate_transition_reanchor_pending = true;
           ++mfg_n_reanchor_request_total;

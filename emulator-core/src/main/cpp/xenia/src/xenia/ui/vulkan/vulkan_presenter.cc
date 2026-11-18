@@ -138,11 +138,11 @@ DEFINE_bool(
     "Vulkan");
 DEFINE_uint32(
     zerofg_multiplier, 2,
-    "Frame generation multiplier ceiling: 2 (one generated frame per game "
-    "frame), 3 or 4. ZeroFG takes the largest N up to it whose N x the "
-    "game's rate fits the display's refresh evenly (30 fps on 120 Hz: x4; "
-    "40 fps: x3; 60 fps: x2), steps down when the GPU cannot keep up, and "
-    "needs the vsync quantizer and free output. Read at each reanchor.",
+    "Frame generation multiplier: 2 (one generated frame per game "
+    "frame), 3 or 4, used as chosen (no fit rule, no step down; MFG "
+    "test branch). Even motion needs N x the game's rate to match the "
+    "display (30 fps on 120 Hz: x4, 40 fps: x3). Needs the vsync "
+    "quantizer and free output. Read at each reanchor.",
     "Vulkan");
 DEFINE_bool(
     zerofg_phase_recovery, true,
