@@ -1349,6 +1349,19 @@ static jint j_zerofg_multiplier(JNIEnv* env, jobject thiz) {
     return jint(cvars::zerofg_multiplier);
 }
 
+// Zero's switches (MFG test branch): bit 1 Zero light, bit 2 x4's quarters from the base. The presenter sees the change at its next
+// paint and rebuilds ZeroFG, as for a mode change.
+static void j_set_zerofg_zero_options(JNIEnv* env, jobject thiz, jint options) {
+    cvars::zerofg_zero_light = (options & 1) != 0;
+    cvars::zerofg_zero_quarter_base = (options & 2) != 0;
+    ae::RequestPresentationRefresh();
+    XELOGI("ZeroFG: Zero options light {} quarter_base {} requested from the app", cvars::zerofg_zero_light, cvars::zerofg_zero_quarter_base);
+}
+
+static jint j_zerofg_zero_options(JNIEnv* env, jobject thiz) {
+    return jint(xe::ui::vulkan::ZeroFGZeroOptions());
+}
+
 static jint j_zerofg_mode(JNIEnv* env, jobject thiz) {
     return jint(xe::ui::vulkan::RequestedZeroFGMode());
 }
@@ -2169,6 +2182,8 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"set_frame_generation", "(ZIF)V", (void *) j_set_frame_generation}
             ,{"set_zerofg_mode", "(I)V", (void *) j_set_zerofg_mode}
             ,{"zerofg_mode", "()I", (void *) j_zerofg_mode}
+            ,{"set_zerofg_zero_options", "(I)V", (void *) j_set_zerofg_zero_options}
+            ,{"zerofg_zero_options", "()I", (void *) j_zerofg_zero_options}
             ,{"set_zerofg_multiplier", "(I)V", (void *) j_set_zerofg_multiplier}
             ,{"zerofg_multiplier", "()I", (void *) j_zerofg_multiplier}
             ,{"zerofg_main_surface_active", "()Z", (void *) j_zerofg_main_surface_active}

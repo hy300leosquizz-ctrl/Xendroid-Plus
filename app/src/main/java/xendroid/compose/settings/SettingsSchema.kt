@@ -19,6 +19,8 @@ object SettingsSchema {
                 "off" to "Off", "reallyzero" to "ReallyZero", "zero" to "Zero"),
             l("Vulkan", "zerofg_multiplier", "Frame generation multiplier", "2",
                 "2" to "x2", "3" to "x3 (internal test)", "4" to "x4 (internal test)"),
+            b("Vulkan", "zerofg_zero_light", "Zero light (internal test)", true),
+            b("Vulkan", "zerofg_zero_quarter_base", "x4: quarters from ReallyZero (internal test)", true),
         )),
 
         SettingsCategory("Vulkan", listOf(

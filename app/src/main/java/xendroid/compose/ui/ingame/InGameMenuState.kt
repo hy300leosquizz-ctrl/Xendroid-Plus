@@ -42,6 +42,8 @@ enum class InGameAction(val kind: RowKind) {
     ZEROFG(RowKind.CHOICE),
     /** MFG (internal test branch): the ZeroFG multiplier ceiling, x2 / x3 / x4, under the mode. */
     ZEROFG_MULTIPLIER(RowKind.CYCLE),
+    /** MFG test branch: Zero light (one background surface, one render pass, no guided matte) and x4's quarters from the base. */
+    ZEROFG_LIGHT(RowKind.TOGGLE), ZEROFG_QUARTER_BASE(RowKind.TOGGLE),
     WINFG(RowKind.TOGGLE), WINFG_PRESET(RowKind.CYCLE), LSFG(RowKind.TOGGLE),
     LSFG_MULTIPLIER(RowKind.CYCLE),
     /** 15d: LSFG by an output target (60/90/120/the display) instead of a multiplier by hand. */
@@ -122,7 +124,7 @@ val inGamePageGroups: Map<InGamePage, List<MenuGroup>> = mapOf(
         MenuGroup(R.string.menu_group_picture, listOf(InGameAction.DISPLAY_MODE, InGameAction.SCALING_EFFECT,
             InGameAction.ANTIALIASING, InGameAction.SHARPNESS, InGameAction.DITHER, InGameAction.COLOR_FILTER, InGameAction.STRETCH)),
         MenuGroup(R.string.menu_group_tv, listOf(InGameAction.EXTERNAL_DISPLAY, InGameAction.TV_MARGIN)),
-        MenuGroup(R.string.menu_group_frame_generation, listOf(InGameAction.ZEROFG, InGameAction.ZEROFG_MULTIPLIER, InGameAction.WINFG, InGameAction.WINFG_PRESET, InGameAction.LSFG,
+        MenuGroup(R.string.menu_group_frame_generation, listOf(InGameAction.ZEROFG, InGameAction.ZEROFG_MULTIPLIER, InGameAction.ZEROFG_LIGHT, InGameAction.ZEROFG_QUARTER_BASE, InGameAction.WINFG, InGameAction.WINFG_PRESET, InGameAction.LSFG,
             InGameAction.LSFG_MULTIPLIER, InGameAction.LSFG_TARGET, InGameAction.IMPORT_LSFG_DLL, InGameAction.CLEAR_LSFG_CACHE)),
         MenuGroup(R.string.menu_group_driver, listOf(InGameAction.DRIVER_INFO)),
     ),

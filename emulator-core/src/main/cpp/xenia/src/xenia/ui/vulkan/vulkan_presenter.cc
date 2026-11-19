@@ -136,6 +136,19 @@ DEFINE_bool(
     "only the newest (~60 of 120 shown for minutes). Off: the logical target "
     "is the desired present time. Startup-only; default on.",
     "Vulkan");
+DEFINE_bool(
+    zerofg_zero_light, true,
+    "Zero light (MFG test branch): one background surface, one render pass "
+    "and the lattice's mattes without the guided filter. The render about "
+    "40 % cheaper on the Adreno 840; weaker where several rigid surfaces "
+    "cross. Changing it rebuilds ZeroFG.",
+    "Vulkan");
+DEFINE_bool(
+    zerofg_zero_quarter_base, true,
+    "x4's quarter phases from the dense-flow base (MFG test branch): only "
+    "the middle frame of a pair is Zero's layers, the two quarters are "
+    "ReallyZero's picture. Changing it rebuilds ZeroFG.",
+    "Vulkan");
 DEFINE_uint32(
     zerofg_multiplier, 2,
     "Frame generation multiplier: 2 (one generated frame per game "
@@ -2035,6 +2048,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
       zerofg_bound_selection_.load(std::memory_order_acquire)) {
     return PaintResult::kNotPresentedConnectionOutdated;
   }
+  // Zero's switches (zerofg_zero_light, zerofg_zero_quarter_base) are fixed
+  // for an adapter's life: a change rebuilds ZeroFG as a mode change does.
+  if (zerofg_bound_selection_.load(std::memory_order_acquire) ==
+          ZeroFGSelection::kZero &&
+      ZeroFGZeroOptions() !=
+          zerofg_bound_zero_options_.load(std::memory_order_acquire)) {
+    return PaintResult::kNotPresentedConnectionOutdated;
+  }
   if (zerofg_independent_presenter_ &&
       zerofg_independent_presenter_->main_surface_reconnect_requested()) {
     // Main Surface Authority: the Surface went out of date under B. The UI
@@ -2990,6 +3011,8 @@ bool VulkanPresenter::ScheduleGuestOutput() {
 bool VulkanPresenter::EnsureZeroFGSessionForMode() {
   const ZeroFGSelection requested = GetZeroFGSelection();
   zerofg_bound_selection_.store(requested, std::memory_order_release);
+  zerofg_bound_zero_options_.store(ZeroFGZeroOptions(),
+                                   std::memory_order_release);
   if (requested == ZeroFGSelection::kOff || zerofg_independent_presenter_)
     return true;
   const bool baseline_available =
@@ -3740,7 +3763,8 @@ bool VulkanPresenter::PrepareZeroFGGenerationContext(
         zerofg_bound_selection_.load(std::memory_order_acquire) == ZeroFGSelection::kReallyZero ? zerofg::Mode::kDenseFlow
                                 : zerofg::Mode::kRC7,
         backend_fallback ? zerofg::Backend::kCompat : zerofg::Backend::kAuto,
-        capabilities, &adapter_status);
+        capabilities, &adapter_status,
+        zerofg_bound_zero_options_.load(std::memory_order_acquire));
   }
   if (!context->adapter) {
     util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,

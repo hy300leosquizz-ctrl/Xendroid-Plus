@@ -5,6 +5,8 @@ package xendroid.compose.settings
 object SettingDescriptions {
     val byName: Map<String, String> = mapOf(
         "zerofg_mode" to "Mobile-native frame generation engine, optimized end to end for performance and image quality at 2X rate. Zero: highest quality. ReallyZero: high quality, lowest cost. Frame-rate limit recommended: set the game's limit to its own rate (30 or 60) for the most even pacing. Vulkan 1.3 required. Hot-swappable from the Frame generation menu",
+        "zerofg_zero_light" to "Zero light (internal test): one background surface, one render pass and the lattice's mattes without the guided filter. The render about 40 % cheaper on the Adreno 840; weaker where several rigid surfaces cross. Changing it rebuilds ZeroFG.",
+        "zerofg_zero_quarter_base" to "x4 (internal test): only the middle frame of each pair comes from Zero's layers; the two quarter frames are ReallyZero's picture. Much cheaper at x4; watch for shimmer at edges. Changing it rebuilds ZeroFG.",
         "zerofg_multiplier" to "Frames per game frame: x2 (one generated), x3 or x4, exactly as chosen (no automatic step down). Even motion needs N x the game's rate to match the display (30 fps on 120 Hz: x4; 40 fps: x3). Internal test builds only.",
         // Redesign: the core's own cvars the app now shows; texts follow the core's descriptions.
         "internal_display_resolution_x" to "Width reported to the game when the display mode is Custom. The core accepts 1 to 1920",

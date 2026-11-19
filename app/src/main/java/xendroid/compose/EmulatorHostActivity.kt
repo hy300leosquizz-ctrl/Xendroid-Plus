@@ -190,6 +190,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val zeroFgMode = mutableStateOf(ZeroFgMode.OFF)
     /** MFG (internal test branch): the multiplier ceiling shown under the mode; the presenter takes it at its next reanchor. */
     private val zeroFgMultiplier = mutableIntStateOf(2)
+    /** Zero's switches (MFG test branch): bit 1 Zero light, bit 2 x4's quarters from the base. A change rebuilds ZeroFG. */
+    private val zeroFgZeroOptions = mutableIntStateOf(3)
     private val zeroFgDisplayVote = xendroid.compose.core.ZeroFgDisplayVote()
     private var zeroFgSurfaceGeneration = 0
     private val zeroFgActive = mutableStateOf(false)
@@ -1452,6 +1454,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         while (isActive) {
                             zeroFgMode.value = session.zeroFgMode()
                             zeroFgMultiplier.intValue = session.zeroFgMultiplier()
+                            zeroFgZeroOptions.intValue = session.zeroFgZeroOptions()
                             val active = session.zeroFgMainSurfaceActive()
                             zeroFgDisplayVote.update(active,
                                 externalDisplay?.outputSurfaceView ?: surfaceView,
@@ -3290,6 +3293,10 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 note = if (zeroFgMode.value != ZeroFgMode.OFF) zeroFgStatus() else null),
             InGameAction.ZEROFG_MULTIPLIER to MenuValue(text = "x${zeroFgMultiplier.intValue}",
                 enabled = zeroFgMode.value != ZeroFgMode.OFF),
+            InGameAction.ZEROFG_LIGHT to MenuValue(on = (zeroFgZeroOptions.intValue and 1) != 0,
+                enabled = zeroFgMode.value == ZeroFgMode.ZERO),
+            InGameAction.ZEROFG_QUARTER_BASE to MenuValue(on = (zeroFgZeroOptions.intValue and 2) != 0,
+                enabled = zeroFgMode.value == ZeroFgMode.ZERO),
             InGameAction.WINFG to MenuValue(on = presentation.requested && presentation.engine == 0),
             InGameAction.WINFG_PRESET to MenuValue(text = stringResource(listOf(R.string.menu_preset_quality, R.string.menu_preset_balanced,
                 R.string.menu_preset_performance)[fgPreset.intValue.coerceIn(0, 2)])),
@@ -3747,6 +3754,16 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 rememberLive("Vulkan|zerofg_multiplier", null)
                 keepChange("Vulkan|zerofg_multiplier", next.toString())
                 recordEvent("zerofg", "multiplier x$next requested")
+            }
+            InGameAction.ZEROFG_LIGHT, InGameAction.ZEROFG_QUARTER_BASE -> {
+                val bit = if (action == InGameAction.ZEROFG_LIGHT) 1 else 2
+                val next = zeroFgZeroOptions.intValue xor bit
+                zeroFgZeroOptions.intValue = next
+                session.setZeroFgZeroOptions(next)
+                val key = if (bit == 1) "Vulkan|zerofg_zero_light" else "Vulkan|zerofg_zero_quarter_base"
+                rememberLive(key, null)
+                keepChange(key, ((next and bit) != 0).toString())
+                recordEvent("zerofg", "zero options $next requested")
             }
             InGameAction.WINFG_PRESET -> {
                 fgPreset.intValue = around(listOf(0, 1, 2), fgPreset.intValue)

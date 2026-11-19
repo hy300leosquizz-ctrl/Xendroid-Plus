@@ -18,10 +18,19 @@ DECLARE_bool(zerofg_vsync_quantizer);
 DECLARE_bool(zerofg_vsync_tight_reach);
 // MFG: the most outputs per pair the user allows (2, 3 or 4; an internal build with kZeroFGMfgMaxN 4 reads it).
 DECLARE_uint32(zerofg_multiplier);
+// Zero's switches (MFG test branch), zerofg::CreateInfo::zero_options: a change rebuilds ZeroFG.
+DECLARE_bool(zerofg_zero_light);
+DECLARE_bool(zerofg_zero_quarter_base);
 
 namespace xe::ui::vulkan {
 
 enum class ZeroFGSelection { kOff, kZero, kReallyZero };
+
+// zerofg::kZeroLight 1, zerofg::kZeroQuarterBase 2.
+inline uint32_t ZeroFGZeroOptions() {
+  return (cvars::zerofg_zero_light ? 1u : 0u) |
+         (cvars::zerofg_zero_quarter_base ? 2u : 0u);
+}
 
 inline ZeroFGSelection StartupZeroFGSelection() {
   const std::string& mode = cvars::zerofg_mode;
