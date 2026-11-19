@@ -8669,6 +8669,93 @@ struct ZeroFGIndependentPresenter::Impl {
                               post_service_gpu_ns.Quantile(90, 100));
   }
 
+  // One output per refresh: N x the game's rate is the refresh (x4 at 30 on 120 Hz, x3 on 90), so every vsync has an output and
+  // no rate change can move the outputs earlier.
+  bool MfgOneRefreshPerOutput() const {
+    const uint64_t refresh_ns = main_surface_egress ? main_surface_egress->RefreshCycleNs() : 0;
+    return refresh_ns && stable_output_quantum_ns && stable_output_quantum_ns <= refresh_ns + refresh_ns / 8;
+  }
+
+  void EndMfgTickRetire(bool lead_gone) {
+    if (mfg_tick_retire_draining) {
+      XELOGI("ZeroFGMfg tick_retire end retired={} reason={}", mfg_tick_retire_episode_count,
+             lead_gone ? "lead_gone" : "lag_or_off");
+      if (lead_gone) {
+        ++mfg_tick_retire_stopped_total;
+      }
+    }
+    mfg_tick_retire_draining = false;
+    mfg_tick_retire_rest = false;
+    mfg_tick_retire_episode_count = 0;
+  }
+
+  // zerofg_mfg_tick_retire (the owner 2026-11-19, the latency wells of x4 at 30 on 120 Hz, ZeroFGRealCommit): every Real
+  // committed at its pair boundary one tick before its target, the phase recovery's reanchors (frequency every 2-8 s on Gears'
+  // wandering rate, and the rate drain's own) each placing the epoch past the ordered boundary plus a quantum and the phase
+  // reserve, and nothing able to take that lead back with one output per refresh. Here, at each Real's first commitment: its
+  // own lead past issue + D; kMfgTickRetireStreak Reals in a row with a cushion, a tick and half a tick of it start a drain,
+  // and while the lead holds every other Real commits with N - 1 for its pair (one S fewer, phases k / (N - 1)), so B and every
+  // later output land one tick earlier. A Real whose lead no longer holds that ends the drain; kMfgTickRetireEpisodeMax retires
+  // without the lead falling block it until it does (a drain that does not drain is not repeated). Reals are never dropped.
+  void TickRetireMfgPair(OutputCandidate& candidate, uint64_t assigned_target_ns) {
+    if (!cvars::zerofg_mfg_tick_retire || candidate.mfg_n < 3 || !candidate.issue_time_ns || !operating_latency_ns ||
+        !MfgOneRefreshPerOutput()) {
+      EndMfgTickRetire(false);
+      mfg_tick_retire_high_streak = 0;
+      return;
+    }
+    const int64_t own_excess_ns =
+        PresenterSignedDeltaNs(assigned_target_ns, SaturatingAddNs(candidate.issue_time_ns, operating_latency_ns));
+    const int64_t needed_ns = int64_t(phase_recovery_cushion_ns) + int64_t(stable_output_quantum_ns) +
+                              int64_t(stable_output_quantum_ns / 2);
+    if (own_excess_ns < needed_ns) {
+      EndMfgTickRetire(true);
+      mfg_tick_retire_high_streak = 0;
+      mfg_tick_retire_blocked = false;
+      return;
+    }
+    if (mfg_tick_retire_blocked) {
+      return;
+    }
+    if (!mfg_tick_retire_draining) {
+      if (++mfg_tick_retire_high_streak < kMfgTickRetireStreak) {
+        return;
+      }
+      mfg_tick_retire_high_streak = 0;
+      mfg_tick_retire_draining = true;
+      mfg_tick_retire_rest = false;
+      mfg_tick_retire_episode_count = 0;
+      ++mfg_tick_retire_request_total;
+      XELOGI("ZeroFGMfg tick_retire start own_excess_us={} needed_us={} quantum_us={} N={} D_us={}", own_excess_ns / 1000,
+             needed_ns / 1000, stable_output_quantum_ns / 1000, candidate.mfg_n, operating_latency_ns / 1000);
+    }
+    if (mfg_tick_retire_rest) {
+      mfg_tick_retire_rest = false;  // every other pair at most: never a run of pairs at N / (N - 1) of the motion's speed
+      return;
+    }
+    // An S of this Real's pair made before its commitment took the epoch's N for its phase and tick: this pair keeps N.
+    for (const LogicalOutput& logical : logical_outputs) {
+      if (logical.state != LogicalOutputState::kFree && logical.state != LogicalOutputState::kDropped &&
+          logical.candidate.kind == CandidateKind::kSynthetic &&
+          logical.candidate.pair_a_source_id == candidate.source_id) {
+        ++mfg_tick_retire_pair_made_total;
+        return;
+      }
+    }
+    if (mfg_tick_retire_episode_count >= kMfgTickRetireEpisodeMax) {
+      XELOGI("ZeroFGMfg tick_retire capped retired={} own_excess_us={}", mfg_tick_retire_episode_count,
+             own_excess_ns / 1000);
+      ++mfg_tick_retire_capped_total;
+      EndMfgTickRetire(false);
+      mfg_tick_retire_blocked = true;
+      return;
+    }
+    --candidate.mfg_n;
+    ++mfg_tick_retire_total;
+    ++mfg_tick_retire_episode_count;
+    mfg_tick_retire_rest = true;
+  }
+
   // MFG: the epoch's N (a constant 2 when kZeroFGMfgMaxN is 2, so every site that reads it compiles as before).
   uint32_t EpochN() const {
     if constexpr (kZeroFGMfgMaxN == 2) {
@@ -11186,40 +11273,18 @@ struct ZeroFGIndependentPresenter::Impl {
     // the epoch at issue + D if the drain went past it.
     // zerofg_mfg_tick_retire (the owner 2026-11-19, the latency wells of x4
     // at 30 on 120 Hz): with one output per refresh (N x the game's rate =
-    // the refresh) the rate drain below cannot work, since N outputs need N
-    // vsyncs whatever the period. The lead drains in whole ticks instead:
-    // each of the next Reals commits with N - 1 for its pair (one S fewer,
-    // phases k / (N - 1)), so B and everything after it lands one tick
-    // earlier. As many ticks as the lead holds beyond the cushion, at most
-    // kMfgTickRetireMax; one schedule per cooldown. A Real is never dropped.
-    bool tick_retire_owns_lead = false;
-    if (cvars::zerofg_mfg_tick_retire && EpochN() >= 3) {
-      const uint64_t refresh_now_ns =
-          main_surface_egress ? main_surface_egress->RefreshCycleNs() : 0;
-      const bool one_refresh_per_output =
-          refresh_now_ns &&
-          stable_output_quantum_ns <= refresh_now_ns + refresh_now_ns / 8;
-      if (one_refresh_per_output && lead_due) {
-        tick_retire_owns_lead = true;
-        if (!mfg_tick_retire_pending &&
-            (!mfg_tick_retire_last_ns ||
-             now_ns - mfg_tick_retire_last_ns >=
-                 std::max<uint64_t>(kPhaseRecoveryCooldownNs,
-                                    kPhaseRecoveryPhaseWindowNs))) {
-          const int64_t ticks = (lead_ns - cushion_ns) / quantum_ns;
-          if (ticks > 0) {
-            mfg_tick_retire_pending =
-                uint32_t(std::min<int64_t>(ticks, kMfgTickRetireMax));
-            mfg_tick_retire_last_ns = now_ns;
-            ++mfg_tick_retire_request_total;
-            XELOGI("ZeroFGMfg tick_retire ticks={} lead_us={} cushion_us={} "
-                   "quantum_us={} N={}",
-                   mfg_tick_retire_pending, lead_ns / 1000, cushion_ns / 1000,
-                   quantum_ns / 1000, EpochN());
-          }
-        }
-      }
+    // the refresh) the rate drain below cannot shorten anything, since N
+    // outputs need N vsyncs whatever the period, and its own reanchors place
+    // the epoch past the ordered boundary plus a quantum and the phase reserve
+    // again: at x4 each one added lead instead of draining it. There the lead
+    // drains in whole ticks at the Reals' commitment (TickRetireMfgPair) and
+    // the rate drain stays off. A lag ends a tick drain.
+    if (lag_due) {
+      EndMfgTickRetire(false);
     }
+    const bool tick_retire_owns_lead =
+        cvars::zerofg_mfg_tick_retire && EpochN() >= 3 &&
+        MfgOneRefreshPerOutput();
     const char* cause = nullptr;
     uint64_t period_ns = 0;
     if (phase_recovery_drain_ns) {
@@ -16145,16 +16210,7 @@ struct ZeroFGIndependentPresenter::Impl {
     candidate.semantic_epoch_origin_ns = semantic_epoch_origin_ns;
     candidate.semantic_output_quantum_ns = stable_output_quantum_ns;
     candidate.mfg_n = EpochN();  // MFG: the pair from this Real to the next takes this epoch's N
-    // zerofg_mfg_tick_retire: a pair of a lead drain takes N - 1 (one S fewer).
-    if (mfg_tick_retire_pending) {
-      if (cvars::zerofg_mfg_tick_retire && candidate.mfg_n >= 3) {
-        --candidate.mfg_n;
-        --mfg_tick_retire_pending;
-        ++mfg_tick_retire_total;
-      } else {
-        mfg_tick_retire_pending = 0;
-      }
-    }
+    TickRetireMfgPair(candidate, assigned_target_ns);
     candidate.semantic_tick_index = assigned_tick;
     candidate.target_time_ns = assigned_target_ns;
     last_semantic_target_ns =
@@ -18305,7 +18361,7 @@ struct ZeroFGIndependentPresenter::Impl {
         "late={} lateness_us p50/p90={}/{} runway_pair_us p50/p90={}/{} "
         "runway_projection_us p50/p90={}/{} ready_at_commit={} "
         "ready_age_us p50/p90={}/{} D_us={} mfg_pair_short={} "
-        "tick_retire on/pending/retired/schedules={}/{}/{}/{}",
+        "tick_retire on/draining/retired/drains/ended/capped/pair_made={}/{}/{}/{}/{}/{}/{}",
         real_commit_observed_total, commit_route_pair_boundary_total,
         commit_route_projection_total, commit_boundary_kind_total[0],
         commit_boundary_kind_total[1], commit_boundary_kind_total[2],
@@ -18332,8 +18388,10 @@ struct ZeroFGIndependentPresenter::Impl {
         real_ready_age_at_commit_ns.Quantile(50, 100) / 1000,
         real_ready_age_at_commit_ns.Quantile(90, 100) / 1000,
         operating_latency_ns / 1000, mfg_pair_short_total,
-        cvars::zerofg_mfg_tick_retire, mfg_tick_retire_pending,
-        mfg_tick_retire_total, mfg_tick_retire_request_total);
+        cvars::zerofg_mfg_tick_retire, mfg_tick_retire_draining,
+        mfg_tick_retire_total, mfg_tick_retire_request_total,
+        mfg_tick_retire_stopped_total, mfg_tick_retire_capped_total,
+        mfg_tick_retire_pair_made_total);
     XELOGI(
         "ZeroFGDeviceB domain=presenter_B Source_q0_counts_exclude_B=true "
         "ingress_queue_busy_retry={} submit_after_teardown_idle={} "
@@ -19717,13 +19775,21 @@ struct ZeroFGIndependentPresenter::Impl {
   uint64_t mfg_step_down_total = 0;
   uint64_t mfg_step_up_retry_total = 0;
   uint64_t mfg_pair_short_total = 0;  // pairs that got fewer than N - 1 frames (no room or no timing)
-  // zerofg_mfg_tick_retire: lead ticks still to retire (one per Real), the
-  // ticks retired, the schedules, and when the last one was made.
-  static constexpr int64_t kMfgTickRetireMax = 16;
-  uint32_t mfg_tick_retire_pending = 0;
+  // zerofg_mfg_tick_retire (TickRetireMfgPair): Reals in a row with the lead, the drain under way and its retires, whether the
+  // next pair rests, whether a drain that did not drain blocks the next one; ticks retired, drains started, drains ended by the
+  // lead falling, drains capped.
+  static constexpr uint32_t kMfgTickRetireStreak = 8;
+  static constexpr uint32_t kMfgTickRetireEpisodeMax = 32;
+  uint32_t mfg_tick_retire_high_streak = 0;
+  bool mfg_tick_retire_draining = false;
+  uint32_t mfg_tick_retire_episode_count = 0;
+  bool mfg_tick_retire_rest = false;
+  bool mfg_tick_retire_blocked = false;
   uint64_t mfg_tick_retire_total = 0;
   uint64_t mfg_tick_retire_request_total = 0;
-  uint64_t mfg_tick_retire_last_ns = 0;
+  uint64_t mfg_tick_retire_stopped_total = 0;
+  uint64_t mfg_tick_retire_capped_total = 0;
+  uint64_t mfg_tick_retire_pair_made_total = 0;  // retires skipped: an S of the pair already existed
   uint32_t mfg_desired_n = 0;  // a different N the rule wants, and since when (debounce)
   uint64_t mfg_desired_since_ns = 0;
   uint64_t operating_latency_ns = 0;
