@@ -137,7 +137,7 @@ DEFINE_bool(
     "is the desired present time. Startup-only; default on.",
     "Vulkan");
 DEFINE_bool(
-    zerofg_vsync_retire, true,
+    zerofg_vsync_retire, false,
     "Main Surface (MFG test branch, the owner 2026-11-19): when every vsync "
     "already has an output (N x the game's rate = the refresh: x4 30 on "
     "120 Hz, x3 on 90, x2 30 on 60), a late output pushed the vsync "

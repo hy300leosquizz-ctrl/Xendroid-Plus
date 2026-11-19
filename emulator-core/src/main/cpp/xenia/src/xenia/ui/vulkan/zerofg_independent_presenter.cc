@@ -18245,6 +18245,46 @@ struct ZeroFGIndependentPresenter::Impl {
         presentation_advance_excess_max_ns / 1000,
         main_surface_egress ? main_surface_egress->RefreshCycleNs() / 1000
                             : 0);
+    // 2026-11-19, the latency wells at x4: why each Real lands where it does
+    // (cumulative per Connect). Route: the pair boundary or the projection;
+    // what last carried the ordered boundary (applied R, applied S, an
+    // explicit S hold, an implicit hold); the projection's extra ticks past
+    // the nominal one, by its winner mask; Reals already due at their first
+    // commitment; the runway and ready age at commitment (p50/p90); D.
+    XELOGI(
+        "ZeroFGRealCommit observed={} route pair/projection={}/{} "
+        "boundary none/R/S/S_hold/implicit_hold={}/{}/{}/{}/{} "
+        "extra_ticks by mask 0..7={}/{}/{}/{}/{}/{}/{}/{} "
+        "projections by mask 0..7={}/{}/{}/{}/{}/{}/{}/{} "
+        "late={} lateness_us p50/p90={}/{} runway_pair_us p50/p90={}/{} "
+        "runway_projection_us p50/p90={}/{} ready_at_commit={} "
+        "ready_age_us p50/p90={}/{} D_us={} mfg_pair_short={}",
+        real_commit_observed_total, commit_route_pair_boundary_total,
+        commit_route_projection_total, commit_boundary_kind_total[0],
+        commit_boundary_kind_total[1], commit_boundary_kind_total[2],
+        commit_boundary_kind_total[3], commit_boundary_kind_total[4],
+        commit_projection_mask_extra_tick_total[0],
+        commit_projection_mask_extra_tick_total[1],
+        commit_projection_mask_extra_tick_total[2],
+        commit_projection_mask_extra_tick_total[3],
+        commit_projection_mask_extra_tick_total[4],
+        commit_projection_mask_extra_tick_total[5],
+        commit_projection_mask_extra_tick_total[6],
+        commit_projection_mask_extra_tick_total[7],
+        commit_projection_mask_total[0], commit_projection_mask_total[1],
+        commit_projection_mask_total[2], commit_projection_mask_total[3],
+        commit_projection_mask_total[4], commit_projection_mask_total[5],
+        commit_projection_mask_total[6], commit_projection_mask_total[7],
+        real_commit_late_total, real_commit_lateness_ns.Quantile(50, 100) / 1000,
+        real_commit_lateness_ns.Quantile(90, 100) / 1000,
+        real_commit_runway_pair_ns.Quantile(50, 100) / 1000,
+        real_commit_runway_pair_ns.Quantile(90, 100) / 1000,
+        real_commit_runway_projection_ns.Quantile(50, 100) / 1000,
+        real_commit_runway_projection_ns.Quantile(90, 100) / 1000,
+        commit_ready_at_commit_total,
+        real_ready_age_at_commit_ns.Quantile(50, 100) / 1000,
+        real_ready_age_at_commit_ns.Quantile(90, 100) / 1000,
+        operating_latency_ns / 1000, mfg_pair_short_total);
     XELOGI(
         "ZeroFGDeviceB domain=presenter_B Source_q0_counts_exclude_B=true "
         "ingress_queue_busy_retry={} submit_after_teardown_idle={} "
