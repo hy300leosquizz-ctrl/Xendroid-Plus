@@ -1,6 +1,6 @@
 # ZeroFG source snapshot
 
-This directory contains the ZeroFG engine of the MFG development branch `mfg/core` (local, at `81309d6`). It is not published yet. It sits on top of v1.1.0 and the
+This directory contains the ZeroFG engine of the MFG development branch `mfg/core` (local, at `24c88f5`). It is not published yet. It sits on top of v1.1.0 and the
 license commit `10e68b6`. ZeroFG is `Apache-2.0 OR GPL-2.0-or-later` since that commit; it is used here under Apache-2.0, `LICENSE`.
 
 The branch adds:
@@ -13,6 +13,7 @@ The branch adds:
   render pass, no guided filter) and `kZeroQuarterBase` (x4's quarter phases from the base's picture), both off by default in the engine.
 - a wipe interpolates (`kCutLit`): a pair is a cut (B whole) only if the points lit in both pictures do not correlate either.
 - fast motion is no cut (`kCutCost`): a cut also needs the motion search to have failed nearly everywhere.
+- a calm pair is the base's (`kEasy`): where the motion search explains nearly everything, the base's picture whole.
 
 At the middle, with the switches off (`kHudCells`, `kLightGain`, `kStopStill` 0; `kBaseClean` 1), it is bit-identical to v1.1.0, except on the pairs the old cut rule took for cuts and `kCutLit` or `kCutCost` do not. The engine sources, public headers, shader sources, shipped SPIR-V
 headers, shader compiler and CMake file are that branch's, byte for byte. Until it is published this snapshot is for internal builds, and
