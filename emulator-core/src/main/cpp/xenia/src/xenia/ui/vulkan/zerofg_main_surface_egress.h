@@ -252,6 +252,11 @@ class ZeroFGMainSurfaceEgress {
     uint64_t vsync_phase_reanchor = 0;
     uint64_t vsync_duplicate_refused = 0;
     uint64_t vsync_gap_absorbed = 0;
+    // zerofg_vsync_retire: whether it is on, and the synthetics retired (with
+    // the phase pushed, and without: two outputs in a row behind).
+    bool vsync_retire = false;
+    uint64_t vsync_retired = 0;
+    uint64_t vsync_retired_unpushed = 0;
     int64_t ready_before_vsync_p10_ns = 0;
     int64_t ready_before_vsync_p50_ns = 0;
     int64_t ready_before_vsync_p90_ns = 0;
@@ -277,7 +282,7 @@ class ZeroFGMainSurfaceEgress {
                           VkFormat format, uint32_t slot_count,
                           bool elevated_priority, bool apocalypse_guard,
                           bool free_output, bool vsync_quantizer,
-                          bool vsync_tight_reach,
+                          bool vsync_tight_reach, bool vsync_retire,
                           std::function<void()> wake_owner);
   ZeroFGMainSurfaceEgress(const ZeroFGMainSurfaceEgress&) = delete;
   ZeroFGMainSurfaceEgress& operator=(const ZeroFGMainSurfaceEgress&) = delete;
@@ -426,6 +431,17 @@ class ZeroFGMainSurfaceEgress {
   // assigned_ns (0 and the logical target when the lattice is not known yet).
   uint64_t QuantizeToVsync(uint64_t target_ns, uint64_t now_ns,
                            uint64_t& assigned_ns);
+  // zerofg_vsync_retire (the owner 2026-11-19, the latency wells of x4 at 30
+  // on 120 Hz): true when this output is a synthetic whose own vsync the
+  // previous present already has while the quantizer's phase is pushed late
+  // (or for the second output in a row): the egress then drops it unshown and
+  // sheds one refresh of phase, so the display steps one tick back towards
+  // its schedule. Every vsync already has an output whenever N x the game's
+  // rate equals the refresh (x4 30 on 120 Hz, x3 on 90, x2 30 on 60), so the
+  // quantizer never finds the free vsync it sheds a phase into, and a pushed
+  // phase became latency for good. A single late S right before its R is
+  // still absorbed as before. Reals are never retired.
+  bool RetireBehindSynthetic(const Request& request);
   // The compositor latches a buffer for vsync V about one refresh before V
   // (shown frames were displayed 8.5-14 ms after ready, 2026-10-07): a slot is
   // reachable when the copy is predicted ready one refresh plus this margin
@@ -528,6 +544,10 @@ class ZeroFGMainSurfaceEgress {
   // switch it off; the window toward that, and whether the present
   // QuantizeToVsync just placed got a slot only the tight reach allowed.
   std::atomic<bool> tight_reach_;
+  // zerofg_vsync_retire (RetireBehindSynthetic) and the outputs in a row whose
+  // own vsync the previous present already had.
+  const bool vsync_retire_;
+  uint32_t vsync_behind_streak_ = 0;
   uint32_t tight_reach_window_presents_ = 0;
   uint32_t tight_reach_window_late_ = 0;
   bool last_quantize_tight_only_ = false;

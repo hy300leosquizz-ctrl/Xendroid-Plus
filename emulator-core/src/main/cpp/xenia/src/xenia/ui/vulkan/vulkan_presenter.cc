@@ -137,6 +137,17 @@ DEFINE_bool(
     "is the desired present time. Startup-only; default on.",
     "Vulkan");
 DEFINE_bool(
+    zerofg_vsync_retire, true,
+    "Main Surface (MFG test branch, the owner 2026-11-19): when every vsync "
+    "already has an output (N x the game's rate = the refresh: x4 30 on "
+    "120 Hz, x3 on 90, x2 30 on 60), a late output pushed the vsync "
+    "quantizer's phase for good (latency wells of 120-216 ms in Gears of War 3 "
+    "at x4). On, a generated frame whose own vsync is already taken while the "
+    "phase is pushed (or for the second output in a row) is not shown, and "
+    "the phase steps one refresh back. Reals are never dropped. Read when "
+    "ZeroFG's output starts (switch frame generation off and on to apply).",
+    "Vulkan");
+DEFINE_bool(
     zerofg_zero_light, true,
     "Zero light (MFG test branch): one background surface, one render pass "
     "and the lattice's mattes without the guided filter. The render about "

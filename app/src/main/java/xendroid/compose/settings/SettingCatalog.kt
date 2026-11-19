@@ -52,6 +52,7 @@ object SettingCatalog {
             e("Vulkan|zerofg_multiplier", E),
             e("Vulkan|zerofg_zero_light", E),
             e("Vulkan|zerofg_zero_quarter_base", E),
+            e("Vulkan|zerofg_vsync_retire", E),
             e("Display|postprocess_scaling_and_sharpening", E, live = true),
             e("GPU|draw_resolution_scale_x", E),
             e("GPU|draw_resolution_scale_y", E),

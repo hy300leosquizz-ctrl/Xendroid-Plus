@@ -21,6 +21,7 @@ object SettingsSchema {
                 "2" to "x2", "3" to "x3 (internal test)", "4" to "x4 (internal test)"),
             b("Vulkan", "zerofg_zero_light", "Zero light (internal test)", true),
             b("Vulkan", "zerofg_zero_quarter_base", "x4: quarters from ReallyZero (internal test)", true),
+            b("Vulkan", "zerofg_vsync_retire", "MFG: drop a late generated frame to keep latency (internal test)", true),
         )),
 
         SettingsCategory("Vulkan", listOf(

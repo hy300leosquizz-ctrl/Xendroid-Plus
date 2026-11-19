@@ -166,7 +166,7 @@ ZeroFGMainSurfaceEgress::ZeroFGMainSurfaceEgress(
     VkSurfaceKHR surface, VkExtent2D extent, VkFormat format,
     uint32_t slot_count, bool elevated_priority, bool apocalypse_guard,
     bool free_output, bool vsync_quantizer, bool vsync_tight_reach,
-    std::function<void()> wake_owner)
+    bool vsync_retire, std::function<void()> wake_owner)
     : device_(device),
       producer_(producer),
       surface_(surface),
@@ -182,8 +182,11 @@ ZeroFGMainSurfaceEgress::ZeroFGMainSurfaceEgress(
       apocalypse_guard_(apocalypse_guard && timing_available_),
       free_output_(free_output),
       vsync_quantizer_(vsync_quantizer && timing_available_),
-      tight_reach_(vsync_tight_reach) {
+      tight_reach_(vsync_tight_reach),
+      vsync_retire_(vsync_retire && free_output && vsync_quantizer &&
+                    timing_available_) {
   counters_.timing_available = timing_available_;
+  counters_.vsync_retire = vsync_retire_;
   counters_.apocalypse_guard = apocalypse_guard_;
   counters_.free_output = free_output_;
   counters_.vsync_quantizer = vsync_quantizer_;
@@ -727,6 +730,10 @@ void ZeroFGMainSurfaceEgress::Serve() {
       DropUnpresented(superseded[i], true);
     }
     superseded_count = 0;
+    if (vsync_retire_ && RetireBehindSynthetic(request)) {
+      DropUnpresented(request, true);
+      continue;
+    }
     bool probe = false;
     if (free_output_ && !PaceFreePresent(request, probe)) {
       Abandon(request);
@@ -1633,6 +1640,76 @@ uint64_t ZeroFGMainSurfaceEgress::QuantizeToVsync(uint64_t target_ns,
   }
   // Half a refresh before the vsync: the compositor targets exactly this one.
   return slot_ns - period_ns / 2;
+}
+
+bool ZeroFGMainSurfaceEgress::RetireBehindSynthetic(const Request& request) {
+  // The quantizer's own state, on this thread: the same lattice QuantizeToVsync
+  // will place this output on. Not while a limiter paces the presents (the
+  // quantizer then is not what decides) or before the lattice is known.
+  if (limiter_period_ns_ || limiter_block_streak_ || !vsync_anchor_ns_ ||
+      !vsync_last_slot_ns_) {
+    vsync_behind_streak_ = 0;
+    return false;
+  }
+  uint64_t period_ns = 0;
+  uint64_t copy_ns = 0;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    period_ns = counters_.refresh_cycle_now_ns;
+    if (copy_residence_ns_.count()) {
+      copy_ns = copy_residence_ns_.Quantile(50, 100);
+    }
+  }
+  if (!period_ns) {
+    vsync_behind_streak_ = 0;
+    return false;
+  }
+  const uint64_t anchor_ns = vsync_anchor_ns_;
+  const uint64_t target_ns = request.desired_present_ns;
+  const uint64_t at_or_after_ns =
+      target_ns <= anchor_ns
+          ? anchor_ns - (anchor_ns - target_ns) / period_ns * period_ns
+          : anchor_ns +
+                (target_ns - anchor_ns + period_ns - 1) / period_ns * period_ns;
+  const uint64_t slot_ns = at_or_after_ns + vsync_offset_periods_ * period_ns;
+  // Behind: the vsync this output's tick maps to is the previous present's,
+  // or an earlier one; QuantizeToVsync would push it to the next.
+  if (slot_ns >= vsync_last_slot_ns_ + period_ns / 2) {
+    vsync_behind_streak_ = 0;
+    return false;
+  }
+  ++vsync_behind_streak_;
+  const bool pushed = vsync_offset_periods_ != 0;
+  if (!request.synthetic || (!pushed && vsync_behind_streak_ < 2)) {
+    return false;
+  }
+  // Only a schedule that is late, not a copy that is: the vsync this output
+  // leaves free must be within the next output's reach with a refresh to
+  // spare (QuantizeToVsync's sum reach), else the next one would push the
+  // phase forward again and the dropped frame would buy nothing.
+  const uint64_t now_ns = EgressMonotonicTimeNs();
+  const uint64_t reach_target_ns =
+      now_ns + copy_ns + period_ns + kVsyncLatchMarginNs;
+  const uint64_t reach_ns =
+      reach_target_ns <= anchor_ns
+          ? anchor_ns - (anchor_ns - reach_target_ns) / period_ns * period_ns
+          : anchor_ns + (reach_target_ns - anchor_ns + period_ns - 1) /
+                            period_ns * period_ns;
+  if (vsync_last_slot_ns_ + period_ns < reach_ns + period_ns) {
+    return false;
+  }
+  if (pushed) {
+    --vsync_offset_periods_;
+  }
+  vsync_behind_streak_ = 0;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    ++counters_.vsync_retired;
+    if (!pushed) {
+      ++counters_.vsync_retired_unpushed;
+    }
+  }
+  return true;
 }
 
 void ZeroFGMainSurfaceEgress::DropUnpresented(const Request& request,

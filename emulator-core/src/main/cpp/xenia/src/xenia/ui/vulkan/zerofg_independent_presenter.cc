@@ -3134,6 +3134,7 @@ struct ZeroFGIndependentPresenter::Impl {
         // quantizer's lead (35-75 ms, Arkham 2026-10-07), so it stays off.
         /*apocalypse_guard=*/false, cvars::zerofg_free_output,
         cvars::zerofg_vsync_quantizer, cvars::zerofg_vsync_tight_reach,
+        cvars::zerofg_vsync_retire,
         [egress_bridge]() { SignalPresenterWake(egress_bridge); });
     const bool egress_started = egress->Start();
     if (egress_started) {
@@ -4607,7 +4608,8 @@ struct ZeroFGIndependentPresenter::Impl {
         "{}/{}/{}/{} ready_before_vsync_us p10/p50/p90={}/{}/{} "
         "vsync hit/late={}/{} hit_min queue/ready_before_vsync_us={}/{} "
         "late_max queue/ready_before_vsync_us={}/{} "
-        "tight_reach={} tight_only/late={}/{}",
+        "tight_reach={} tight_only/late={}/{} "
+        "vsync_retire={} retired/unpushed={}/{}",
         event,
         ZeroFGMainSurfaceProducer::Name(main_surface_producer.state()),
         main_surface_producer.handoff_begin_total(),
@@ -4680,7 +4682,8 @@ struct ZeroFGIndependentPresenter::Impl {
         stats.hit_ready_before_vsync_min_ns / 1000,
         stats.late_queue_before_vsync_max_ns / 1000,
         stats.late_ready_before_vsync_max_ns / 1000, stats.vsync_tight_reach,
-        stats.vsync_tight_only, stats.vsync_tight_only_late);
+        stats.vsync_tight_only, stats.vsync_tight_only_late,
+        stats.vsync_retire, stats.vsync_retired, stats.vsync_retired_unpushed);
   }
 
   bool TryActivateFromNativeSourceCadence() {
