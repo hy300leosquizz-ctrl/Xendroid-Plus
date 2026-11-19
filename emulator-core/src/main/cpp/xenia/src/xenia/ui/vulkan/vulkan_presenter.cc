@@ -138,12 +138,15 @@ DEFINE_bool(
     "Vulkan");
 DEFINE_bool(
     zerofg_mfg_tick_retire, true,
-    "MFG (test branch, the owner 2026-11-19): with one output per refresh (N x "
-    "the game's rate = the refresh: x4 30 on 120 Hz, x3 on 90) the phase "
-    "recovery's rate drain cannot shorten anything, and a late pair left the "
-    "latency high for good (wells of 120-200 ms at x4). On, the lead drains in "
-    "whole ticks: the next pairs take N - 1 frames (one generated frame fewer, "
-    "phases k / (N - 1)), each one tick earlier. Real frames are never dropped.",
+    "MFG (test branch, the owner 2026-11-19): latency wells (120-200 ms at x4). "
+    "Phase recoveries anchor at the oldest pending Real instead of the newest "
+    "(each reanchor added the pending Reals' span to the latency), and with one "
+    "output per refresh (N x the game's rate = the refresh: x4 30 on 120 Hz, x3 "
+    "on 90, x2 30 on 60, x2 60 on 120), where neither the rate drain (off "
+    "there) nor the presentation advance can take a lead back, the lead drains "
+    "in short pairs: N - 1 ticks with one generated frame fewer (at x2 a "
+    "real-only pair), each one tick earlier, every other pair at most. Real "
+    "frames are never dropped.",
     "Vulkan");
 DEFINE_bool(
     zerofg_vsync_retire, false,

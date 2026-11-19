@@ -8676,84 +8676,83 @@ struct ZeroFGIndependentPresenter::Impl {
     return refresh_ns && stable_output_quantum_ns && stable_output_quantum_ns <= refresh_ns + refresh_ns / 8;
   }
 
-  void EndMfgTickRetire(bool lead_gone) {
-    if (mfg_tick_retire_draining) {
-      XELOGI("ZeroFGMfg tick_retire end retired={} reason={}", mfg_tick_retire_episode_count,
-             lead_gone ? "lead_gone" : "lag_or_off");
-      if (lead_gone) {
-        ++mfg_tick_retire_stopped_total;
-      }
-    }
-    mfg_tick_retire_draining = false;
-    mfg_tick_retire_rest = false;
-    mfg_tick_retire_episode_count = 0;
-  }
-
-  // zerofg_mfg_tick_retire (the owner 2026-11-19, the latency wells of x4 at 30 on 120 Hz, ZeroFGRealCommit): every Real
-  // committed at its pair boundary one tick before its target, the phase recovery's reanchors (frequency every 2-8 s on Gears'
-  // wandering rate, and the rate drain's own) each placing the epoch past the ordered boundary plus a quantum and the phase
-  // reserve, and nothing able to take that lead back with one output per refresh. Here, at each Real's first commitment: its
-  // own lead past issue + D; kMfgTickRetireStreak Reals in a row with a cushion, a tick and half a tick of it start a drain,
-  // and while the lead holds every other Real commits with N - 1 for its pair (one S fewer, phases k / (N - 1)), so B and every
-  // later output land one tick earlier. A Real whose lead no longer holds that ends the drain; kMfgTickRetireEpisodeMax retires
-  // without the lead falling block it until it does (a drain that does not drain is not repeated). Reals are never dropped.
-  void TickRetireMfgPair(OutputCandidate& candidate, uint64_t assigned_target_ns) {
-    if (!cvars::zerofg_mfg_tick_retire || candidate.mfg_n < 3 || !candidate.issue_time_ns || !operating_latency_ns ||
-        !MfgOneRefreshPerOutput()) {
-      EndMfgTickRetire(false);
-      mfg_tick_retire_high_streak = 0;
-      return;
-    }
-    const int64_t own_excess_ns =
-        PresenterSignedDeltaNs(assigned_target_ns, SaturatingAddNs(candidate.issue_time_ns, operating_latency_ns));
-    const int64_t needed_ns = int64_t(phase_recovery_cushion_ns) + int64_t(stable_output_quantum_ns) +
-                              int64_t(stable_output_quantum_ns / 2);
-    if (own_excess_ns < needed_ns) {
-      EndMfgTickRetire(true);
-      mfg_tick_retire_high_streak = 0;
-      mfg_tick_retire_blocked = false;
-      return;
-    }
-    if (mfg_tick_retire_blocked) {
-      return;
-    }
-    if (!mfg_tick_retire_draining) {
-      if (++mfg_tick_retire_high_streak < kMfgTickRetireStreak) {
-        return;
-      }
-      mfg_tick_retire_high_streak = 0;
-      mfg_tick_retire_draining = true;
-      mfg_tick_retire_rest = false;
-      mfg_tick_retire_episode_count = 0;
-      ++mfg_tick_retire_request_total;
-      XELOGI("ZeroFGMfg tick_retire start own_excess_us={} needed_us={} quantum_us={} N={} D_us={}", own_excess_ns / 1000,
-             needed_ns / 1000, stable_output_quantum_ns / 1000, candidate.mfg_n, operating_latency_ns / 1000);
-    }
-    if (mfg_tick_retire_rest) {
-      mfg_tick_retire_rest = false;  // every other pair at most: never a run of pairs at N / (N - 1) of the motion's speed
-      return;
-    }
-    // An S of this Real's pair made before its commitment took the epoch's N for its phase and tick: this pair keeps N.
+  // zerofg_mfg_tick_retire (the owner 2026-11-19): the issue of the oldest accepted Real still without a target (0: none). A Real
+  // commits only when it heads the apply order, one tick before its target, so at x4 several accepted Reals wait uncommitted.
+  // A phase recovery anchored at the newest issue placed every one of them past it: each reanchor added their issue span to
+  // the lead (Gears of War 3 at x4: 42 -> 73 -> 107 -> 119 ms over three frequency recoveries).
+  uint64_t OldestPendingRealIssueNs() const {
+    uint64_t oldest_source_id = 0;
+    uint64_t oldest_issue_ns = 0;
     for (const LogicalOutput& logical : logical_outputs) {
       if (logical.state != LogicalOutputState::kFree && logical.state != LogicalOutputState::kDropped &&
-          logical.candidate.kind == CandidateKind::kSynthetic &&
-          logical.candidate.pair_a_source_id == candidate.source_id) {
-        ++mfg_tick_retire_pair_made_total;
-        return;
+          logical.candidate.kind == CandidateKind::kReal && !logical.candidate.target_time_ns &&
+          logical.candidate.issue_time_ns &&
+          (!oldest_source_id || logical.candidate.source_id < oldest_source_id)) {
+        oldest_source_id = logical.candidate.source_id;
+        oldest_issue_ns = logical.candidate.issue_time_ns;
       }
     }
-    if (mfg_tick_retire_episode_count >= kMfgTickRetireEpisodeMax) {
-      XELOGI("ZeroFGMfg tick_retire capped retired={} own_excess_us={}", mfg_tick_retire_episode_count,
-             own_excess_ns / 1000);
-      ++mfg_tick_retire_capped_total;
-      EndMfgTickRetire(false);
-      mfg_tick_retire_blocked = true;
-      return;
+    return oldest_issue_ns;
+  }
+
+  // zerofg_mfg_tick_retire, the semantic drain with one output per refresh (x4 at 30 on 120 Hz, x3 on 90, x2 at 30 on 60, x2
+  // at 60 on 120): there every vsync has an output, so neither the rate drain nor the presentation advance can take a lead
+  // back, and the reanchors' lead stayed (the wells). Asked at B's acceptance, before the pair's S exist: should the pair
+  // (A, B) span N - 1 ticks (N - 2 S, phases k / (N - 1); at x2 a real-only pair, B at A + ld*O)? Yes while the smallest
+  // lead of the last kMfgLeadSamples committed Reals, less one tick for each shortened pair not yet committed, keeps the
+  // phase cushion, a tick and max(half a tick, 8 ms) for the Source's jitter; every other pair at most. Every N-reading site
+  // takes the S's own N or A's, so B and every later output land one tick earlier. Reals are never dropped; an S that is not
+  // made is never owed (the Always-S contract covers the S a pair has).
+  // tools/pacing_sim (zerofg-depth testbed), Gears-like Source, 10 min: x4 120 / x3 90 / x2 60 wells in 109-117 of 117
+  // windows -> 0 (p50 77-87 ms, p99 93-112 ms), with the head anchor.
+  bool MfgShortPairWanted() {
+    if (!cvars::zerofg_mfg_tick_retire || !MfgOneRefreshPerOutput() || !operating_latency_ns ||
+        mfg_lead_sample_count < kMfgLeadSamples) {
+      return false;
     }
-    --candidate.mfg_n;
-    ++mfg_tick_retire_total;
-    ++mfg_tick_retire_episode_count;
-    mfg_tick_retire_rest = true;
+    if (mfg_short_rest) {
+      mfg_short_rest = false;  // never a run of shortened pairs
+      return false;
+    }
+    int64_t lead_ns = mfg_lead_samples[0];
+    for (uint32_t i = 1; i < kMfgLeadSamples; ++i) {
+      lead_ns = std::min(lead_ns, mfg_lead_samples[i]);
+    }
+    const int64_t quantum_ns = int64_t(stable_output_quantum_ns);
+    lead_ns -= int64_t(mfg_short_pending_count) * quantum_ns;
+    const int64_t cushion_ns = std::max<int64_t>(quantum_ns / kPhaseRecoveryLagQuantumDivisor, kPhaseRecoveryLagMinimumNs);
+    const int64_t needed_ns = cushion_ns + quantum_ns + std::max<int64_t>(quantum_ns / 2, 8000000);
+    return lead_ns >= needed_ns;
+  }
+
+  void MfgShortPairApplied(uint64_t b_source_id, bool real_only) {
+    if (mfg_short_pending_count == kMfgShortPendingMax) {
+      // A B that never committed (dropped with its slot): the oldest record goes.
+      for (uint32_t i = 1; i < kMfgShortPendingMax; ++i) {
+        mfg_short_pending[i - 1] = mfg_short_pending[i];
+      }
+      --mfg_short_pending_count;
+    }
+    mfg_short_pending[mfg_short_pending_count++] = b_source_id;
+    mfg_short_rest = true;
+    ++mfg_short_pair_total;
+    if (real_only) {
+      ++mfg_short_real_only_total;
+    }
+  }
+
+  // At each Real's first commitment: its lead past issue + D, and the shortened pairs it closes.
+  void ObserveMfgLead(uint64_t source_id, int64_t excess_ns) {
+    mfg_lead_samples[mfg_lead_sample_next] = excess_ns;
+    mfg_lead_sample_next = (mfg_lead_sample_next + 1) % kMfgLeadSamples;
+    mfg_lead_sample_count = std::min(mfg_lead_sample_count + 1, kMfgLeadSamples);
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < mfg_short_pending_count; ++i) {
+      if (mfg_short_pending[i] > source_id) {
+        mfg_short_pending[kept++] = mfg_short_pending[i];
+      }
+    }
+    mfg_short_pending_count = kept;
   }
 
   // MFG: the epoch's N (a constant 2 when kZeroFGMfgMaxN is 2, so every site that reads it compiles as before).
@@ -11273,18 +11272,12 @@ struct ZeroFGIndependentPresenter::Impl {
     // the epoch at issue + D if the drain went past it.
     // zerofg_mfg_tick_retire (the owner 2026-11-19, the latency wells of x4
     // at 30 on 120 Hz): with one output per refresh (N x the game's rate =
-    // the refresh) the rate drain below cannot shorten anything, since N
-    // outputs need N vsyncs whatever the period, and its own reanchors place
-    // the epoch past the ordered boundary plus a quantum and the phase reserve
-    // again: at x4 each one added lead instead of draining it. There the lead
-    // drains in whole ticks at the Reals' commitment (TickRetireMfgPair) and
-    // the rate drain stays off. A lag ends a tick drain.
-    if (lag_due) {
-      EndMfgTickRetire(false);
-    }
+    // the refresh, any N) the rate drain below cannot shorten anything, since
+    // N outputs need N vsyncs whatever the period, and its own reanchors add
+    // lead. There the short pairs drain the lead, one tick and one generated
+    // frame at a time (MfgShortPairWanted), and the rate drain stays off.
     const bool tick_retire_owns_lead =
-        cvars::zerofg_mfg_tick_retire && EpochN() >= 3 &&
-        MfgOneRefreshPerOutput();
+        cvars::zerofg_mfg_tick_retire && MfgOneRefreshPerOutput();
     const char* cause = nullptr;
     uint64_t period_ns = 0;
     if (phase_recovery_drain_ns) {
@@ -11700,11 +11693,28 @@ struct ZeroFGIndependentPresenter::Impl {
       ApplyPendingLatencyDepthReanchor(source_id, issue_ns, issue_anchor_ns);
     }
     ObserveSourcePhase(source_id, issue_ns, issue_anchor_ns, forward_skipped_out);
-    // A phase recovery places the epoch its cushion above issue + D.
-    const uint64_t recovery_anchor_ns =
+    // A phase recovery places the epoch its cushion above issue + D. With
+    // zerofg_mfg_tick_retire the issue is the oldest pending Real's
+    // (OldestPendingRealIssueNs): it commits first in the new epoch, and the
+    // later ones follow at their pair spacing, instead of all of them landing
+    // past the newest issue (the lead each reanchor added).
+    const bool phase_recovery_pending =
         source_reanchor_provenance.pending ==
-                SourceReanchorRequestReason::kPhaseRecovery
-            ? SaturatingAddNs(issue_anchor_ns, phase_recovery_cushion_ns)
+        SourceReanchorRequestReason::kPhaseRecovery;
+    uint64_t recovery_issue_anchor_ns = issue_anchor_ns;
+    if (phase_recovery_pending && cvars::zerofg_mfg_tick_retire &&
+        source_phase_reanchor_pending) {
+      const uint64_t oldest_issue_ns = OldestPendingRealIssueNs();
+      if (oldest_issue_ns && oldest_issue_ns < issue_ns) {
+        recovery_issue_anchor_ns =
+            SaturatingAddNs(oldest_issue_ns, operating_latency_ns);
+        ++mfg_drain_head_anchor_total;
+      }
+    }
+    const uint64_t recovery_anchor_ns =
+        phase_recovery_pending
+            ? SaturatingAddNs(recovery_issue_anchor_ns,
+                              phase_recovery_cushion_ns)
             : issue_anchor_ns;
     if (ApplyPendingSourcePhaseReanchor(
             issue_ns, issue_anchor_ns,
@@ -15315,7 +15325,8 @@ struct ZeroFGIndependentPresenter::Impl {
     }
     const uint64_t refresh_ns = main_surface_egress->RefreshCycleNs();
     if (!refresh_ns || stable_output_quantum_ns <= refresh_ns + refresh_ns / 8) {
-      // No vsync to gain inside one output quantum.
+      // No vsync to gain inside one output quantum. (There the lead drains
+      // semantically: zerofg_mfg_tick_retire's short pairs, MfgShortPairWanted.)
       return;
     }
     const int64_t band_ns = int64_t(refresh_ns) * 2;
@@ -15687,6 +15698,7 @@ struct ZeroFGIndependentPresenter::Impl {
       rate_lock_excess_ns = PresenterSignedDeltaNs(
           candidate.target_time_ns,
           SaturatingAddNs(candidate.issue_time_ns, operating_latency_ns));
+      ObserveMfgLead(candidate.source_id, rate_lock_excess_ns);
       // Phase recovery's samples: the Source's issue by Source id (its
       // frequency), and the excess by epoch (its phase).
       if (candidate.source_id) {
@@ -16210,7 +16222,6 @@ struct ZeroFGIndependentPresenter::Impl {
     candidate.semantic_epoch_origin_ns = semantic_epoch_origin_ns;
     candidate.semantic_output_quantum_ns = stable_output_quantum_ns;
     candidate.mfg_n = EpochN();  // MFG: the pair from this Real to the next takes this epoch's N
-    TickRetireMfgPair(candidate, assigned_target_ns);
     candidate.semantic_tick_index = assigned_tick;
     candidate.target_time_ns = assigned_target_ns;
     last_semantic_target_ns =
@@ -17832,9 +17843,16 @@ struct ZeroFGIndependentPresenter::Impl {
       // computing this pair. Re-evaluate before applying any shared-era
       // capacity veto so the first post-warmup pair is mandatory as well.
       split_always_s = SplitAlwaysSArmed();
+      // zerofg_mfg_tick_retire: this pair drains one tick of the lead (MfgShortPairWanted): N - 1 ticks with N - 2 S, or at
+      // x2 the TransitionRealOnly contract (no S, B at A + ld*O), whose anchoring already exists.
+      const bool mfg_short_pair =
+          synthetic_eligible && pair_targets_valid && pair_a_source_id && MfgShortPairWanted();
+      const bool mfg_short_real_only = mfg_short_pair && EpochN() <= 2;
+      bool mfg_short_applied = false;
       if (synthetic_eligible && pair_targets_valid && pair_a_source_id &&
-          H1cMayCreateTransitionRealOnlyPair(PresenterMonotonicTimeNs(),
-              last_processed_source_issue_period_sequence)) {
+          (mfg_short_real_only ||
+           H1cMayCreateTransitionRealOnlyPair(PresenterMonotonicTimeNs(),
+               last_processed_source_issue_period_sequence))) {
         // ComputeAcceptedRealTiming above already ran the metronome and
         // Better-D/phase observers for this Source issue. Re-running it for
         // the H1c projection would create a second policy observation. The
@@ -17874,8 +17892,12 @@ struct ZeroFGIndependentPresenter::Impl {
           // commitment of pair A will replace/raise it using A+ld*O.
         }
         if (h1c_transition_real_only) {
-          ++h1c_transition_real_only_pair_total;
-          ++h1c_episode_real_only_pairs;
+          if (mfg_short_real_only) {
+            mfg_short_applied = true;
+          } else {
+            ++h1c_transition_real_only_pair_total;
+            ++h1c_episode_real_only_pairs;
+          }
         }
       } else if (synthetic_eligible &&
                  transition_planned_space_state ==
@@ -17976,6 +17998,23 @@ struct ZeroFGIndependentPresenter::Impl {
           mfg_a_committed = synthetic_target_ns && pair_a_source_id &&
                             FindRealSemanticCommitment(pair_a_source_id, mfg_committed_a);
           pair_n = std::clamp<uint32_t>(mfg_a_committed ? mfg_committed_a.mfg_n : EpochN(), 2, kZeroFGMfgMaxN);
+          // zerofg_mfg_tick_retire: a short pair spans N - 1 ticks. Its S carry N - 1 (their phases and ticks, and B's floor
+          // when A commits later: AnchorSyntheticPairsToCommittedReal); with A already committed B's floor is set here.
+          if (mfg_short_pair && !mfg_short_real_only && pair_n >= 3) {
+            --pair_n;
+            mfg_short_applied = true;
+            if (mfg_a_committed) {
+              uint64_t short_s_semantic_ns = 0;
+              uint64_t short_b_floor_ns = 0;
+              uint64_t short_s_target_ns = 0;
+              uint64_t short_s_tick = 0;
+              if (ComputePairTimingFromCommittedReal(mfg_committed_a, pair_lattice_distance, short_s_semantic_ns,
+                                                     short_b_floor_ns, short_s_target_ns, short_s_tick, false, 1,
+                                                     pair_n)) {
+                real_earliest_eligible_ns = short_b_floor_ns;
+              }
+            }
+          }
         }
         const uint64_t mfg_first_semantic_ns = synthetic_semantic_ns;
         const uint64_t mfg_first_target_ns = synthetic_target_ns;
@@ -18111,6 +18150,9 @@ struct ZeroFGIndependentPresenter::Impl {
               h1c_transition_real_only ? PairContract::kTransitionRealOnly
                                        : PairContract::kNormal)) {
         return false;
+      }
+      if (mfg_short_applied) {
+        MfgShortPairApplied(current.source_id.load(std::memory_order_relaxed), mfg_short_real_only);
       }
       if (next_semantic_tick_index !=
               nominal_cursor_tick_before_real_accept ||
@@ -18361,7 +18403,7 @@ struct ZeroFGIndependentPresenter::Impl {
         "late={} lateness_us p50/p90={}/{} runway_pair_us p50/p90={}/{} "
         "runway_projection_us p50/p90={}/{} ready_at_commit={} "
         "ready_age_us p50/p90={}/{} D_us={} mfg_pair_short={} "
-        "tick_retire on/draining/retired/drains/ended/capped/pair_made={}/{}/{}/{}/{}/{}/{}",
+        "mfg_drain on/head_anchored/short_pairs/real_only/pending={}/{}/{}/{}/{}",
         real_commit_observed_total, commit_route_pair_boundary_total,
         commit_route_projection_total, commit_boundary_kind_total[0],
         commit_boundary_kind_total[1], commit_boundary_kind_total[2],
@@ -18388,10 +18430,9 @@ struct ZeroFGIndependentPresenter::Impl {
         real_ready_age_at_commit_ns.Quantile(50, 100) / 1000,
         real_ready_age_at_commit_ns.Quantile(90, 100) / 1000,
         operating_latency_ns / 1000, mfg_pair_short_total,
-        cvars::zerofg_mfg_tick_retire, mfg_tick_retire_draining,
-        mfg_tick_retire_total, mfg_tick_retire_request_total,
-        mfg_tick_retire_stopped_total, mfg_tick_retire_capped_total,
-        mfg_tick_retire_pair_made_total);
+        cvars::zerofg_mfg_tick_retire, mfg_drain_head_anchor_total,
+        mfg_short_pair_total, mfg_short_real_only_total,
+        mfg_short_pending_count);
     XELOGI(
         "ZeroFGDeviceB domain=presenter_B Source_q0_counts_exclude_B=true "
         "ingress_queue_busy_retry={} submit_after_teardown_idle={} "
@@ -19775,21 +19816,20 @@ struct ZeroFGIndependentPresenter::Impl {
   uint64_t mfg_step_down_total = 0;
   uint64_t mfg_step_up_retry_total = 0;
   uint64_t mfg_pair_short_total = 0;  // pairs that got fewer than N - 1 frames (no room or no timing)
-  // zerofg_mfg_tick_retire (TickRetireMfgPair): Reals in a row with the lead, the drain under way and its retires, whether the
-  // next pair rests, whether a drain that did not drain blocks the next one; ticks retired, drains started, drains ended by the
-  // lead falling, drains capped.
-  static constexpr uint32_t kMfgTickRetireStreak = 8;
-  static constexpr uint32_t kMfgTickRetireEpisodeMax = 32;
-  uint32_t mfg_tick_retire_high_streak = 0;
-  bool mfg_tick_retire_draining = false;
-  uint32_t mfg_tick_retire_episode_count = 0;
-  bool mfg_tick_retire_rest = false;
-  bool mfg_tick_retire_blocked = false;
-  uint64_t mfg_tick_retire_total = 0;
-  uint64_t mfg_tick_retire_request_total = 0;
-  uint64_t mfg_tick_retire_stopped_total = 0;
-  uint64_t mfg_tick_retire_capped_total = 0;
-  uint64_t mfg_tick_retire_pair_made_total = 0;  // retires skipped: an S of the pair already existed
+  // zerofg_mfg_tick_retire: phase recoveries anchored at the oldest pending Real's issue; the short pairs (MfgShortPairWanted):
+  // the last kMfgLeadSamples committed Reals' lead past issue + D, the Bs of shortened pairs not yet committed, whether the next
+  // pair rests, the pairs shortened (real-only ones among them).
+  uint64_t mfg_drain_head_anchor_total = 0;
+  static constexpr uint32_t kMfgLeadSamples = 4;
+  std::array<int64_t, kMfgLeadSamples> mfg_lead_samples = {};
+  uint32_t mfg_lead_sample_count = 0;
+  uint32_t mfg_lead_sample_next = 0;
+  static constexpr uint32_t kMfgShortPendingMax = 16;
+  std::array<uint64_t, kMfgShortPendingMax> mfg_short_pending = {};
+  uint32_t mfg_short_pending_count = 0;
+  bool mfg_short_rest = false;
+  uint64_t mfg_short_pair_total = 0;
+  uint64_t mfg_short_real_only_total = 0;
   uint32_t mfg_desired_n = 0;  // a different N the rule wants, and since when (debounce)
   uint64_t mfg_desired_since_ns = 0;
   uint64_t operating_latency_ns = 0;
