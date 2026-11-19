@@ -18,18 +18,18 @@ class SettingsSchemaTest {
     // Display|host_present_from_non_ui_thread is intentionally absent (forced true natively).
     // Plus adds Vulkan|zerofg_mode, in its own ZeroFG section, and System link's Network|systemlink and
     // Network|systemlink_peers: 176. The MFG test branch adds Vulkan|zerofg_multiplier, zerofg_zero_light and
-    // zerofg_zero_quarter_base, and zerofg_vsync_retire: 180.
-    @Test fun total_entry_count_is_180() {
-        assertEquals(180, all.size)
+    // zerofg_zero_quarter_base, zerofg_vsync_retire and zerofg_mfg_tick_retire: 181.
+    @Test fun total_entry_count_is_181() {
+        assertEquals(181, all.size)
         assertEquals(
-            180,
+            181,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
     }
 
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(123, all.count { it is Setting.Bool })        // 103 + 18 new - 2 the core never had + systemlink + Zero's two switches + zerofg_vsync_retire
+        assertEquals(124, all.count { it is Setting.Bool })        // 103 + 18 new - 2 the core never had + systemlink + Zero's two switches + zerofg_vsync_retire + zerofg_mfg_tick_retire
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
         assertEquals(32, all.count { it is Setting.ListChoice })   // 27 + 3 new + zerofg_mode + zerofg_multiplier
         assertEquals(2, all.count { it is Setting.Action })
