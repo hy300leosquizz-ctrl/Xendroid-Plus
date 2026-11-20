@@ -175,8 +175,9 @@ DEFINE_bool(
 DEFINE_uint32(
     zerofg_multiplier, 2,
     "Frame generation multiplier: 2 (one generated frame per game "
-    "frame), 3 or 4, used as chosen (no fit rule, no step down; MFG "
-    "test branch). Even motion needs N x the game's rate to match the "
+    "frame), 3 or 4, used as chosen up to what the refresh holds (N "
+    "outputs need N vsyncs per game frame: x4 from 30 is 2 on 60 Hz; no "
+    "step down on lateness; MFG test branch). Even motion needs N x the game's rate to match the "
     "display (30 fps on 120 Hz: x4, 40 fps: x3). Needs the vsync "
     "quantizer and free output. Read at each reanchor.",
     "Vulkan");

@@ -8765,8 +8765,8 @@ struct ZeroFGIndependentPresenter::Impl {
   }
 
   // The owner, 2026-11-18, after the first x3 / x4 runs: "tirar as proteções... cair automático é roubada, porque framerate
-  // flutua naturalmente... só mandar fazer e pronto". N is the selector, as chosen: no fit rule against the refresh and no step
-  // down (kMfgForced). It still needs the vsync quantizer and free output (3.4: N outputs producible at once need one vsync each).
+  // flutua naturalmente... só mandar fazer e pronto". N is the selector, as chosen, capped only by what the refresh holds (below),
+  // with no step down on lateness (kMfgForced). It still needs the vsync quantizer and free output (3.4: N outputs producible at once need one vsync each).
   // With kMfgForced false it is MFG_DESIGN 3.5: the largest n up to the selector with n <= r and r / n within 3 % of a whole
   // number, r the refreshes per game frame, with 12 % hysteresis for the epoch's N.
   static constexpr bool kMfgForced = true;
@@ -8776,7 +8776,19 @@ struct ZeroFGIndependentPresenter::Impl {
     } else {
       const uint32_t selector = std::clamp<uint32_t>(cvars::zerofg_multiplier, 2, kZeroFGMfgMaxN);
       if (kMfgForced) {
-        return cvars::zerofg_free_output && cvars::zerofg_vsync_quantizer ? selector : 2;
+        if (!cvars::zerofg_free_output || !cvars::zerofg_vsync_quantizer) {
+          return 2;
+        }
+        // The one physical limit (Gears of War 3, 2026-11-20): N outputs need N vsyncs per game frame. With the display at 60 Hz
+        // and x4 / x3 from 30 the presenter scheduled 4 / 3 vsyncs into every 2, Android never dropped them (each one had its own
+        // future vsync), and the lead grew to 540 - 620 ms until the refresh came back. So N is the selector up to what the refresh
+        // holds, with 12 % slack for a game that wanders (Gears at a 30 lock: 33 - 36 ms): x4 at 30 is 4 on 120 Hz, 3 on 90, 2 on 60.
+        const uint64_t refresh_ns = main_surface_egress ? main_surface_egress->RefreshCycleNs() : 0;
+        if (!refresh_ns || !period_ns) {
+          return selector;
+        }
+        const double fit = double(period_ns) / double(refresh_ns) * 1.12;
+        return std::clamp<uint32_t>(uint32_t(fit), 2, selector);
       }
       const uint32_t ceiling = std::min(selector, mfg_overload_ceiling);
       if (ceiling <= 2 || !period_ns || !cvars::zerofg_free_output || !cvars::zerofg_vsync_quantizer) {
@@ -11647,7 +11659,10 @@ struct ZeroFGIndependentPresenter::Impl {
         } else if (desired_n != mfg_desired_n) {
           mfg_desired_n = desired_n;
           mfg_desired_since_ns = current_time_ns;
-        } else if (kMfgForced || current_time_ns - mfg_desired_since_ns >= 1500000000ull) {
+        } else if ((kMfgForced && cvars::zerofg_multiplier != mfg_selector_seen) ||
+                   current_time_ns - mfg_desired_since_ns >= 1500000000ull) {
+          // Forced: a new selector is taken at once; a change the refresh asks for (MfgNForPeriod's fit) holds 1.5 s first.
+          mfg_selector_seen = cvars::zerofg_multiplier;
           mfg_desired_n = 0;
           source_rate_transition_reanchor_pending = true;
           ++mfg_n_reanchor_request_total;
@@ -19832,6 +19847,7 @@ struct ZeroFGIndependentPresenter::Impl {
   uint64_t mfg_short_real_only_total = 0;
   uint32_t mfg_desired_n = 0;  // a different N the rule wants, and since when (debounce)
   uint64_t mfg_desired_since_ns = 0;
+  uint32_t mfg_selector_seen = 0;  // the zerofg_multiplier the last N change saw (forced mode: a new selector skips the hold)
   uint64_t operating_latency_ns = 0;
   uint64_t latency_required_last_ns = 0;
   uint64_t next_semantic_target_ns = 0;
