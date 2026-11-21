@@ -17,19 +17,18 @@ class SettingsSchemaTest {
     // less APU|mute and GPU|readback_memexport, which the core never defined (ajustes-2.md).
     // Display|host_present_from_non_ui_thread is intentionally absent (forced true natively).
     // Plus adds Vulkan|zerofg_mode, System link's Network|systemlink + Network|systemlink_peers (176),
-    // the 19 Plus Ultra Track A/B/C/D canonical engine cvars (195), and the MFG branch Vulkan|zerofg_multiplier,
-    // zerofg_vsync_retire and zerofg_mfg_tick_retire: 198.
-    @Test fun total_entry_count_is_198() {
-        assertEquals(198, all.size)
+    // the 19 Plus Ultra Track A/B/C/D canonical engine cvars (195), and the MFG multiplier Vulkan|zerofg_multiplier: 196.
+    @Test fun total_entry_count_is_196() {
+        assertEquals(196, all.size)
         assertEquals(
-            198,
+            196,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
     }
 
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(140, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra bool cvars + zerofg_vsync_retire + zerofg_mfg_tick_retire
+        assertEquals(138, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra bool cvars
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
         assertEquals(33, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start + zerofg_multiplier
         assertEquals(2, all.count { it is Setting.Action })
