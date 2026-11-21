@@ -27,7 +27,7 @@ fun phoneControllersDetails(context: Context, status: Status): String? {
         "P${player.slot + 1} ${player.name}" + (player.latencyMs?.let { " ($it ms)" } ?: "")
     }
     return buildString {
-        append(context.getString(R.string.phone_ctl_how, "${host.address.hostAddress}:${host.port}", host.code, networkName(context, on.network)))
+        append(context.getString(R.string.phone_ctl_how, host.endpoint, host.code, networkName(context, on.network)))
         append('\n')
         append(if (players.isEmpty()) context.getString(R.string.phone_ctl_nobody) else players)
         if (host.locked) append('\n').append(context.getString(R.string.phone_ctl_locked, CompanionHost.MAX_WRONG_CODES))
@@ -39,6 +39,7 @@ private fun networkName(context: Context, network: String): String = when (netwo
     "hotspot" -> context.getString(R.string.phone_ctl_net_hotspot)
     "USB tethering" -> context.getString(R.string.phone_ctl_net_usb)
     "Bluetooth tethering" -> context.getString(R.string.phone_ctl_net_bluetooth)
+    "Bluetooth RFCOMM" -> context.getString(R.string.phone_ctl_net_bluetooth)
     "local network" -> context.getString(R.string.phone_ctl_net_local)
     else -> network
 }

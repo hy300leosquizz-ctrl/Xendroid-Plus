@@ -546,6 +546,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         result = COMMAND_PROCESSOR::ExecutePacketType3_NOP(packet, count);
         break;
       case PM4_INTERRUPT:
+        ++guest_sync_count_;
         result = COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(packet, count);
         break;
       case PM4_XE_SWAP:
@@ -557,6 +558,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
                                                                        count);
         break;
       case PM4_WAIT_REG_MEM:
+        ++guest_sync_count_;
         result =
             COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(packet, count);
         break;
@@ -575,14 +577,17 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
             COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(packet, count);
         break;
       case PM4_EVENT_WRITE:
+        ++guest_sync_count_;
         result =
             COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE(packet, count);
         break;
       case PM4_EVENT_WRITE_SHD:
+        ++guest_sync_count_;
         result = COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(packet,
                                                                        count);
         break;
       case PM4_EVENT_WRITE_EXT:
+        ++guest_sync_count_;
         result = COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(packet,
                                                                        count);
         break;
@@ -735,6 +740,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         break;
       }
       case PM4_WAIT_FOR_IDLE: {
+        ++guest_sync_count_;
         // This opcode is used by 5454084E while going / being ingame.
         assert_true(count == 1);
         uint32_t value = reader_.ReadAndSwap<uint32_t>();
@@ -742,6 +748,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
           COMMAND_PROCESSOR::InsertDebugMarker("PM4_WAIT_FOR_IDLE: 0x%08X",
                                                value);
         }
+        COMMAND_PROCESSOR::AwaitHeldSignalsAndMemexport();
         XELOGGPU("GPU wait for idle = {:08X}", value);
         result = true;
         break;
@@ -845,11 +852,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(
     COMMAND_PROCESSOR::AwaitMemexportForFence("interrupt");
   }
 
-  for (int n = 0; n < 6; n++) {
-    if (cpu_mask & (1 << n)) {
-      graphics_system_->DispatchInterruptCallback(1, n);
-    }
-  }
+  COMMAND_PROCESSOR::DispatchGuestInterrupt(cpu_mask);
   return true;
 }
 XE_NOINLINE
@@ -970,6 +973,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     value_ptr = &kNonexistentRegisterValue;
   }
   const volatile uint32_t& value_ref = *value_ptr;
+  if (is_memory) {
+    COMMAND_PROCESSOR::AwaitHeldSignalsWriting(poll_reg_addr & ~uint32_t(0x3));
+  }
 
   bool matched = false;
   // Sleep before the next re-check with wait_reg_mem_backoff.
@@ -1022,6 +1028,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
                                                          ? "memory wait"
                                                          : "register wait")) {
         continue;
+      }
+      if (COMMAND_PROCESSOR::has_held_guest_signals()) {
+        size_t held_before = held_guest_signals_.size();
+        COMMAND_PROCESSOR::SubmitHeldSignals();
+        if (held_guest_signals_.size() != held_before) {
+          continue;
+        }
       }
       if (!unmet_begin_ns) {
         unmet_begin_ns = COMMAND_PROCESSOR::FrameWaitBegin();
@@ -1222,6 +1235,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
     // Memory.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
+    COMMAND_PROCESSOR::AwaitHeldSignalsWriting(poll_reg_addr);
     trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr), 4);
     value = xe::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
@@ -1285,6 +1299,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE(
     address &= ~0x3;
     uint32_t data_value = GpuSwap(value, endianness);
     uint8_t* write_destination = memory_->TranslatePhysical(address);
+    uint32_t write_physical_address = address;
     if (address > 0x1FFFFFFF) {
       uint32_t writeback_base =
           register_file_->values[XE_GPU_REG_WRITEBACK_START];
@@ -1294,9 +1309,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE(
       if (writeback_base != 0 && writeback_offset < writeback_size) {
         write_destination =
             memory_->TranslateVirtual(0x7F000000 + writeback_offset);
+        write_physical_address = writeback_offset;
       }
     }
-    xe::store(write_destination, data_value);
+    COMMAND_PROCESSOR::WriteGuestFence(write_destination,
+                                       write_physical_address, data_value);
     trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
     NotifyGuestGpuProgress();
   } else {
@@ -1343,6 +1360,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   uint8_t* write_destination = memory_->TranslatePhysical(address);
+  uint32_t write_physical_address = address;
   if (address > 0x1FFFFFFF) {
     uint32_t writeback_base =
         register_file_->values[XE_GPU_REG_WRITEBACK_START];
@@ -1353,9 +1371,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
     if (writeback_base != 0 && writeback_offset < writeback_size) {
       write_destination =
           memory_->TranslateVirtual(0x7F000000 + writeback_offset);
+      write_physical_address = writeback_offset;
     }
   }
-  xe::store(write_destination, data_value);
+  COMMAND_PROCESSOR::WriteGuestFence(write_destination, write_physical_address,
+                                     data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   NotifyGuestGpuProgress();
   return true;
@@ -1634,12 +1654,23 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
   // merge_tiling_bands: draws of an earlier band aren't repeated.
   if (draw_succeeded && XE_UNLIKELY(tiling_band_ >= 0) &&
       !COMMAND_PROCESSOR::PrepareTilingBandDraw()) {
+    ++guest_sync_count_;
+    return true;
+  }
+
+  if (draw_succeeded &&
+      !COMMAND_PROCESSOR::PrepareVIZDraw(viz_query_condition)) {
+    ++guest_sync_count_;
     return true;
   }
 
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
+    if (viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z &&
+        !cvars::occlusion_query_viz) {
+      // Not issued, but a title could still wait for exports with such a draw.
+      ++guest_sync_count_;
+    } else {
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
       // shader has memexport.
       // TODO(Triang3l || JoelLinn): Handle this properly in the render
@@ -1964,14 +1995,16 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_VIZ_QUERY(
     // On hardware this clears the internal state of the scan converter (which
     // is different to the register)
     COMMAND_PROCESSOR::WriteEventInitiator(VIZQUERY_START);
+    COMMAND_PROCESSOR::BeginVIZQuery(id);
     // XELOGGPU("Begin viz query ID {:02X}", id);
   } else {
     // end the viz query
     COMMAND_PROCESSOR::WriteEventInitiator(VIZQUERY_END);
     // XELOGGPU("End viz query ID {:02X}", id);
     // The scan converter writes the internal result back to the register here.
-    // We just fake it and say it was visible in case it is read back.
-    if (id < 32) {
+    if (cvars::occlusion_query_viz) {
+      COMMAND_PROCESSOR::EndVIZQuery(id);
+    } else if (id < 32) {
       register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0] |= uint32_t(1)
                                                                      << id;
     } else {
@@ -2042,6 +2075,7 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
     // the end of the burst, and then there is nothing honest to publish.
     if (writeback_stride && remaining <= remaining_at_writeback &&
         remaining_at_writeback - remaining >= writeback_stride) {
+      COMMAND_PROCESSOR::PerformCompletedHeldSignals();
       // Re-read the target, the guest can re-point or disable the write-back
       // from its own thread while we are draining.
       uint32_t writeback_ptr = read_ptr_writeback_ptr_;

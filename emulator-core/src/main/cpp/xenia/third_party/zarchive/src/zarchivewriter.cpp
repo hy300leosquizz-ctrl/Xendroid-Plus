@@ -1,30 +1,152 @@
 #include "zarchive/zarchivewriter.h"
 #include "zarchive/zarchivecommon.h"
 
+#include <algorithm>
+#include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <queue>
 #include <string>
 #include <string_view>
-#include <queue>
 
 #include <zstd.h>
 
 #include "sha_256.h"
 
-#include <cassert>
-#include <algorithm>
+namespace {
+constexpr int kZstdCompressionLevel = 6;
+}
 
-ZArchiveWriter::ZArchiveWriter(CB_NewOutputFile cbNewOutputFile, CB_WriteOutputData cbWriteOutputData, void* ctx) : m_cbCtx(ctx), m_cbNewOutputFile(cbNewOutputFile), m_cbWriteOutputData(cbWriteOutputData)
+ZArchiveWriter::ZArchiveWriter(CB_NewOutputFile cbNewOutputFile,
+                               CB_WriteOutputData cbWriteOutputData, void* ctx)
+    : m_cbNewOutputFile(cbNewOutputFile),
+      m_cbWriteOutputData(cbWriteOutputData),
+      m_cbCtx(ctx)
 {
 	cbNewOutputFile(-1, ctx);
 	m_mainShaCtx = (struct Sha_256*)malloc(sizeof(struct Sha_256));
 	sha_256_init(m_mainShaCtx, m_integritySha);
-};
+
+	m_currentWriteBuffer.reserve(_ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+	m_pendingRawBlocks.resize(kBatchBlocks * _ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+	const size_t maxCompressedSize = ZSTD_compressBound(_ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+	for (auto& buf : m_batchCompressed)
+	{
+		buf.resize(maxCompressedSize);
+	}
+	m_inlineCctx = ZSTD_createCCtx();
+
+	const unsigned int hwCores = std::thread::hardware_concurrency();
+	const unsigned int totalThreads = std::clamp(hwCores ? hwCores : 4u, 2u, 8u);
+	// Spawn (totalThreads - 1) background workers; caller participates in each batch too.
+	const unsigned int bgWorkers = totalThreads - 1;
+	m_workers.reserve(bgWorkers);
+	for (unsigned int i = 0; i < bgWorkers; ++i)
+	{
+		m_workers.emplace_back(&ZArchiveWriter::WorkerLoop, this);
+	}
+}
 
 ZArchiveWriter::~ZArchiveWriter()
 {
-	free(m_mainShaCtx);
+	ShutdownWorkers();
+	if (m_inlineCctx)
+	{
+		ZSTD_freeCCtx(m_inlineCctx);
+		m_inlineCctx = nullptr;
+	}
+	if (m_mainShaCtx)
+	{
+		free(m_mainShaCtx);
+		m_mainShaCtx = nullptr;
+	}
+	for (PathNode* child : m_rootNode.subnodes)
+	{
+		DestroySubtree(child);
+	}
+	m_rootNode.subnodes.clear();
 }
 
-ZArchiveWriter::PathNode* ZArchiveWriter::GetNodeByPath(ZArchiveWriter::PathNode* root, std::string_view path)
+void ZArchiveWriter::DestroySubtree(PathNode* node)
+{
+	if (!node)
+		return;
+	for (PathNode* child : node->subnodes)
+	{
+		DestroySubtree(child);
+	}
+	delete node;
+}
+
+void ZArchiveWriter::ShutdownWorkers()
+{
+	if (m_workers.empty())
+		return;
+	{
+		std::lock_guard<std::mutex> lock(m_batchMutex);
+		m_workersQuit = true;
+	}
+	m_batchStartCv.notify_all();
+	for (auto& t : m_workers)
+	{
+		if (t.joinable())
+			t.join();
+	}
+	m_workers.clear();
+}
+
+void ZArchiveWriter::CompressBatchRange(ZSTD_CCtx_s* cctx, size_t batchCount)
+{
+	while (true)
+	{
+		const size_t idx = m_nextBlockIndex.fetch_add(1, std::memory_order_relaxed);
+		if (idx >= batchCount)
+			break;
+
+		const uint8_t* src = m_pendingRawBlocks.data() + idx * _ZARCHIVE::COMPRESSED_BLOCK_SIZE;
+		uint8_t* dst = m_batchCompressed[idx].data();
+		const size_t dstCap = m_batchCompressed[idx].size();
+		const size_t outSize = cctx
+			? ZSTD_compressCCtx(cctx, dst, dstCap, src, _ZARCHIVE::COMPRESSED_BLOCK_SIZE, kZstdCompressionLevel)
+			: ZSTD_compress(dst, dstCap, src, _ZARCHIVE::COMPRESSED_BLOCK_SIZE, kZstdCompressionLevel);
+		m_batchSizes[idx] = ZSTD_isError(outSize) ? _ZARCHIVE::COMPRESSED_BLOCK_SIZE : outSize;
+
+		if (m_completedBlocks.fetch_add(1, std::memory_order_acq_rel) + 1 == batchCount)
+		{
+			std::lock_guard<std::mutex> lock(m_batchMutex);
+			m_batchDoneCv.notify_one();
+		}
+	}
+}
+
+void ZArchiveWriter::WorkerLoop()
+{
+	ZSTD_CCtx_s* workerCctx = ZSTD_createCCtx();
+	uint64_t seenEpoch = 0;
+
+	while (true)
+	{
+		size_t batchCount = 0;
+		{
+			std::unique_lock<std::mutex> lock(m_batchMutex);
+			m_batchStartCv.wait(lock, [&]() {
+				return m_workersQuit || m_batchEpoch != seenEpoch;
+			});
+			if (m_workersQuit)
+				break;
+			seenEpoch = m_batchEpoch;
+			batchCount = m_activeBatchCount;
+		}
+		CompressBatchRange(workerCctx, batchCount);
+	}
+
+	if (workerCctx)
+	{
+		ZSTD_freeCCtx(workerCctx);
+	}
+}
+
+ZArchiveWriter::PathNode* ZArchiveWriter::GetNodeByPath(ZArchiveWriter::PathNode* /*root*/, std::string_view path)
 {
 	PathNode* currentNode = &m_rootNode;
 
@@ -35,7 +157,7 @@ ZArchiveWriter::PathNode* ZArchiveWriter::GetNodeByPath(ZArchiveWriter::PathNode
 		if (!_ZARCHIVE::GetNextPathNode(pathParser, nodeName))
 			break;
 		PathNode* nextSubnode = FindSubnodeByName(currentNode, nodeName);
-		if (!nextSubnode || (nextSubnode && nextSubnode->isFile))
+		if (!nextSubnode || nextSubnode->isFile)
 			return nullptr;
 		currentNode = nextSubnode;
 	}
@@ -64,7 +186,6 @@ bool ZArchiveWriter::StartNewFile(const char* path)
 		return false;
 	if (FindSubnodeByName(dir, filename))
 		return false;
-	// add new entry and make it the currently active file for append operations
 	PathNode*& r = dir->subnodes.emplace_back(new PathNode(true, CreateNameEntry(filename)));
 	m_currentFileNode = r;
 	r->fileOffset = m_currentInputOffset;
@@ -124,7 +245,6 @@ void ZArchiveWriter::OutputData(const void* data, size_t length)
 {
 	m_cbWriteOutputData(data, length, m_cbCtx);
 	m_currentCompressedWriteIndex += length;
-	// hash the data
 	if (m_mainShaCtx)
 		sha_256_write(m_mainShaCtx, data, length);
 }
@@ -134,28 +254,85 @@ uint64_t ZArchiveWriter::GetCurrentOutputOffset() const
 	return m_currentCompressedWriteIndex;
 }
 
-void ZArchiveWriter::StoreBlock(const uint8_t* uncompressedData)
+void ZArchiveWriter::EmitCompressedBlock(const uint8_t* rawBlock,
+                                         const uint8_t* compressedData,
+                                         size_t compressedSize)
 {
-	// compress and store
-	uint64_t compressedWriteOffset = GetCurrentOutputOffset();
-	m_compressionBuffer.resize(ZSTD_compressBound(_ZARCHIVE::COMPRESSED_BLOCK_SIZE));
-	size_t outputSize = ZSTD_compress(m_compressionBuffer.data(), m_compressionBuffer.size(), uncompressedData, _ZARCHIVE::COMPRESSED_BLOCK_SIZE, 6);
-	assert(outputSize >= 0);
+	const uint64_t compressedWriteOffset = GetCurrentOutputOffset();
+	size_t outputSize = compressedSize;
 	if (outputSize >= _ZARCHIVE::COMPRESSED_BLOCK_SIZE)
 	{
-		// store block uncompressed if it is equal or larger than the input after compression
 		outputSize = _ZARCHIVE::COMPRESSED_BLOCK_SIZE;
-		OutputData(uncompressedData, _ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+		OutputData(rawBlock, _ZARCHIVE::COMPRESSED_BLOCK_SIZE);
 	}
 	else
 	{
-		OutputData(m_compressionBuffer.data(), outputSize);
+		OutputData(compressedData, outputSize);
 	}
-	// add offset translation record
 	if ((m_numWrittenOffsetRecords % _ZARCHIVE::ENTRIES_PER_OFFSETRECORD) == 0)
 		m_compressionOffsetRecord.emplace_back().baseOffset = compressedWriteOffset;
 	m_compressionOffsetRecord.back().size[m_numWrittenOffsetRecords % _ZARCHIVE::ENTRIES_PER_OFFSETRECORD] = (uint16_t)outputSize - 1;
 	m_numWrittenOffsetRecords++;
+}
+
+void ZArchiveWriter::EnqueueBlock(const uint8_t* uncompressedData)
+{
+	std::memcpy(
+		m_pendingRawBlocks.data() + m_pendingBlockCount * _ZARCHIVE::COMPRESSED_BLOCK_SIZE,
+		uncompressedData,
+		_ZARCHIVE::COMPRESSED_BLOCK_SIZE);
+	if (++m_pendingBlockCount == kBatchBlocks)
+	{
+		FlushPendingBlocks();
+	}
+}
+
+void ZArchiveWriter::FlushPendingBlocks()
+{
+	if (m_pendingBlockCount == 0)
+		return;
+
+	const size_t count = m_pendingBlockCount;
+	if (count == 1 || m_workers.empty())
+	{
+		const uint8_t* src = m_pendingRawBlocks.data();
+		uint8_t* dst = m_batchCompressed[0].data();
+		const size_t dstCap = m_batchCompressed[0].size();
+		const size_t outSize = m_inlineCctx
+			? ZSTD_compressCCtx(m_inlineCctx, dst, dstCap, src, _ZARCHIVE::COMPRESSED_BLOCK_SIZE, kZstdCompressionLevel)
+			: ZSTD_compress(dst, dstCap, src, _ZARCHIVE::COMPRESSED_BLOCK_SIZE, kZstdCompressionLevel);
+		const size_t validSize = ZSTD_isError(outSize) ? _ZARCHIVE::COMPRESSED_BLOCK_SIZE : outSize;
+		EmitCompressedBlock(src, dst, validSize);
+		m_pendingBlockCount = 0;
+		return;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(m_batchMutex);
+		m_activeBatchCount = count;
+		m_nextBlockIndex.store(0, std::memory_order_relaxed);
+		m_completedBlocks.store(0, std::memory_order_relaxed);
+		++m_batchEpoch;
+	}
+	m_batchStartCv.notify_all();
+
+	// Main thread participates in compressing the batch, then waits for stragglers.
+	CompressBatchRange(m_inlineCctx, count);
+	{
+		std::unique_lock<std::mutex> lock(m_batchMutex);
+		m_batchDoneCv.wait(lock, [&]() {
+			return m_completedBlocks.load(std::memory_order_acquire) == count;
+		});
+	}
+
+	// Retire compressed blocks strictly in sequence so archive layout & SHA-256
+	// match single-threaded ZArchive bit-for-bit.
+	for (size_t i = 0; i < count; ++i)
+	{
+		const uint8_t* raw = m_pendingRawBlocks.data() + i * _ZARCHIVE::COMPRESSED_BLOCK_SIZE;
+		EmitCompressedBlock(raw, m_batchCompressed[i].data(), m_batchSizes[i]);
+	}
+	m_pendingBlockCount = 0;
 }
 
 void ZArchiveWriter::AppendData(const void* data, size_t size)
@@ -169,8 +346,7 @@ void ZArchiveWriter::AppendData(const void* data, size_t size)
 			bytesToCopy = size;
 		if (bytesToCopy == _ZARCHIVE::COMPRESSED_BLOCK_SIZE)
 		{
-			// if incoming data is block-aligned we can store it directly without memcpy to temporary buffer
-			StoreBlock(input);
+			EnqueueBlock(input);
 			input += bytesToCopy;
 			size -= bytesToCopy;
 			continue;
@@ -180,7 +356,7 @@ void ZArchiveWriter::AppendData(const void* data, size_t size)
 		size -= bytesToCopy;
 		if (m_currentWriteBuffer.size() == _ZARCHIVE::COMPRESSED_BLOCK_SIZE)
 		{
-			StoreBlock(m_currentWriteBuffer.data());
+			EnqueueBlock(m_currentWriteBuffer.data());
 			m_currentWriteBuffer.clear();
 		}
 	}
@@ -191,17 +367,17 @@ void ZArchiveWriter::AppendData(const void* data, size_t size)
 
 void ZArchiveWriter::Finalize()
 {
-	m_currentFileNode = nullptr; // make sure the padding added below doesn't modify the active file
-	// flush write buffer by padding it to the length of a full block
+	m_currentFileNode = nullptr;
 	if (!m_currentWriteBuffer.empty())
 	{
-		std::vector<uint8_t> padBuffer;
-		padBuffer.resize(_ZARCHIVE::COMPRESSED_BLOCK_SIZE - m_currentWriteBuffer.size());
+		std::vector<uint8_t> padBuffer(_ZARCHIVE::COMPRESSED_BLOCK_SIZE - m_currentWriteBuffer.size(), 0);
 		AppendData(padBuffer.data(), padBuffer.size());
 	}
+	FlushPendingBlocks();
+	ShutdownWorkers();
+
 	m_footer.sectionCompressedData.offset = 0;
 	m_footer.sectionCompressedData.size = GetCurrentOutputOffset();
-	// pad to 8 byte
 	while ((GetCurrentOutputOffset() % 8) != 0)
 	{
 		uint8_t b = 0;
@@ -217,7 +393,7 @@ void ZArchiveWriter::Finalize()
 void ZArchiveWriter::WriteOffsetRecords()
 {
 	m_footer.sectionOffsetRecords.offset = GetCurrentOutputOffset();
-	_ZARCHIVE::CompressionOffsetRecord::Serialize(m_compressionOffsetRecord.data(), m_compressionOffsetRecord.size(), m_compressionOffsetRecord.data()); // in-place
+	_ZARCHIVE::CompressionOffsetRecord::Serialize(m_compressionOffsetRecord.data(), m_compressionOffsetRecord.size(), m_compressionOffsetRecord.data());
 	OutputData(m_compressionOffsetRecord.data(), m_compressionOffsetRecord.size() * sizeof(_ZARCHIVE::CompressionOffsetRecord));
 	m_footer.sectionOffsetRecords.size = GetCurrentOutputOffset() - m_footer.sectionOffsetRecords.offset;
 }
@@ -230,11 +406,9 @@ void ZArchiveWriter::WriteNameTable()
 	for (size_t i = 0; i < m_nodeNames.size(); i++)
 	{
 		m_nodeNameOffsets[i] = currentNameTableOffset;
-		// Each node name is stored with a length prefix byte. The prefix byte's MSB is used to indicate if an extended 2-byte header is used. The lower 7 bits are used to store the lower bits of the name length
-		// If MSB is set, add an extra byte which extends the 7 bit name length field to 15 bit
 		std::string_view name = m_nodeNames[i];
 		if (name.size() > 0x7FFF)
-			name = name.substr(0, 0x7FFF); // cut-off after 2^15-1 characters
+			name = name.substr(0, 0x7FFF);
 		if (name.size() >= 0x80)
 		{
 			uint8_t header[2];
@@ -259,9 +433,8 @@ void ZArchiveWriter::WriteNameTable()
 void ZArchiveWriter::WriteFileTree()
 {
 	std::queue<PathNode*> nodeQueue;
-	// first pass - assign a node range to all directories
 	nodeQueue.push(&m_rootNode);
-	uint32_t currentIndex = 1; // root node is at index 0
+	uint32_t currentIndex = 1;
 	while (!nodeQueue.empty())
 	{
 		PathNode* node = nodeQueue.front();
@@ -271,7 +444,6 @@ void ZArchiveWriter::WriteFileTree()
 			node->nodeStartIndex = (uint32_t)0xFFFFFFFF;
 			continue;
 		}
-		// order entries lexicographically so we can use binary search in the reader
 		std::sort(node->subnodes.begin(), node->subnodes.end(),
 			[&](ZArchiveWriter::PathNode*& a, ZArchiveWriter::PathNode*& b) -> int
 			{
@@ -283,7 +455,7 @@ void ZArchiveWriter::WriteFileTree()
 		for (auto& it : node->subnodes)
 			nodeQueue.push(it);
 	}
-	// second pass - serialize to file
+
 	m_footer.sectionFileTree.offset = GetCurrentOutputOffset();
 	nodeQueue.push(&m_rootNode);
 	while (!nodeQueue.empty())
@@ -292,7 +464,7 @@ void ZArchiveWriter::WriteFileTree()
 		nodeQueue.pop();
 
 		_ZARCHIVE::FileDirectoryEntry tmp;
-		if(node == &m_rootNode)
+		if (node == &m_rootNode)
 			tmp.SetTypeAndNameOffset(node->isFile, 0x7FFFFFFF);
 		else
 			tmp.SetTypeAndNameOffset(node->isFile, m_nodeNameOffsets[node->nameIndex]);
@@ -317,7 +489,6 @@ void ZArchiveWriter::WriteFileTree()
 
 void ZArchiveWriter::WriteMetaData()
 {
-	// todo
 	m_footer.sectionMetaDirectory.offset = GetCurrentOutputOffset();
 	m_footer.sectionMetaDirectory.size = 0;
 	m_footer.sectionMetaData.offset = GetCurrentOutputOffset();
@@ -332,7 +503,6 @@ void ZArchiveWriter::WriteFooter()
 
 	_ZARCHIVE::Footer tmp;
 
-	// serialize and hash the footer with all hash bytes set to zero
 	memset(m_footer.integrityHash, 0, 32);
 	_ZARCHIVE::Footer::Serialize(&m_footer, &tmp);
 	sha_256_write(m_mainShaCtx, &tmp, sizeof(_ZARCHIVE::Footer));
@@ -340,7 +510,6 @@ void ZArchiveWriter::WriteFooter()
 	free(m_mainShaCtx);
 	m_mainShaCtx = nullptr;
 
-	// set hash and write footer
 	memcpy(m_footer.integrityHash, m_integritySha, 32);
 	_ZARCHIVE::Footer::Serialize(&m_footer, &tmp);
 	OutputData(&tmp, sizeof(_ZARCHIVE::Footer));

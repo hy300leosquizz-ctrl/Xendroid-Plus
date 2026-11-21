@@ -11,6 +11,7 @@
 #define XENIA_BASE_STRING_UTIL_H_
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstddef>
 #include <cstring>
@@ -146,15 +147,34 @@ inline bool hex_string_to_array(std::vector<uint8_t>& output_array,
 inline std::string BoolToString(bool value) { return value ? "true" : "false"; }
 
 inline std::string ltrim(const std::string& value) {
-  return std::regex_replace(value, std::regex("^\\s+"), std::string(""));
+  size_t start = 0;
+  while (start < value.size() &&
+         std::isspace(static_cast<unsigned char>(value[start]))) {
+    ++start;
+  }
+  return value.substr(start);
 }
 
 inline std::string rtrim(const std::string& value) {
-  return std::regex_replace(value, std::regex("\\s+$"), std::string(""));
+  size_t end = value.size();
+  while (end > 0 && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+    --end;
+  }
+  return value.substr(0, end);
 }
 
 inline std::string trim(const std::string& value) {
-  return ltrim(rtrim(value));
+  size_t start = 0;
+  size_t end = value.size();
+  while (start < end &&
+         std::isspace(static_cast<unsigned char>(value[start]))) {
+    ++start;
+  }
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+    --end;
+  }
+  return value.substr(start, end - start);
 }
 
 inline std::string remove_eol(const std::string& value) {

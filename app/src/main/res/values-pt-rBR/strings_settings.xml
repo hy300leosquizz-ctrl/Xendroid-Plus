@@ -263,4 +263,42 @@
         <item quantity="one">e mais %1$d</item>
         <item quantity="other">e mais %1$d</item>
     </plurals>
+    <string name="st_t_storage_iso_stream_pread">Ler discos .iso sob demanda</string>
+    <string name="st_d_storage_iso_stream_pread">Lê setores de .iso do Xbox 360 via pread64 e cache LRU de 16 MiB em vez de mapear os 8,5 GB inteiros na memória, economizando de 2 a 5 GB de RAM no Android.</string>
+    <string name="st_t_hid_jit_frame_start">Início de quadro just-in-time</string>
+    <string name="st_d_hid_jit_frame_start">Aproxima a leitura dos controles do instante de apresentação para os botões responderem cerca de 20 ms mais cedo. Automático cede a vez quando a geração de quadros está ativa.</string>
+    <string name="st_t_vulkan_vulkan_xclipse_bc_transcode">Transcodificação BCn na Samsung Xclipse</string>
+    <string name="st_d_vulkan_vulkan_xclipse_bc_transcode">Converte texturas DXT/BCn via compute na GPU em drivers Samsung Xclipse onde a leitura nativa de BCn gera falhas ou artefatos.</string>
+    <string name="st_t_vulkan_vulkan_msaa_4x_as_2x2">Emular MSAA 4x como 2x2</string>
+    <string name="st_d_vulkan_vulkan_msaa_4x_as_2x2">Mapeia alvos MSAA 4x do Xbox 360 em arranjo 2x2 para economizar banda e memória de tiles nas GPUs móveis com diferença visual mínima.</string>
+    <string name="st_t_vulkan_vulkan_adreno_bcenabler">Ativar BCn nativo na Adreno</string>
+    <string name="st_d_vulkan_vulkan_adreno_bcenabler">Habilita formatos comprimidos BCn por hardware em drivers proprietários Qualcomm Adreno que ocultam o suporte nas consultas Vulkan.</string>
+    <string name="st_t_vulkan_vulkan_memexport_batch">Agrupar exportações de memória da GPU</string>
+    <string name="st_d_vulkan_vulkan_memexport_batch">Agrupa escritas consecutivas de memexport do Xenos em menos barreiras e sincronizações com a CPU.</string>
+    <string name="st_t_gpu_spirv_forward_jump_segments">Segmentar saltos à frente em SPIR-V</string>
+    <string name="st_d_gpu_spirv_forward_jump_segments">Converte saltos condicionais à frente dos shaders Xenos em segmentos SPIR-V estruturados, acelerando a compilação de shaders no celular.</string>
+    <string name="st_t_gpu_spirv_nonfinite_safe_fmul">Multiplicação SPIR-V segura para não-finitos</string>
+    <string name="st_d_gpu_spirv_nonfinite_safe_fmul">Preserva a regra 0 * Inf = 0 do Xbox 360 nos shaders SPIR-V traduzidos sem o custo completo de verificação de NaN.</string>
+    <string name="st_t_gpu_spirv_texture_iscale_specialization">Especializar escala de coordenadas de textura</string>
+    <string name="st_d_gpu_spirv_texture_iscale_specialization">Incorpora fatores constantes de escala de resolução nos módulos SPIR-V especializados para reduzir instruções por amostra.</string>
+    <string name="st_t_gpu_vulkan_shader_register_ssa">Promoção de registradores SSA em SPIR-V</string>
+    <string name="st_d_gpu_vulkan_shader_register_ssa">Promove registradores temporários não indexados do Xenos a valores SSA em SPIR-V em vez de vetores privados, melhorando o uso de registradores na GPU móvel.</string>
+    <string name="st_t_vulkan_vulkan_shader_object">Objetos de shader Vulkan (EXT)</string>
+    <string name="st_d_vulkan_vulkan_shader_object">Usa VK_EXT_shader_object quando suportado pelo driver para vincular shaders compilados diretamente sem pipelines monolíticos.</string>
+    <string name="st_t_vulkan_vulkan_graphics_pipeline_library">Biblioteca de pipelines gráficos (GPL)</string>
+    <string name="st_d_vulkan_vulkan_graphics_pipeline_library">Usa VK_EXT_graphics_pipeline_library quando suportado para ligar subconjuntos pré-compilados de shaders e estados quase sem engasgos.</string>
+    <string name="st_t_gpu_vulkan_fable2_float24_depth">Precisão de profundidade float24 (Fable II)</string>
+    <string name="st_d_gpu_vulkan_fable2_float24_depth">Aplica o arredondamento exato float24 20e4 necessário para evitar cintilação de profundidade e sombras quebradas em Fable II e jogos Unreal Engine 3.</string>
+    <string name="st_t_vulkan_vulkan_tight_render_area">Área justa de renderização</string>
+    <string name="st_d_vulkan_vulkan_tight_render_area">Restringe o renderArea do Vulkan ao retângulo ativo de scissor/viewport para que GPUs por tiles evitem carregar e resolver tiles fora da área útil.</string>
+    <string name="st_t_cpu_a64_call_aware_volatile_gprs">GPRs voláteis conscientes de chamada no ARM64</string>
+    <string name="st_d_cpu_a64_call_aware_volatile_gprs">Evita salvar registradores PowerPC voláteis em chamadas de função no JIT ARM64 quando os blocos seguintes os sobrescrevem.</string>
+    <string name="st_t_cpu_a64_fast_vmx_estimates">Estimativas rápidas VMX no ARM64</string>
+    <string name="st_d_cpu_a64_fast_vmx_estimates">Usa instruções NEON FRECPE/FRSQRTE rápidas para matemática AltiVec/VMX. Mais rápido, mas desligue se houver tremores em física ou animações.</string>
+    <string name="st_t_cpu_enable_early_precompilation">Pré-compilação antecipada de funções</string>
+    <string name="st_d_cpu_enable_early_precompilation">Compila funções PowerPC descobertas em threads de fundo ao carregar o módulo em vez de esperar pela primeira execução.</string>
+    <string name="st_t_memory_shm_coalesce_writewatch_pages">Agrupar proteção de páginas write-watch</string>
+    <string name="st_d_memory_shm_coalesce_writewatch_pages">Agrupa páginas físicas contíguas do jogo em chamadas mprotect únicas ao armar ou limpar vigias de escrita da GPU.</string>
+    <string name="st_t_kernel_file_read_no_apc_inline">Adiar APC de conclusão de leitura</string>
+    <string name="st_d_kernel_file_read_no_apc_inline">Enfileira APCs assíncronos de NtReadFile em vez de executá-los na hora, corrigindo condições de corrida em motores de streaming.</string>
 </resources>

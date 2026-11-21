@@ -134,12 +134,77 @@ void repeated_handle_waits_end() {
         "a wait-all on a repeated handle did not fail");
 }
 
+// Event::Pulse wakes only callers already waiting (all of them for manual-reset,
+// one for auto-reset), leaves the event unsignaled, and does not sleep.
+void pulse_event_releases_only_current_waiters() {
+  using xe::threading::Event;
+  using xe::threading::WaitResult;
+  for (bool manual_reset : {false, true}) {
+    auto evt = manual_reset ? Event::CreateManualResetEvent(false)
+                            : Event::CreateAutoResetEvent(false);
+    check(evt != nullptr, "event creation failed");
+
+    // With nobody waiting, a pulse is lost and leaves the event unsignaled.
+    evt->Pulse();
+    check(xe::threading::Wait(evt.get(), false, 20ms) == WaitResult::kTimeout,
+          "pulse with no waiters left the event signaled");
+    check(evt->Query().state == 0,
+          "pulse left Query().state nonzero");
+
+    auto other = Event::CreateAutoResetEvent(false);
+    std::atomic<unsigned> started{0};
+    std::atomic<unsigned> released{0};
+    std::thread single_waiter([&] {
+      started.fetch_add(1);
+      if (xe::threading::Wait(evt.get(), false, 2s) == WaitResult::kSuccess) {
+        released.fetch_add(1);
+      }
+    });
+    std::thread multi_waiter([&] {
+      started.fetch_add(1);
+      auto res = xe::threading::WaitAny({evt.get(), other.get()}, false, 2s);
+      if (res.first == WaitResult::kSuccess && res.second == 0) {
+        released.fetch_add(1);
+      }
+    });
+
+    for (int i = 0; i < 200 && started.load() < 2; ++i) {
+      std::this_thread::sleep_for(1ms);
+    }
+    std::this_thread::sleep_for(40ms);
+
+    evt->Pulse();
+    const unsigned expected = manual_reset ? 2u : 1u;
+    for (int i = 0; i < 500 && released.load() < expected; ++i) {
+      std::this_thread::sleep_for(1ms);
+    }
+    std::this_thread::sleep_for(30ms);
+    check(released.load() == expected,
+          manual_reset ? "manual-reset pulse did not release all waiters"
+                       : "auto-reset pulse did not release exactly one waiter");
+
+    if (!manual_reset) {
+      evt->Pulse();
+      for (int i = 0; i < 500 && released.load() < 2u; ++i) {
+        std::this_thread::sleep_for(1ms);
+      }
+    }
+
+    single_waiter.join();
+    multi_waiter.join();
+    check(released.load() == 2u, "second waiter was never released");
+    check(xe::threading::Wait(evt.get(), false, 20ms) == WaitResult::kTimeout,
+          "event remained signaled after pulse woke waiters");
+  }
+}
+
 }  // namespace
 
 int main() {
   single_callback_runs_on_its_thread();
   concurrent_callbacks_stay_on_their_targets();
   repeated_handle_waits_end();
+  pulse_event_releases_only_current_waiters();
   if (failures) {
     std::fprintf(stderr, "threading_apc_test: %d failure(s)\n", failures);
     return 1;

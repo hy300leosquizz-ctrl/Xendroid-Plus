@@ -82,6 +82,17 @@ class GameLibraryRepository(
         true
     }
 
+    /** Validates [newPath] is a readable directory, then replaces [oldPath] in place. */
+    suspend fun replaceGameDirPath(oldPath: String, newPath: String): Boolean = withContext(Dispatchers.IO) {
+        val dir = File(newPath)
+        if (!dir.isDirectory || dir.listFiles() == null) {
+            Log.w(tag, "replaceGameDirPath rejected (not a readable dir): $newPath")
+            return@withContext false
+        }
+        prefs.replaceGameDirPath(oldPath, newPath)
+        true
+    }
+
     /** Stops scanning [path]; nothing in it is deleted. */
     suspend fun removeGameDirPath(path: String) = withContext(Dispatchers.IO) { prefs.removeGameDirPath(path) }
 

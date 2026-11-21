@@ -207,7 +207,8 @@ class EmulatorSession {
     fun requestFrameTrace(): Boolean = booted && core.request_frame_trace()
     /** PRE-boot: where the core leaves a fatal error's message before aborting. */
     fun setFatalReportPath(path: String?) = core.set_fatal_report_path(path)
-    fun presenterWork(): LongArray = if (booted) core.presenter_work() else longArrayOf(0, 0, 0)
+    fun presenterWork(): LongArray = if (booted) core.presenter_work() else longArrayOf(0, 0, 0, 0)
+    fun setPresenterAdpfTarget(targetNs: Long) { if (booted) core.set_presenter_adpf_target(targetNs) }
     fun setFrameGeneration(enabled: Boolean, preset: Int, hz: Float) { if (booted) core.set_frame_generation(enabled, preset, hz) }
     /** Requested mode; the native presenter drains and switches on its own thread. */
     fun zeroFgMode(): ZeroFgMode = if (booted) ZeroFgMode.fromValue(core.zerofg_mode()) else ZeroFgMode.OFF

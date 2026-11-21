@@ -10,6 +10,7 @@
 #include "xenia/kernel/xam/content_manager.h"
 
 #include <algorithm>
+#include <atomic>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/filesystem.h"
@@ -34,7 +35,7 @@ namespace xam {
 static const char* kGameContentHeaderDirName = "Headers";
 static const char* kSpaFilename = "spa.bin";
 
-static int content_device_id_ = 0;
+static std::atomic<int> content_device_id_{0};
 
 ContentPackage::ContentPackage(KernelState* kernel_state,
                                const std::string_view root_name,
@@ -67,12 +68,18 @@ ContentPackage::ContentPackage(KernelState* kernel_state,
       XELOGE("{}: Cannot mount content container {}", __func__, mount_path);
     }
   }
-  fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+}
+
+void ContentPackage::LinkRoot() {
+  linked_ = kernel_state_->file_system()->RegisterSymbolicLink(root_name_ + ":",
+                                                               device_path_);
 }
 
 ContentPackage::~ContentPackage() {
   auto fs = kernel_state_->file_system();
-  fs->UnregisterSymbolicLink(root_name_ + ":");
+  if (linked_) {
+    fs->UnregisterSymbolicLink(root_name_ + ":");
+  }
   fs->UnregisterDevice(device_path_);
 }
 
@@ -394,8 +401,6 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     return nullptr;
   }
 
-  auto global_lock = global_critical_region_.Acquire();
-
   // Open content is matched by its package, which for a disc is the package
   // holding the discNNN directory mounted.
   const std::filesystem::path package_path =
@@ -531,7 +536,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name,
                                        const XCONTENT_AGGREGATE_DATA& data) {
   auto global_lock = global_critical_region_.Acquire();
 
-  if (open_packages_.count(string_key_insensitive(root_name))) {
+  if (IsRootTaken(root_name)) {
     // Already content open with this root name.
     return X_ERROR_ALREADY_EXISTS;
   }
@@ -544,6 +549,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name,
   if (!package) {
     return X_ERROR_ACCESS_DENIED;
   }
+  package->LinkRoot();
 
   open_packages_.insert(
       {string_key_insensitive::create(root_name), package.release()});
@@ -575,30 +581,49 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
 
   auto global_lock = global_critical_region_.Acquire();
 
-  if (open_packages_.count(string_key_insensitive(root_name))) {
+  if (IsRootTaken(root_name)) {
     // Already content open with this root name.
     return X_ERROR_ALREADY_EXISTS;
   }
 
-  std::filesystem::path package_path;
+  std::filesystem::path mount_path;
   if (const X_RESULT result =
-          ResolvePackagePath(xuid, data, package_path, disc_number)) {
+          ResolvePackagePath(xuid, data, mount_path, disc_number)) {
     return result;
   }
-  if (!std::filesystem::exists(package_path)) {
-    // Does not exist, must be created.
-    return X_ERROR_FILE_NOT_FOUND;
-  }
+  const std::filesystem::path package_path =
+      disc_number != -1 ? mount_path.parent_path() : mount_path;
 
-  // Open package.
-  auto package = ResolvePackage(root_name, xuid, data, disc_number);
-  if (!package) {
-    return X_ERROR_FILE_NOT_FOUND;
-  }
+  // The package can be on slow storage, so mount it on an I/O worker without
+  // holding the global lock while keeping the root and package claimed.
+  opening_.emplace(string_key_insensitive::create(root_name), package_path);
+  global_lock.unlock();
 
-  // The header is the package's, not one of its discNNN directories'.
-  package->LoadPackageLicenseMask(PackageHeaderPath(
-      disc_number != -1 ? package_path.parent_path() : package_path));
+  std::unique_ptr<ContentPackage> package;
+  X_RESULT mount_result = X_ERROR_SUCCESS;
+  kernel_state_->RunBlockingIo(
+      [&]() {
+        std::error_code ec;
+        if (!std::filesystem::exists(mount_path, ec)) {
+          mount_result = X_ERROR_FILE_NOT_FOUND;
+          return;
+        }
+        package = ResolvePackage(root_name, xuid, data, disc_number);
+        if (!package) {
+          mount_result = X_ERROR_FILE_NOT_FOUND;
+          return;
+        }
+        // The header is the package's, not one of its discNNN directories'.
+        package->LoadPackageLicenseMask(PackageHeaderPath(package_path));
+      },
+      GuestScheduler::BlockingCallClass::kConcurrent);
+
+  global_lock.lock();
+  opening_.erase(string_key_insensitive(root_name));
+  if (mount_result) {
+    return mount_result;
+  }
+  package->LinkRoot();
 
   content_license = package->GetPackageLicense();
   if (static_cast<uint32_t>(cvars::license_mask) > 0) {
@@ -863,15 +888,27 @@ std::filesystem::path ContentManager::ResolveGameUserContentPath(
          title_id;
 }
 
+bool ContentManager::IsRootTaken(const std::string_view root_name) const {
+  auto global_lock = global_critical_region_.Acquire();
+  const string_key_insensitive key(root_name);
+  return open_packages_.count(key) || opening_.count(key);
+}
+
 bool ContentManager::IsContentOpen(
     const std::filesystem::path& package_path) const {
   // A name in another case, with the shared bit or for another user can reach
   // the same package so open ones are matched by their host files.
-  return std::ranges::any_of(open_packages_, [&](const auto& content) {
+  auto same = [&](const std::filesystem::path& open_path) {
     std::error_code ec;
-    return std::filesystem::equivalent(package_path,
-                                       content.second->package_path(), ec);
-  });
+    return std::filesystem::equivalent(package_path, open_path, ec);
+  };
+  return std::ranges::any_of(open_packages_,
+                             [&](const auto& content) {
+                               return same(content.second->package_path());
+                             }) ||
+         std::ranges::any_of(opening_, [&](const auto& opening) {
+           return same(opening.second);
+         });
 }
 
 bool ContentManager::IsRootOpen(const std::string_view root_name) {

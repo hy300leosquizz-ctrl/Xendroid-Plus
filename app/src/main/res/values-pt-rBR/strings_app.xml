@@ -82,7 +82,7 @@
     <string name="xd_drv_back_to">Voltar ao anterior: %1$s</string>
     <string name="xd_drv_use_system">Usar o driver do sistema</string>
     <string name="xd_drv_suggestion">Sugestão para esta GPU</string>
-    <string name="xd_drv_suggestion_note">Veja o que as fontes oferecem para ver o driver sugerido pela família da Adreno nos nomes dos arquivos.</string>
+    <string name="xd_drv_suggestion_note">Veja o que as fontes oferecem para ver o driver sugerido para a família desta GPU nos nomes dos arquivos.</string>
     <string name="xd_drv_look">Ver os downloads</string>
     <string name="xd_drv_games">Jogos com driver próprio</string>
     <string name="xd_drv_games_none">Nenhum: todos usam o driver acima.</string>
@@ -120,11 +120,14 @@
         <item quantity="one">De %1$d fonte: %2$s</item>
         <item quantity="other">De %1$d fontes: %2$s</item>
     </plurals>
-    <string name="xd_drv_unsupported">Este aparelho não carrega drivers personalizados (eles precisam de uma GPU Adreno): todos os jogos usam o driver do sistema.</string>
+    <string name="xd_drv_unsupported">Este aparelho não carrega drivers personalizados (eles precisam de uma GPU Adreno, Mali ou Xclipse): todos os jogos usam o driver do sistema.</string>
     <string name="xd_set_title">Configurações</string>
     <string name="xd_drv_eff_not_yet">Nenhum jogo rodou com esta escolha ainda (o último usou %1$s).</string>
     <string name="xd_drv_eff_not_loaded">O driver escolhido não carregou na última sessão (ausente ou recusado): o driver do sistema foi usado.</string>
     <string name="xd_drv_eff_other">A última sessão rodou com outra biblioteca que não a escolhida agora (%1$s).</string>
     <string name="xd_drv_eff_custom_then">A última sessão rodou com um driver personalizado escolhido na época.</string>
     <string name="xd_drv_eff_ran">A última sessão rodou no driver escolhido.</string>
+    <string name="drv_probe_passed">%1$s verificado (Vulkan %2$s)</string>
+    <string name="drv_probe_failed">Driver recusado no teste Vulkan: %1$s</string>
+    <string name="drv_suggested_gpu">Sugerido para %1$s</string>
 </resources>

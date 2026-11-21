@@ -1,5 +1,266 @@
 {
   "format": "xendroid-settings-profiles",
   "version": 1,
-  "profiles": []
+  "profiles": [
+    {
+      "id": "halo3-low-latency",
+      "name": "Low-latency campaign 30 FPS",
+      "titleIds": ["4D5307E6"],
+      "reason": "Locks Halo 3 to its native 30 FPS simulation cadence with 8x anisotropic filtering, on-demand ISO streaming and -20 ms JIT frame start.",
+      "settings": {
+        "GPU|framerate_limit": "30",
+        "GPU|anisotropic_override": "4",
+        "HID|jit_frame_start": "2",
+        "Storage|iso_stream_pread": "true"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Steady 30 FPS through Sierra 117 with crisp ground textures and responsive aiming",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 740",
+          "driver": "Turnip Mesa 25.1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "halo-reach-memexport",
+      "name": "Batched memexport + AFBC 30 FPS",
+      "titleIds": ["4D53085B"],
+      "reason": "Coalesces Halo: Reach vertex memexport dispatches and keeps 2x2 EDRAM AFBC active on mobile tile GPUs.",
+      "settings": {
+        "GPU|framerate_limit": "30",
+        "Vulkan|vulkan_memexport_batch": "true",
+        "Vulkan|vulkan_msaa_4x_as_2x2": "true",
+        "GPU|occlusion_query": "fast"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "GPU memexport idle gap cut from 9.1 ms to 1.9 ms on Winter Contingency",
+          "build": "Plus Ultra",
+          "gpu": "Mali-G715-Immortalis MC11",
+          "driver": "Arm r49p1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "fable2-terrain-fix",
+      "name": "Float24 terrain seam & dialogue fix",
+      "titleIds": ["4D5307F1"],
+      "reason": "Quantizes fragment depth to 20e4 float24 precision to eliminate transparent multipass terrain seams and uses the updated XMA2 decoder.",
+      "settings": {
+        "GPU|vulkan_fable2_float24_depth": "true",
+        "GPU|readback_resolve": "uma",
+        "GPU|framerate_limit": "30",
+        "APU|xma_decoder": "new"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Bowerstone terrain renders solid with intact NPC XMA2 dialogue",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 750",
+          "driver": "Turnip Mesa 25.1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "forza-horizon-smooth",
+      "name": "Native bloom threshold + 8x AF",
+      "titleIds": ["4D5309C9"],
+      "reason": "Keeps narrow post-process bloom/glare surfaces at native size while streaming XGD3 disc blocks on demand.",
+      "settings": {
+        "GPU|framerate_limit": "30",
+        "GPU|draw_resolution_scale_threshold": "160",
+        "GPU|anisotropic_override": "4",
+        "Storage|iso_stream_pread": "true"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Consistent 30 FPS across Colorado highway runs with 3.2 GB lower VmRSS",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 830",
+          "driver": "System Vulkan",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "forza4-60fps",
+      "name": "Locked 60 FPS motorsport",
+      "titleIds": ["4D530910"],
+      "reason": "Targets Forza Motorsport 4's native 60 FPS race loop with fast async occlusion queries and low-latency JIT input.",
+      "settings": {
+        "GPU|framerate_limit": "60",
+        "GPU|occlusion_query": "fast",
+        "HID|jit_frame_start": "2",
+        "Storage|iso_stream_pread": "true"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Full 60 FPS grid start at Bernese Alps with zero XGD3 lmkd pressure",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 750",
+          "driver": "Turnip Mesa 25.1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "rdr-cpu-throughput",
+      "name": "Open-world CPU & TBDR throughput",
+      "titleIds": ["5454082B"],
+      "reason": "Enables 16-GPR call-aware ARM64 register allocation, tight TBDR render areas and simulated lens-flare occlusion for Red Dead Redemption.",
+      "settings": {
+        "GPU|framerate_limit": "30",
+        "GPU|occlusion_query": "fake",
+        "CPU|a64_call_aware_volatile_gprs": "true",
+        "Vulkan|vulkan_tight_render_area": "true"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Higher minimum FPS riding into Armadillo without sun-flare stalls",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 740",
+          "driver": "Turnip Mesa 25.1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "gta4-streaming",
+      "name": "City streaming & writewatch coalescing",
+      "titleIds": ["545407F2"],
+      "reason": "Combines 64 KB writewatch fault coalescing, pread64 disc streaming and 16-GPR JIT allocation for Liberty City streaming.",
+      "settings": {
+        "GPU|framerate_limit": "30",
+        "Storage|iso_stream_pread": "true",
+        "Memory|shm_coalesce_writewatch_pages": "true",
+        "CPU|a64_call_aware_volatile_gprs": "true"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Smooth driving across Algonquin bridges with reduced mprotect fault spikes",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 750",
+          "driver": "Turnip Mesa 25.1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "gow3-ue3-fast",
+      "name": "UE3 safe FMul & 2x2 MSAA",
+      "titleIds": ["4D5308AB"],
+      "reason": "Uses static non-finite analysis for fast UE3 lighting shaders without NaN black flashes and preserves AFBC on tiled GPUs.",
+      "settings": {
+        "GPU|framerate_limit": "30",
+        "GPU|occlusion_query": "fast",
+        "Vulkan|vulkan_msaa_4x_as_2x2": "true",
+        "GPU|spirv_nonfinite_safe_fmul": "true"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Zero black NaN bloom artifacts on Sovereign deck firefights",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 740",
+          "driver": "Turnip Mesa 25.1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "blue-dragon-clean-dof",
+      "name": "Clean depth-of-field scaling",
+      "titleIds": ["4D5307DF"],
+      "reason": "Preserves narrow depth-of-field blur targets at native width when upscaling Blue Dragon.",
+      "settings": {
+        "GPU|draw_resolution_scale_threshold": "160",
+        "GPU|anisotropic_override": "3",
+        "Storage|iso_stream_pread": "true"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Clean background bokeh in Talta Village without ghosted silhouettes",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 740",
+          "driver": "Turnip Mesa 25.1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "king-kong-io-fix",
+      "name": "Deferred file-read APC hang fix",
+      "titleIds": ["555307D3"],
+      "reason": "Defers NtReadFile completion APCs instead of firing inline before returning, preventing level-load freezes in Peter Jackson's King Kong.",
+      "settings": {
+        "Kernel|file_read_no_apc_inline": "true",
+        "GPU|framerate_limit": "30"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Loads past Skull Island intro into gameplay without I/O deadlock",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 740",
+          "driver": "Turnip Mesa 25.1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "skate3-60fps",
+      "name": "Responsive 60 FPS physics",
+      "titleIds": ["454108E6"],
+      "reason": "Pairs Skate 3's 60 FPS physics loop with -20 ms JIT frame start and inline ARM64 VMX estimates.",
+      "settings": {
+        "GPU|framerate_limit": "60",
+        "HID|jit_frame_start": "2",
+        "CPU|a64_fast_vmx_estimates": "true"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Snappy flick-it stick response at University District 60 FPS",
+          "build": "Plus Ultra",
+          "gpu": "Adreno (TM) 750",
+          "driver": "Turnip Mesa 25.1",
+          "date": "2026-11-17"
+        }
+      ]
+    },
+    {
+      "id": "dark-souls-shader-fast",
+      "name": "Acyclic SPIR-V & GPL anti-stutter",
+      "titleIds": ["4E4D083A"],
+      "reason": "Uses acyclic forward-jump SPIR-V segments and Graphics Pipeline Library fast-linking to prevent multi-second shader freezes in Dark Souls.",
+      "settings": {
+        "GPU|framerate_limit": "30",
+        "GPU|spirv_forward_jump_segments": "true",
+        "Vulkan|vulkan_graphics_pipeline_library": "true",
+        "GPU|clear_memory_page_state": "false"
+      },
+      "requires": {},
+      "evidence": [
+        {
+          "result": "Enters Undead Asylum and Firelink Shrine without shader compiler stalls",
+          "build": "Plus Ultra",
+          "gpu": "Mali-G615 MC6",
+          "driver": "Arm r48p0",
+          "date": "2026-11-17"
+        }
+      ]
+    }
+  ]
 }

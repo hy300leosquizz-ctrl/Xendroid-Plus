@@ -9,13 +9,21 @@
 
 #include "xenia/gpu/texture_cache.h"
 
+#include <algorithm>
+
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shared_memory.h"
+#include "xenia/gpu/texture_info.h"
+
+#if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+#include <unistd.h>
+#endif
 
 DEFINE_int32(
     draw_resolution_scale_x, 1,
@@ -105,6 +113,25 @@ DEFINE_bool(tiled_shared_memory, true,
             "support. Disable for graphics debugger compatibility.",
             "GPU");
 
+DEFINE_int32(
+    vulkan_resolve_link_mips, 5,
+    "Maximum mip level linked directly from EDRAM 1x color resolves into "
+    "resident mipmapped textures (0 disables mip-chain resolve linking).",
+    "Vulkan");
+
+namespace {
+uint32_t QueryHostRamMegabytes() {
+#if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  const long pages = sysconf(_SC_PHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (pages > 0 && page_size > 0) {
+    return uint32_t((uint64_t(pages) * uint64_t(page_size)) >> 20);
+  }
+#endif
+  return 0;
+}
+}  // namespace
+
 namespace xe {
 namespace gpu {
 
@@ -145,6 +172,14 @@ const TextureCache::LoadShaderInfo
         {2, 2},   // kCTX1
         {4, 3},   // kDepthUnorm
         {4, 3},   // kDepthFloat
+        {4, 3},   // kR16XenosHalfToFloat32
+        {8, 3},   // kRG16XenosHalfToFloat32
+        {16, 2},  // kRGBA16XenosHalfToFloat32
+        {16, 2},  // kDXT1ToASTC4x4
+        {16, 2},  // kDXT3ToASTC4x4
+        {16, 2},  // kDXT5ToASTC4x4
+        {16, 2},  // kDXNToEACRG11
+        {16, 2},  // kCTX1ToEACRG11
 };
 
 TextureCache::TextureCache(const RegisterFile& register_file,
@@ -252,6 +287,25 @@ void TextureCache::CompletedSubmissionUpdated(
       cvars::texture_cache_memory_limit_soft + limit_scaled_resolve_add_mb;
   uint32_t limit_hard_mb =
       cvars::texture_cache_memory_limit_hard + limit_scaled_resolve_add_mb;
+  if (decompressed_bcn_fallback_active_) {
+    static const uint32_t kHostRamMb = QueryHostRamMegabytes();
+    if (kHostRamMb > 0) {
+      if (cvars::texture_cache_memory_limit_soft <= 384) {
+        const uint32_t dynamic_soft_mb =
+            std::clamp(uint32_t(uint64_t(kHostRamMb) * 18 / 100),
+                       UINT32_C(768), UINT32_C(2048));
+        limit_soft_mb =
+            std::max(limit_soft_mb, dynamic_soft_mb + limit_scaled_resolve_add_mb);
+      }
+      if (cvars::texture_cache_memory_limit_hard <= 768) {
+        const uint32_t dynamic_hard_mb =
+            std::clamp(uint32_t(uint64_t(kHostRamMb) * 30 / 100),
+                       UINT32_C(1536), UINT32_C(3072));
+        limit_hard_mb =
+            std::max(limit_hard_mb, dynamic_hard_mb + limit_scaled_resolve_add_mb);
+      }
+    }
+  }
   uint32_t limit_soft_lifetime =
       cvars::texture_cache_memory_limit_soft_lifetime * 1000;
   bool destroyed_any = false;
@@ -425,6 +479,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     const bool binding_was_outdated =
         old_key.is_valid && IsBindingOutdatedForUse(binding);
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
+    ApplyMipChainSharing(binding.key);
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
       // An invalid fetch constant still has a destination swizzle: its
@@ -738,6 +793,7 @@ TextureCache::Texture::~Texture() {
 
   // Only remove from usage list if we were added to it (track_usage=true).
   if (in_usage_list_) {
+    texture_cache_.UnregisterLinkCandidate(this);
     if (used_previous_) {
       used_previous_->used_next_ = used_next_;
     } else {
@@ -754,12 +810,22 @@ TextureCache::Texture::~Texture() {
 }
 
 bool TextureCache::Texture::MakeUpToDateAndWatch(
-    const global_unique_lock_type& global_lock) {
+    const global_unique_lock_type& global_lock, bool update_base,
+    bool update_mips) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
   assert_true(global_lock.owns_lock());
   if (subresource_count_) {
     // What the load covered - not what became outdated during it.
-    const uint64_t loaded = loading_subresources_;
+    uint64_t loaded = loading_subresources_;
+    const uint64_t base_mask = subresource_layers_ >= 64
+                                   ? ~uint64_t(0)
+                                   : (uint64_t(1) << subresource_layers_) - 1;
+    if (!update_base) {
+      loaded &= ~base_mask;
+    }
+    if (!update_mips) {
+      loaded &= base_mask;
+    }
     for (uint64_t bits = loaded; bits; bits &= bits - 1) {
       uint32_t start, length;
       GetSubresourceRange(xe::tzcnt(bits), start, length);
@@ -783,16 +849,16 @@ bool TextureCache::Texture::MakeUpToDateAndWatch(
             2 + index);
       }
     }
-    loading_subresources_ = 0;
-    const uint64_t base_mask = subresource_layers_ >= 64
-                                   ? ~uint64_t(0)
-                                   : (uint64_t(1) << subresource_layers_) - 1;
+    loading_subresources_ &= ~loaded;
     base_outdated_ = (outdated_subresources_ & base_mask) != 0;
     mips_outdated_ = (outdated_subresources_ & ~base_mask) != 0;
+    if (!base_outdated_ && !mips_outdated_) {
+      ever_loaded_ = true;
+    }
     return true;
   }
-  const bool watch_base = base_outdated_;
-  const bool watch_mips = mips_outdated_;
+  const bool watch_base = update_base && base_outdated_;
+  const bool watch_mips = update_mips && mips_outdated_;
   if (watch_base &&
       !shared_memory.IsRangeValid(
           key().base_page << 12, xe::align(GetGuestBaseSize(), UINT32_C(16)))) {
@@ -807,6 +873,9 @@ bool TextureCache::Texture::MakeUpToDateAndWatch(
   if (watch_base) {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = false;
+    if (base_watch_handle_) {
+      shared_memory.UnwatchMemoryRange(base_watch_handle_);
+    }
     base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback,
         this, nullptr, 0);
@@ -814,11 +883,55 @@ bool TextureCache::Texture::MakeUpToDateAndWatch(
   if (watch_mips) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = false;
+    if (mips_watch_handle_) {
+      shared_memory.UnwatchMemoryRange(mips_watch_handle_);
+    }
     mips_watch_handle_ = shared_memory.WatchMemoryRange(
         key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback,
         this, nullptr, 1);
   }
+  if (!base_outdated_ && !mips_outdated_) {
+    ever_loaded_ = true;
+  }
   return true;
+}
+
+bool TextureCache::Texture::CompleteResolveLinkLevel(
+    const global_unique_lock_type& global_lock, uint32_t level,
+    uint32_t layer) {
+  assert_true(global_lock.owns_lock());
+  SharedMemory& shared_memory = texture_cache().shared_memory();
+  if (subresource_count_) {
+    const uint32_t index = level * subresource_layers_ + layer;
+    if (index >= subresource_count_) {
+      return false;
+    }
+    uint32_t start, length;
+    GetSubresourceRange(index, start, length);
+    if (length &&
+        !shared_memory.IsRangeValid(start, xe::align(length, UINT32_C(16)))) {
+      return false;
+    }
+    outdated_subresources_ &= ~(uint64_t(1) << index);
+    if (subresource_watch_handles_[index]) {
+      shared_memory.UnwatchMemoryRange(subresource_watch_handles_[index]);
+      subresource_watch_handles_[index] = nullptr;
+    }
+    if (length) {
+      subresource_watch_handles_[index] = shared_memory.WatchMemoryRange(
+          start, length, TextureCache::WatchCallback, this, nullptr, 2 + index);
+    }
+    const uint64_t base_mask = subresource_layers_ >= 64
+                                   ? ~uint64_t(0)
+                                   : (uint64_t(1) << subresource_layers_) - 1;
+    base_outdated_ = (outdated_subresources_ & base_mask) != 0;
+    mips_outdated_ = (outdated_subresources_ & ~base_mask) != 0;
+    if (!base_outdated_ && !mips_outdated_) {
+      ever_loaded_ = true;
+    }
+    return true;
+  }
+  return MakeUpToDateAndWatch(global_lock, level == 0, level != 0);
 }
 
 void TextureCache::Texture::MarkAsUsed() {
@@ -890,6 +1003,8 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
   for (TextureFindMemoEntry& entry : texture_find_memo_) {
     entry.texture = nullptr;
   }
+  link_candidates_.clear();
+  chain_max_levels_.clear();
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
@@ -983,8 +1098,190 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     find_memo.texture = texture;
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+  RegisterLinkCandidate(texture);
   texture->LogAction("Created");
   return texture;
+}
+
+void TextureCache::RegisterLinkCandidate(Texture* texture) {
+  if (!texture) {
+    return;
+  }
+  const TextureKey& key = texture->key();
+  if (!key.IsResolveLinkShape()) {
+    return;
+  }
+  const FormatInfo* format_info = FormatInfo::Get(key.format);
+  if (!format_info || format_info->block_width != 1 ||
+      format_info->block_height != 1) {
+    return;
+  }
+  if (key.base_page != 0) {
+    link_candidates_.emplace(key.base_page, texture);
+  }
+  if (key.mip_max_level != 0 && key.mip_page != 0 &&
+      key.mip_page != key.base_page) {
+    link_candidates_.emplace(key.mip_page, texture);
+  }
+}
+
+void TextureCache::UnregisterLinkCandidate(Texture* texture) {
+  for (auto it = link_candidates_.begin(); it != link_candidates_.end();) {
+    if (it->second == texture) {
+      it = link_candidates_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void TextureCache::ApplyMipChainSharing(TextureKey& key) const {
+  if (cvars::vulkan_resolve_link_mips <= 0 || !key.is_valid ||
+      !key.IsResolveLinkShape() || key.base_page == 0 || key.mip_page == 0 ||
+      key.mip_max_level > uint32_t(cvars::vulkan_resolve_link_mips)) {
+    return;
+  }
+  const uint64_t chain_key =
+      (uint64_t(key.base_page) << 32) | uint64_t(key.mip_page);
+  auto it = chain_max_levels_.find(chain_key);
+  if (it != chain_max_levels_.end() && it->second > key.mip_max_level) {
+    const uint32_t max_dim = std::max(key.GetWidth(), key.GetHeight());
+    const uint32_t max_possible_level = 31u - xe::lzcnt(max_dim);
+    const uint32_t target_level = std::min(it->second, max_possible_level);
+    if (target_level > key.mip_max_level) {
+      key.mip_max_level = target_level;
+    }
+  }
+}
+
+void TextureCache::GetResolveLinkCandidates(
+    uint32_t dest_base, uint32_t pitch_tiles, uint32_t dest_x0,
+    uint32_t dest_y0, uint32_t width, uint32_t height,
+    xenos::ColorFormat dest_format, xenos::Endian dest_endian,
+    std::vector<LinkCandidate>& out) {
+  out.clear();
+  if (cvars::vulkan_resolve_link_mips <= 0 || link_candidates_.empty() ||
+      !pitch_tiles || !width || !height) {
+    return;
+  }
+  dest_base &= 0x1FFFFFFFu;
+  const xenos::TextureFormat base_format =
+      GetBaseFormat(xenos::TextureFormat(dest_format));
+  const FormatInfo* format_info = FormatInfo::Get(base_format);
+  if (!format_info || format_info->block_width != 1 ||
+      format_info->block_height != 1) {
+    return;
+  }
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  const uint32_t tile_bytes =
+      xenos::kTextureTileWidthHeight * xenos::kTextureTileWidthHeight *
+      bytes_per_block;
+  if (!tile_bytes) {
+    return;
+  }
+  const uint32_t resolve_pitch_texels = pitch_tiles * 32u;
+  const uint32_t max_link_mips = uint32_t(cvars::vulkan_resolve_link_mips);
+
+  // Deduplicate textures registered under both base_page and mip_page.
+  Texture* seen[64];
+  uint32_t seen_count = 0;
+  for (const auto& pair : link_candidates_) {
+    Texture* texture = pair.second;
+    if (!texture) {
+      continue;
+    }
+    bool duplicate = false;
+    for (uint32_t s = 0; s < seen_count; ++s) {
+      if (seen[s] == texture) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate) {
+      continue;
+    }
+    if (seen_count < 64) {
+      seen[seen_count++] = texture;
+    }
+
+    const TextureKey& key = texture->key();
+    if (!key.IsResolveLinkShape() || key.format != base_format ||
+        key.endianness != dest_endian) {
+      continue;
+    }
+    const texture_util::TextureGuestLayout& layout = texture->guest_layout();
+    // Check level 0 (base) and unpacked mip levels 1..max_link_mips.
+    for (uint32_t level = 0; level <= key.mip_max_level; ++level) {
+      if (level >= layout.packed_level || level > max_link_mips) {
+        break;
+      }
+      if (level == 0 && key.base_page == 0) {
+        continue;
+      }
+      if (level != 0 && key.mip_page == 0) {
+        break;
+      }
+      // If multi-mip without per-subresource watches and never loaded yet,
+      // don't mark all mips clean from a single mip resolve; still record
+      // chain_max_levels_ below so future keys share the full chain.
+      const texture_util::TextureGuestLayout::Level& level_layout =
+          level == 0 ? layout.base : layout.mips[level];
+      const uint32_t level_size = level_layout.level_data_extent_bytes;
+      if (!level_size) {
+        continue;
+      }
+      const uint32_t level_guest_base =
+          level == 0
+              ? (key.base_page << 12)
+              : ((key.mip_page << 12) + layout.mip_offsets_bytes[level]);
+      if (dest_base < level_guest_base ||
+          dest_base >= level_guest_base + level_size) {
+        continue;
+      }
+      const uint32_t delta_bytes = dest_base - level_guest_base;
+      if (delta_bytes % tile_bytes != 0) {
+        continue;
+      }
+      const uint32_t level_pitch_blocks = level_layout.x_extent_blocks;
+      if (level_pitch_blocks != resolve_pitch_texels) {
+        continue;
+      }
+      const uint32_t pitch_macro_tiles =
+          std::max(level_pitch_blocks >> 5, UINT32_C(1));
+      const uint32_t tile_index = delta_bytes / tile_bytes;
+      const uint32_t dst_x = (tile_index % pitch_macro_tiles) * 32u + dest_x0;
+      const uint32_t dst_y = (tile_index / pitch_macro_tiles) * 32u + dest_y0;
+      const uint32_t level_width = std::max(key.GetWidth() >> level, 1u);
+      const uint32_t level_height = std::max(key.GetHeight() >> level, 1u);
+      if (dst_x + width > level_width || dst_y + height > level_height) {
+        continue;
+      }
+      if (level > 0 && key.base_page != 0 && key.mip_page != 0) {
+        const uint64_t chain_key =
+            (uint64_t(key.base_page) << 32) | uint64_t(key.mip_page);
+        uint32_t& recorded = chain_max_levels_[chain_key];
+        if (key.mip_max_level > recorded) {
+          recorded = std::min(uint32_t(key.mip_max_level), max_link_mips);
+        }
+      }
+      const bool full_level =
+          dst_x == 0 && dst_y == 0 && width == level_width &&
+          height == level_height;
+      const bool can_link =
+          texture->ever_loaded() || texture->has_subresource_watches() ||
+          (key.mip_max_level == 0 && full_level);
+      if (can_link) {
+        out.push_back(LinkCandidate{texture, level, dst_x, dst_y});
+      }
+      break;
+    }
+  }
+}
+
+void TextureCache::CompleteResolveLink(Texture& texture, uint32_t level,
+                                       uint32_t layer) {
+  auto global_lock = global_critical_region_.Acquire();
+  texture.CompleteResolveLinkLevel(global_lock, level, layer);
 }
 
 // Packs the integer scale the fetch shader reads from the system constant to

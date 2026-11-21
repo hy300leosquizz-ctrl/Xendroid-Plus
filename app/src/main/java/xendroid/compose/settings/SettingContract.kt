@@ -12,7 +12,7 @@ data class SettingContract(val scope: String, val apply: SettingApply,
 }
 
 /** U03: why the custom driver setting is unavailable, and what runs instead. */
-const val UNSUPPORTED_DRIVER = "Unavailable: custom drivers load only on Adreno GPUs (Qualcomm KGSL), " +
+const val UNSUPPORTED_DRIVER = "Unavailable: custom drivers load only on Adreno, Mali or Xclipse GPUs, " +
     "and this phone has none. Games run on the system driver."
 
 /** Disk editors never pretend that saving a cvar calls its live JNI setter. */

@@ -142,9 +142,13 @@ uint64_t GuestSpirvShaderCache::GetPixelShaderModification(
   // from the system constants, so these stay at their defaults.
   if (render_target_cache_.GetPath() ==
       RenderTargetCache::Path::kHostRenderTargets) {
-    // Whether this draw is native res due to a scale threshold.
+    // Whether this draw is native res due to a scale threshold. XenDroid:
+    // without resolution scaling, which the threshold needs, it means the
+    // samples of a 4x draw are pixels here, for the position it reads.
     modification.pixel.resolution_scale_native =
-        uint32_t(render_target_cache_.IsDrawScaleNative());
+        uint32_t(render_target_cache_.IsDrawResolutionScaled()
+                     ? render_target_cache_.IsDrawScaleNative()
+                     : render_target_cache_.draw_samples_as_pixels());
 
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;
@@ -242,9 +246,7 @@ Shader::Translation* GuestSpirvShaderCache::TranslateSpirv(
       should_translate = translation.TryClaimTranslation();
       if (!should_translate) {
         // Another thread is translating this same modification - wait for it.
-        while (!translation.is_translated()) {
-          std::this_thread::yield();
-        }
+        translation.WaitForTranslation();
       }
     }
     if (should_translate && !translator.TranslateAnalyzedShader(translation)) {

@@ -40,6 +40,7 @@
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 #include "xenia/cpu/breakpoint.h"
+#include "xenia/cpu/mmio_handler.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/stack_walker.h"
@@ -145,6 +146,9 @@ class A64HelperEmitter : public A64Emitter {
   void* EmitReturnToHostHelper();
   void* EmitVRsqrtefpHelper(void** out_vector_entry);
   void* EmitFrsqrteHelper();
+  void* EmitTryAcquireReservationHelper();
+  void* EmitReservedStoreHelper(bool bit64, ReservedStoreFaultSite& fault_site);
+  ReservedStoreThunk EmitReservedStoreThunk(void* helper);
 
  private:
   // Around a host call from guest code: host C code runs with the AAPCS64
@@ -982,13 +986,247 @@ void* A64HelperEmitter::EmitFrsqrteHelper() {
   return Emplace(func_info);
 }
 
+// GPR-only leaf helper for RESERVED_LOAD when inline native ops are off or on
+// possible MMIO instructions. Reached by plain BLR (no 448 B q4-q31 spill or
+// FPCR restore); only tail-calls AwaitReservation via GuestToHostThunk when a
+// concurrent stwcx. currently holds the granule claim (odd generation).
+// w1 = guest effective address (32-bit), x19 = A64BackendContext*.
+void* A64HelperEmitter::EmitTryAcquireReservationHelper() {
+  using namespace Xbyak_aarch64;
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+  code_offsets.prolog = getSize();
+  code_offsets.prolog_stack_alloc = getSize();
+  code_offsets.body = getSize();
+
+  auto bctx = [this](size_t offset) {
+    return ptr(x19, static_cast<uint32_t>(offset));
+  };
+  constexpr uint64_t kReserveFlagBit = uint64_t(1) << kA64BackendHasReserveBit;
+  Label claimed;
+
+  ldr(x8, bctx(offsetof(A64BackendContext, reserve_helper_)));
+  ubfx(w9, w1, A64_RESERVE_GRANULE_SHIFT, A64_RESERVE_ENTRY_BITS);
+  add(x8, x8, x9, LSL, 2);
+  ldar(w10, ptr(x8));
+  str(w1, bctx(offsetof(A64BackendContext, reserve_address)));
+  ldr(w11, bctx(offsetof(A64BackendContext, flags)));
+  orr(w11, w11, kReserveFlagBit);
+  str(w11, bctx(offsetof(A64BackendContext, flags)));
+  tbnz(w10, 0, claimed);
+  str(w10, bctx(offsetof(A64BackendContext, reserve_generation)));
+  mov(w0, 1);
+  ret();
+
+  L(claimed);
+  // Tail-call A64Backend::AwaitReservation(context, w1) via GuestToHostThunk,
+  // preserving x30 so GuestToHostThunk returns straight back to our caller.
+  mov(x0, reinterpret_cast<uint64_t>(&A64Backend::AwaitReservation));
+  ldr(x9, bctx(offsetof(A64BackendContext, guest_to_host_thunk_address)));
+  br(x9);
+
+  code_offsets.epilog = getSize();
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = 0;
+
+  return Emplace(func_info);
+}
+
+// w12 = guest address, x1 = host address, x2 = value
+// w0 = 1 if the store landed. Clobbers x0-x3, x8-x17 and the flags.
+void* A64HelperEmitter::EmitReservedStoreHelper(
+    bool bit64, ReservedStoreFaultSite& fault_site) {
+  using namespace Xbyak_aarch64;
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+  code_offsets.prolog = getSize();
+  code_offsets.prolog_stack_alloc = getSize();
+  code_offsets.body = getSize();
+
+  auto bctx = [this](size_t offset) {
+    return ptr(x19, static_cast<uint32_t>(offset));
+  };
+  constexpr uint32_t kReserveFlagBit = 1u << kA64BackendHasReserveBit;
+  const bool lse = IsFeatureEnabled(kA64EmitLSE);
+  Label fail, release_fail, claim_mismatch, value_mismatch;
+
+  // stwcx. always clears the reservation, stored or not
+  ldr(w8, bctx(offsetof(A64BackendContext, flags)));
+  and_(w9, w8, static_cast<uint64_t>(~kReserveFlagBit));
+  str(w9, bctx(offsetof(A64BackendContext, flags)));
+  tst(w8, static_cast<uint64_t>(kReserveFlagBit));
+  b(EQ, fail);
+
+  // the reservation must be for the address we're storing to
+  ldr(w10, bctx(offsetof(A64BackendContext, reserve_address)));
+  cmp(w10, w12);
+  b(NE, fail);
+
+  ldr(x11, bctx(offsetof(A64BackendContext, reserve_helper_)));
+  ubfx(w13, w12, A64_RESERVE_GRANULE_SHIFT, A64_RESERVE_ENTRY_BITS);
+  add(x11, x11, x13, LSL, 2);
+  // claim the generation (even to odd) so no other store can land until we
+  // publish the next even value, odd snapshots always fail
+  ldr(w15, bctx(offsetof(A64BackendContext, reserve_generation)));
+  tbnz(w15, 0, fail);
+  add(w17, w15, 1);
+
+  // a fault here leaves the claim in x11 and w17 for the handler
+  size_t first_access;
+  size_t last_access;
+  if (lse) {
+    mov(w14, w15);
+    casal(w14, w17, ptr(x11));
+    cmp(w14, w15);
+    b(NE, fail);
+
+    ldr(x16, bctx(offsetof(A64BackendContext, cached_reserve_value_)));
+    // casal returns the old value in the compare register, so keep a copy
+    mov(x3, x16);
+    first_access = getSize();
+    last_access = first_access;
+    if (bit64) {
+      casal(x16, x2, ptr(x1));
+      cmp(x16, x3);
+    } else {
+      casal(w16, w2, ptr(x1));
+      cmp(w16, w3);
+    }
+    b(NE, release_fail);
+  } else {
+    Label claim_retry, cas_retry;
+    L(claim_retry);
+    ldaxr(w14, ptr(x11));
+    cmp(w14, w15);
+    b(NE, claim_mismatch);
+    stlxr(w13, w17, ptr(x11));
+    cbnz(w13, claim_retry);
+
+    ldr(x16, bctx(offsetof(A64BackendContext, cached_reserve_value_)));
+    L(cas_retry);
+    first_access = getSize();
+    if (bit64) {
+      ldaxr(x14, ptr(x1));
+      cmp(x14, x16);
+      b(NE, value_mismatch);
+      last_access = getSize();
+      stlxr(w15, x2, ptr(x1));
+    } else {
+      ldaxr(w14, ptr(x1));
+      cmp(w14, w16);
+      b(NE, value_mismatch);
+      last_access = getSize();
+      stlxr(w15, w2, ptr(x1));
+    }
+    cbnz(w15, cas_retry);
+  }
+
+  add(w17, w17, 1);
+  stlr(w17, ptr(x11));
+  mov(w0, 1);
+  ret();
+
+  if (!lse) {
+    // ldaxr compare failed, drop the exclusive monitor
+    L(claim_mismatch);
+    clrex(15);
+    b(fail);
+    L(value_mismatch);
+    clrex(15);
+  }
+  // claimed, so publish even on failure
+  L(release_fail);
+  add(w17, w17, 1);
+  stlr(w17, ptr(x11));
+  const size_t fail_offset = getSize();
+  L(fail);
+  mov(w0, 0);
+  ret();
+
+  code_offsets.epilog = getSize();
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = 0;
+
+  auto helper = reinterpret_cast<uint8_t*>(Emplace(func_info));
+  fault_site.first_access = reinterpret_cast<uint64_t>(helper + first_access);
+  fault_site.last_access = reinterpret_cast<uint64_t>(helper + last_access);
+  fault_site.fail = reinterpret_cast<uint64_t>(helper + fail_offset);
+  return helper;
+}
+
+// Puts host arguments where the stwcx. helper takes them, so a fault in a host
+// store is released the same way as one in guest code.
+// w0 = guest address, x1 = context, x2 = value, x3 = host address
+ReservedStoreThunk A64HelperEmitter::EmitReservedStoreThunk(void* helper) {
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+  code_offsets.prolog = getSize();
+  sub(sp, sp, static_cast<uint32_t>(16));
+  code_offsets.prolog_stack_alloc = getSize();
+  stp(x19, x30, ptr(sp, 0x00));
+  code_offsets.body = getSize();
+
+  sub(x19, x1, static_cast<uint32_t>(sizeof(A64BackendContext)));
+  mov(w12, w0);
+  mov(x1, x3);
+  mov(x9, reinterpret_cast<uint64_t>(helper));
+  blr(x9);
+
+  code_offsets.epilog = getSize();
+  ldp(x19, x30, ptr(sp, 0x00));
+  add(sp, sp, static_cast<uint32_t>(16));
+  ret();
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = 16;
+
+  return reinterpret_cast<ReservedStoreThunk>(Emplace(func_info));
+}
+
 // ==========================================================================
 // Reservation helpers. A global per-granule generation counter so
-// cross-thread stores invalidate other threads' reservations. A CAS on the
-// value alone would be ABA-vulnerable, and so is checking the generation and
-// then storing: a thread descheduled in between misses every store made
-// meanwhile. The check and the store share one exclusive window instead (see
-// the native stwcx. in a64_seq_memory.cc).
+// cross-thread stores invalidate other threads' reservations.
 // ==========================================================================
 namespace {
 
@@ -1006,10 +1244,9 @@ std::atomic<uint32_t>& ReserveGranule(ReserveHelper* reserve_helper,
 extern "C" uint64_t TryAcquireReservationHelper(void* raw_context,
                                                 uint64_t guest_address) {
   auto* bctx = BackendContextFromRawContext(raw_context);
-  auto& granule =
-      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address));
   // snapshot the generation first, the acquire pins the value read after
-  bctx->reserve_generation = granule.load(std::memory_order_acquire);
+  bctx->reserve_generation = AwaitReserveGranule(
+      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address)));
   bctx->reserve_address = uint32_t(guest_address);
   // lwarx replaces any reservation this thread already held
   bctx->flags |= 1u << kA64BackendHasReserveBit;
@@ -1026,127 +1263,40 @@ T ReservedLoadImpl(ppc::PPCContext* context, uint32_t address) {
   return xe::byte_swap(raw);
 }
 
-// Stores |value| if the generation is still |generation| and the word still
-// |expected|, both checked between the ldaxr and the stlxr of the word, so a
-// context switch or a store to it before the store fails and checks again.
-// After a few failed exclusive stores (a core whose monitor the generation
-// load clears) it falls back to checking the generation, then one CAS.
-template <typename T>
-bool StoreIfUnchanged(std::atomic<uint32_t>* granule, uint32_t generation,
-                      volatile T* host, T expected, T value) {
-  uint32_t scratch;
-  uint32_t status;
-  uint32_t tries = 16;
-  T current;
-  if constexpr (sizeof(T) == sizeof(uint64_t)) {
-    __asm__ __volatile__(
-        "1: ldaxr %x[cur], [%[host]]\n"
-        "   cmp %x[cur], %x[expected]\n"
-        "   b.ne 3f\n"
-        "   ldr %w[scratch], [%[granule]]\n"
-        "   cmp %w[scratch], %w[generation]\n"
-        "   b.ne 3f\n"
-        "   stlxr %w[status], %x[value], [%[host]]\n"
-        "   cbz %w[status], 4f\n"
-        "   subs %w[tries], %w[tries], #1\n"
-        "   b.ne 1b\n"
-        "   mov %w[status], #2\n"
-        "   b 5f\n"
-        "3: clrex\n"
-        "   mov %w[status], #1\n"
-        "   b 5f\n"
-        "4: mov %w[status], #0\n"
-        "5:\n"
-        : [cur] "=&r"(current), [scratch] "=&r"(scratch),
-          [status] "=&r"(status), [tries] "+r"(tries)
-        : [granule] "r"(granule), [generation] "r"(generation),
-          [host] "r"(host), [expected] "r"(expected), [value] "r"(value)
-        : "cc", "memory");
-  } else {
-    __asm__ __volatile__(
-        "1: ldaxr %w[cur], [%[host]]\n"
-        "   cmp %w[cur], %w[expected]\n"
-        "   b.ne 3f\n"
-        "   ldr %w[scratch], [%[granule]]\n"
-        "   cmp %w[scratch], %w[generation]\n"
-        "   b.ne 3f\n"
-        "   stlxr %w[status], %w[value], [%[host]]\n"
-        "   cbz %w[status], 4f\n"
-        "   subs %w[tries], %w[tries], #1\n"
-        "   b.ne 1b\n"
-        "   mov %w[status], #2\n"
-        "   b 5f\n"
-        "3: clrex\n"
-        "   mov %w[status], #1\n"
-        "   b 5f\n"
-        "4: mov %w[status], #0\n"
-        "5:\n"
-        : [cur] "=&r"(current), [scratch] "=&r"(scratch),
-          [status] "=&r"(status), [tries] "+r"(tries)
-        : [granule] "r"(granule), [generation] "r"(generation),
-          [host] "r"(host), [expected] "r"(expected), [value] "r"(value)
-        : "cc", "memory");
-  }
-  if (status == 0) {
-    return true;
-  }
-  if (status == 1 ||
-      granule->load(std::memory_order_acquire) != generation) {
-    return false;
-  }
-  if constexpr (sizeof(T) == sizeof(uint64_t)) {
-    return xe::atomic_cas(uint64_t(expected), uint64_t(value),
-                          reinterpret_cast<volatile uint64_t*>(host));
-  } else {
-    return xe::atomic_cas(uint32_t(expected), uint32_t(value),
-                          reinterpret_cast<volatile uint32_t*>(host));
-  }
-}
-
-template <typename T>
-uint64_t ReservedStoreImpl(void* raw_context, uint64_t guest_address,
-                           uint64_t host_address, uint64_t value) {
-  auto* bctx = BackendContextFromRawContext(raw_context);
-  const uint32_t reserve_flag = 1u << kA64BackendHasReserveBit;
-  const bool had_reservation = (bctx->flags & reserve_flag) != 0;
-  // stwcx. always clears the reservation, stored or not
-  bctx->flags &= ~reserve_flag;
-  // the reservation must be for the address we're storing to
-  if (!had_reservation || bctx->reserve_address != uint32_t(guest_address)) {
-    return 0;
-  }
-
-  auto& granule =
-      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address));
-  // a store to this granule since our lwarx kills the reservation
-  const bool stored = StoreIfUnchanged<T>(
-      &granule, bctx->reserve_generation,
-      reinterpret_cast<volatile T*>(uintptr_t(host_address)),
-      T(bctx->cached_reserve_value_), T(value));
-  if (stored) {
-    // the store landed, so kill other reservations on this granule
-    granule.fetch_add(1, std::memory_order_release);
-  }
-  return stored ? 1 : 0;
-}
-
-extern "C" uint64_t ReservedStore32Helper(void* raw_context,
-                                          uint64_t guest_address,
-                                          uint64_t host_address,
-                                          uint64_t value) {
-  return ReservedStoreImpl<uint32_t>(raw_context, guest_address, host_address,
-                                     value);
-}
-
-extern "C" uint64_t ReservedStore64Helper(void* raw_context,
-                                          uint64_t guest_address,
-                                          uint64_t host_address,
-                                          uint64_t value) {
-  return ReservedStoreImpl<uint64_t>(raw_context, guest_address, host_address,
-                                     value);
-}
-
 }  // namespace
+
+uint64_t A64Backend::AwaitReservation(void* raw_context,
+                                      uint64_t guest_address) {
+  auto* bctx = BackendContextFromRawContext(raw_context);
+  bctx->reserve_generation = AwaitReserveGranule(
+      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address)));
+  return 0;
+}
+
+uint64_t A64Backend::ReleaseFaultingReservedStore(void* data, Exception* ex) {
+  auto* backend = reinterpret_cast<A64Backend*>(data);
+  for (const auto& site : backend->reserved_store_fault_sites_) {
+    if (ex->pc() < site.first_access || ex->pc() > site.last_access) {
+      continue;
+    }
+    // x11 = the claimed granule, w17 = its odd generation
+    const HostThreadContext& context = *ex->thread_context();
+    reinterpret_cast<std::atomic<uint32_t>*>(context.x[11])
+        ->store(uint32_t(context.x[17]) + 1, std::memory_order_release);
+    return site.fail;
+  }
+  return 0;
+}
+
+bool A64Backend::IsReservedStoreFaultPc(void* data, uint64_t pc) {
+  auto* backend = reinterpret_cast<A64Backend*>(data);
+  for (const auto& site : backend->reserved_store_fault_sites_) {
+    if (pc >= site.first_access && pc <= site.last_access) {
+      return true;
+    }
+  }
+  return false;
+}
 
 uint32_t A64Backend::ReservedLoad32(ppc::PPCContext* context,
                                     uint32_t address) {
@@ -1160,20 +1310,16 @@ uint64_t A64Backend::ReservedLoad64(ppc::PPCContext* context,
 
 bool A64Backend::ReservedStore32(ppc::PPCContext* context, uint32_t address,
                                  uint32_t value) {
-  return ReservedStoreImpl<uint32_t>(
-             context, address,
-             reinterpret_cast<uint64_t>(
-                 context->TranslateVirtual<uint32_t*>(address)),
-             xe::byte_swap(value)) != 0;
+  return reserved_store_32_thunk_(
+             address, context, xe::byte_swap(value),
+             context->TranslateVirtual<uint32_t*>(address)) != 0;
 }
 
 bool A64Backend::ReservedStore64(ppc::PPCContext* context, uint32_t address,
                                  uint64_t value) {
-  return ReservedStoreImpl<uint64_t>(
-             context, address,
-             reinterpret_cast<uint64_t>(
-                 context->TranslateVirtual<uint64_t*>(address)),
-             xe::byte_swap(value)) != 0;
+  return reserved_store_64_thunk_(
+             address, context, xe::byte_swap(value),
+             context->TranslateVirtual<uint64_t*>(address)) != 0;
 }
 
 // ==========================================================================
@@ -1281,9 +1427,10 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
     }
   }
 
-  auto fn = processor->ResolveFunction(static_cast<uint32_t>(target_address));
+  uint32_t address = static_cast<uint32_t>(target_address);
+  auto fn = processor->ResolveCallTarget(guest_context, &address);
   if (!fn) {
-    // Unresolvable — return 0 which will fault.
+    XELOGE("No guest code at {:08X} for a call", address);
     return 0;
   }
 
@@ -1445,30 +1592,18 @@ static uint64_t ResolveDynamicFunction(void* raw_context,
     }
   }
   const uint64_t sweep_count = guest_context->processor->code_sweep_count();
-  auto function = guest_context->processor->ResolveFunction(
-      static_cast<uint32_t>(target_address));
-  bool redirected = false;
-  if (!function || !function->is_guest()) {
-    // The guest can handle the fetch fault and continue the call elsewhere.
-    if (auto hook = guest_context->processor->code_fault_hook()) {
-      if (const uint32_t resume_address =
-              hook(guest_context, static_cast<uint32_t>(target_address))) {
-        target_address = resume_address;
-        function = guest_context->processor->ResolveFunction(resume_address);
-        redirected = true;
-      }
-    }
-  }
-  if (!function || !function->is_guest()) {
-    XELOGE("No guest code at {:08X} for a dynamic call",
-           static_cast<uint32_t>(target_address));
+  uint32_t address = static_cast<uint32_t>(target_address);
+  auto function =
+      guest_context->processor->ResolveCallTarget(guest_context, &address);
+  if (!function) {
+    XELOGE("No guest code at {:08X} for a dynamic call", address);
     return 0;
   }
   const uint64_t host_address = reinterpret_cast<uint64_t>(
       static_cast<A64Function*>(function)->machine_code());
   // A redirect isn't cached, since the checks above were for the original
   // target.
-  if (redirected) {
+  if (address != static_cast<uint32_t>(target_address)) {
     return host_address;
   }
   auto backend = static_cast<A64Backend*>(guest_context->processor->backend());
@@ -1653,6 +1788,10 @@ A64Backend::A64Backend() {
 
 A64Backend::~A64Backend() {
   ExceptionHandler::Uninstall(&ExceptionCallbackThunk, this);
+  // gone if Memory was torn down first
+  if (auto mmio_handler = MMIOHandler::global_handler()) {
+    mmio_handler->SetReservedStoreFaultCallback(nullptr, nullptr, nullptr);
+  }
   if (guest_trampoline_memory_) {
     memory::DeallocFixed(guest_trampoline_memory_,
                          kGuestTrampolineSize * MAX_GUEST_TRAMPOLINES,
@@ -1683,12 +1822,14 @@ bool A64Backend::Initialize(Processor* processor) {
 
   // Set up machine info for the register allocator.
   machine_info_.supports_extended_load_store = true;
-  // GPR set: x22-x28 (7 registers; x19=backend ctx, x20=context, x21=membase)
+  // GPR set: x22-x28 (callee-saved) + x5-x13 (call-aware volatile GPRs).
+  // x19=backend ctx, x20=context, x21=membase; x0-x4 and x14-x17 stay scratch.
   auto& gpr_set = machine_info_.register_sets[0];
   gpr_set.id = 0;
   std::strcpy(gpr_set.name, "gpr");
   gpr_set.types = MachineInfo::RegisterSet::INT_TYPES;
   gpr_set.count = A64Emitter::GPR_COUNT;
+  gpr_set.volatile_mask = A64Emitter::kVolatileGprMask;
   // VEC set: v4-v15, v16-v31 (28 registers, v0-v3 scratch)
   auto& vec_set = machine_info_.register_sets[1];
   vec_set.id = 1;
@@ -1723,9 +1864,21 @@ bool A64Backend::Initialize(Processor* processor) {
 
   // Wire up reservation helpers used by RESERVED_LOAD/STORE codegen.
   try_acquire_reservation_helper_ =
-      reinterpret_cast<void*>(&TryAcquireReservationHelper);
-  reserved_store_32_helper = reinterpret_cast<void*>(&ReservedStore32Helper);
-  reserved_store_64_helper = reinterpret_cast<void*>(&ReservedStore64Helper);
+      thunk_emitter.EmitTryAcquireReservationHelper();
+  reserved_store_32_helper = thunk_emitter.EmitReservedStoreHelper(
+      false, reserved_store_fault_sites_[0]);
+  reserved_store_64_helper = thunk_emitter.EmitReservedStoreHelper(
+      true, reserved_store_fault_sites_[1]);
+  reserved_store_32_thunk_ =
+      thunk_emitter.EmitReservedStoreThunk(reserved_store_32_helper);
+  reserved_store_64_thunk_ =
+      thunk_emitter.EmitReservedStoreThunk(reserved_store_64_helper);
+  if (!try_acquire_reservation_helper_ || !reserved_store_32_helper ||
+      !reserved_store_64_helper || !reserved_store_32_thunk_ ||
+      !reserved_store_64_thunk_) {
+    XELOGE("A64Backend: Failed to generate the reservation helpers");
+    return false;
+  }
   vrsqrtefp_scalar_helper_ =
       thunk_emitter.EmitVRsqrtefpHelper(&vrsqrtefp_vector_helper_);
   frsqrte_helper_ = thunk_emitter.EmitFrsqrteHelper();
@@ -1760,6 +1913,10 @@ bool A64Backend::Initialize(Processor* processor) {
 
   // Register exception handler for MMIO access from JIT code.
   ExceptionHandler::Install(ExceptionCallbackThunk, this);
+  if (auto mmio_handler = MMIOHandler::global_handler()) {
+    mmio_handler->SetReservedStoreFaultCallback(
+        ReleaseFaultingReservedStore, this, IsReservedStoreFaultPc);
+  }
 
   // Lets the memory system tell us which guest instructions faulted on MMIO,
   // so they get recompiled into a direct call instead of taking the signal
@@ -1846,6 +2003,12 @@ void A64Backend::InitializeBackendContext(void* ctx) {
       reinterpret_cast<uint64_t>(guest_to_host_thunk_);
   a64_ctx->guest_to_host_thunk_no_vec_address =
       reinterpret_cast<uint64_t>(guest_to_host_thunk_no_vec_);
+  a64_ctx->try_acquire_reservation_helper_address =
+      reinterpret_cast<uint64_t>(try_acquire_reservation_helper_);
+  a64_ctx->reserved_store_32_helper_address =
+      reinterpret_cast<uint64_t>(reserved_store_32_helper);
+  a64_ctx->reserved_store_64_helper_address =
+      reinterpret_cast<uint64_t>(reserved_store_64_helper);
   if (code_cache_ && code_cache_->encoded_indirection()) {
     a64_ctx->indirection_table_base_bias =
         code_cache_->indirection_table_base_bias();
@@ -2121,6 +2284,10 @@ bool A64Backend::ExceptionCallbackThunk(Exception* ex, void* data) {
 }
 
 bool A64Backend::ExceptionCallback(Exception* ex) {
+  if (ex->code() == Exception::Code::kAccessViolation) {
+    auto* guest_function = code_cache_->LookupFunction(ex->pc());
+    return processor()->HandleGuestDataFault(ex, guest_function);
+  }
   if (ex->code() != Exception::Code::kIllegalInstruction) {
     return false;
   }

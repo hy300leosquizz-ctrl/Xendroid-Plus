@@ -12,4 +12,6 @@ enum class HudMetric(val label: String) {
     BATTERY_TIME("Battery time"),
     /** 15g: what KGSL (the Adreno driver) has allocated, for every app ([KgslMemory]). */
     GPU_MEMORY("GPU memory"),
+    /** Bluetooth / USB controller battery percentage on Android 12+ ([InputDevice.getBatteryState]). */
+    CONTROLLER_BATTERY("Controller battery"),
 }

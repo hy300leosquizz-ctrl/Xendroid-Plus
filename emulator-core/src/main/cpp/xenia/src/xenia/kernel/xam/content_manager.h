@@ -223,6 +223,10 @@ class ContentPackage {
 
   const std::filesystem::path& package_path() const { return package_path_; }
 
+  // Makes the package reachable through its root, once it's mounted and
+  // listed as open.
+  void LinkRoot();
+
  private:
   KernelState* kernel_state_;
   std::string root_name_;
@@ -231,6 +235,7 @@ class ContentPackage {
   XCONTENT_AGGREGATE_DATA content_data_;
   uint32_t license_;
   bool mounted_ = false;
+  bool linked_ = false;
 };
 
 class ContentManager {
@@ -284,6 +289,8 @@ class ContentManager {
                          const XCONTENT_AGGREGATE_DATA& data);
   std::filesystem::path ResolveGameUserContentPath(const uint64_t xuid);
   bool IsContentOpen(const std::filesystem::path& package_path) const;
+  // Whether content is open, or being opened, under |root_name|.
+  bool IsRootTaken(const std::string_view root_name) const;
   // Whether content is mounted under |root_name| (such as "UPDATE").
   bool IsRootOpen(const std::string_view root_name);
   void CloseOpenedFilesFromContent(const ContentPackage& package);
@@ -317,12 +324,14 @@ class ContentManager {
   std::filesystem::path root_path_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
-  xe::global_critical_region global_critical_region_;
+  mutable xe::global_critical_region global_critical_region_;
   // Serializes UnpackPackageFile, and the package files it failed on, which
   // are not tried again this session (each try copies the whole save).
   std::mutex unpack_mutex_;
   std::unordered_set<std::string> unpack_failed_;
   std::unordered_map<string_key_insensitive, ContentPackage*> open_packages_;
+  // Roots whose packages are mounting outside the lock, with the packages.
+  std::unordered_map<string_key_insensitive, std::filesystem::path> opening_;
 };
 
 }  // namespace xam

@@ -152,6 +152,21 @@ DEFINE_string(
     "         Most accurate, but may be somewhat less performant.",
     "GPU");
 
+DEFINE_bool(
+    occlusion_query_full_counters, false,
+    "Controls in-shader / full-counter emulation of the ZFail, StencilFail and "
+    "Total ZPD counters to supplement ZPass testing.\n"
+    "Most titles only use the ZPass counter, so this is off by default.",
+    "GPU");
+
+DEFINE_bool(
+    occlusion_query_viz, false,
+    "Enables VIZ_QUERY (VIZ) visibility tests for draws with a VIZ token. "
+    "When enabled, coarse occlusion queries feed 64 visibility IDs and "
+    "predicates that skip occluded draws while conservatively avoiding false "
+    "occlusion.",
+    "GPU");
+
 DEFINE_string(
     readback_resolve, "uma",
     "Controls which render-to-texture resolves are copied back into guest "
@@ -259,17 +274,15 @@ std::atomic<int> readback_resolve_mode_cache{-1};
 std::atomic<int> zpd_mode_cache{-1};
 
 ReadbackResolveMode ParseReadbackResolveMode(const std::string& mode) {
-  if (mode == "all") {
+  if (mode == "all" || mode == "full") {
     return ReadbackResolveMode::kAll;
   } else if (mode == "uma") {
     return ReadbackResolveMode::kUma;
   } else if (mode == "none") {
     return ReadbackResolveMode::kDisabled;
-  } else if (mode == "fast") {
+  } else if (mode == "fast" || mode == "some") {
     return ReadbackResolveMode::kFast;
   } else {
-    // Retired values (some/full) and typos: fall back to the default rather
-    // than to a mode that copies nothing on unified-memory GPUs.
     static bool logged = false;
     if (!logged) {
       logged = true;
@@ -531,7 +544,8 @@ void CommandProcessor::ClearReadbackBuffers() {}
 
 void CommandProcessor::SetReadbackResolveMode(ReadbackResolveMode mode,
                                               bool persist) {
-  if (cached_readback_resolve_mode_ == mode) {
+  if (xe::gpu::GetReadbackResolveMode() == mode &&
+      cached_readback_resolve_mode_ == mode) {
     return;
   }
   // Update cached value
@@ -1533,6 +1547,7 @@ void CommandProcessor::WorkerThreadMain() {
           xe::threading::MaybeYield();
         }
         loop_count++;
+        SubmitHeldSignals();
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ &&
                !has_pending_fns_.load(std::memory_order_acquire) &&
@@ -1554,6 +1569,7 @@ void CommandProcessor::WorkerThreadMain() {
     // Execute. Note that we handle wraparound transparently.
     const uint64_t fs_exec_begin = FrameStatsBegin();
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    PerformCompletedHeldSignals();
     if (fs_exec_begin) {
       frame_time_stats_.exec_ns += FrameStatsNow() - fs_exec_begin;
     }
@@ -1572,6 +1588,7 @@ void CommandProcessor::WorkerThreadMain() {
     // but no games seem to actually use it.
   }
 
+  held_guest_signals_.clear();
   ShutdownContext();
 }
 
@@ -1627,11 +1644,15 @@ bool CommandProcessor::Restore(ByteStream* stream) {
 }
 
 bool CommandProcessor::SetupContext() {
+  ResetVIZState();
   ResetZPDState();
   return true;
 }
 
-void CommandProcessor::ShutdownContext() { ResetZPDState(); }
+void CommandProcessor::ShutdownContext() {
+  ResetVIZState();
+  ResetZPDState();
+}
 
 uint32_t CommandProcessor::GuestReadPtrOffset(int32_t offset) const {
   return uint32_t(reader_.read_ptr() -
@@ -2147,14 +2168,282 @@ void CommandProcessor::MakeCoherent() {
 
 void CommandProcessor::PrepareForWait() {
   trace_writer_.Flush();
-  // Only refresh completion if there is a strict ZPD retire pending so
-  // PumpPendingRetire sees the latest progress without adding extra overhead.
-  if (zpd_pending_retire_handle_ != kInvalidReportHandle) {
+  SubmitHeldSignals();
+  // Only refresh completion if there is a strict ZPD retire or VIZ resolve
+  // pending so PumpPendingRetire sees the latest progress without extra
+  // overhead.
+  if (zpd_pending_retire_handle_ != kInvalidReportHandle ||
+      viz_pending_resolves_ != 0) {
     PollCompletedSubmission();
   }
   // Give strict ZPD a chance to retire a pending report before the guest's
   // loop polls again.
   PumpPendingRetire();
+}
+
+void CommandProcessor::WriteGuestFence(uint8_t* destination,
+                                       uint32_t physical_address,
+                                       uint32_t value) {
+  HeldGuestSignal signal;
+  signal.destination = destination;
+  signal.physical_address = physical_address;
+  signal.value = value;
+  HoldOrPerformGuestSignal(signal);
+}
+
+void CommandProcessor::DispatchGuestInterrupt(uint32_t cpu_mask) {
+  HeldGuestSignal signal;
+  signal.value = cpu_mask;
+  HoldOrPerformGuestSignal(signal);
+}
+
+void CommandProcessor::HoldOrPerformGuestSignal(const HeldGuestSignal& signal) {
+  uint64_t submission = TakeMemexportSignalSubmission();
+  PerformCompletedHeldSignals();
+  if (held_guest_signals_.empty() && submission <= GetCompletedSubmission()) {
+    PerformGuestSignal(signal);
+    return;
+  }
+  HeldGuestSignal& held = held_guest_signals_.emplace_back(signal);
+  held.submission = submission;
+  held.held_since = std::chrono::steady_clock::now();
+  held_guest_signals_submission_ =
+      std::max(held_guest_signals_submission_, submission);
+  if (trace_writer_.is_open()) {
+    PerformHeldSignals(held_guest_signals_.size());
+  }
+}
+
+void CommandProcessor::PerformGuestSignal(const HeldGuestSignal& signal) {
+  if (signal.destination) {
+    xe::store(signal.destination, signal.value);
+    return;
+  }
+  for (int n = 0; n < 6; ++n) {
+    if (signal.value & (1u << n)) {
+      graphics_system_->DispatchInterruptCallback(1, n);
+    }
+  }
+}
+
+void CommandProcessor::PerformCompletedHeldSignals() {
+  if (!held_guest_signals_.empty()) {
+    PerformHeldSignals(0);
+  }
+}
+
+void CommandProcessor::SubmitHeldSignals() {
+  if (!held_guest_signals_.empty()) {
+    EndSubmissionForHeldSignals(held_guest_signals_submission_);
+    PerformHeldSignals(0);
+  }
+}
+
+void CommandProcessor::AwaitHeldSignalsWriting(uint32_t physical_address) {
+  size_t await_count = held_guest_signals_.size();
+  for (; await_count; --await_count) {
+    const HeldGuestSignal& signal = held_guest_signals_[await_count - 1];
+    if (signal.destination &&
+        !((signal.physical_address ^ physical_address) & 0x1FFFFFFFu)) {
+      break;
+    }
+  }
+  PerformHeldSignals(await_count);
+}
+
+void CommandProcessor::AwaitHeldSignalsAndMemexport() {
+  uint64_t submission = TakeMemexportSignalSubmission();
+  if (submission > GetCompletedSubmission()) {
+    AwaitSubmissionForHeldSignals(submission);
+  }
+  PerformHeldSignals(held_guest_signals_.size());
+}
+
+void CommandProcessor::PerformHeldSignals(size_t await_count) {
+  constexpr auto kMaxHold = std::chrono::seconds(1);
+  while (!held_guest_signals_.empty()) {
+    const HeldGuestSignal& signal = held_guest_signals_.front();
+    if (signal.submission > GetCompletedSubmission()) {
+      PollCompletedSubmission();
+      if (signal.submission > GetCompletedSubmission()) {
+        if (!await_count &&
+            std::chrono::steady_clock::now() - signal.held_since < kMaxHold) {
+          return;
+        }
+        AwaitSubmissionForHeldSignals(signal.submission);
+        if (signal.submission > GetCompletedSubmission()) {
+          XELOGE(
+              "HeldGuestSignal: submission {} incomplete after await "
+              "(completed {})",
+              signal.submission, GetCompletedSubmission());
+        }
+      }
+    }
+    PerformGuestSignal(signal);
+    held_guest_signals_.pop_front();
+    if (await_count) {
+      --await_count;
+    }
+  }
+  held_guest_signals_submission_ = 0;
+}
+
+void CommandProcessor::BeginVIZQuery(uint32_t id) {
+  id &= 0x3Fu;
+  if (!cvars::occlusion_query_viz) {
+    return;
+  }
+  if (viz_active_generation_ != kInvalidVIZGeneration) {
+    viz_active_id_ = UINT32_MAX;
+    viz_active_generation_ = kInvalidVIZGeneration;
+  }
+  VIZQuery& query = viz_queries_[id];
+  uint64_t generation = (query.generation + 1) & kVIZGenerationMask;
+  if (generation == kInvalidVIZGeneration) {
+    generation = 1;
+  }
+  query = {};
+  query.generation = generation;
+  query.resolved = false;
+  query.active = true;
+  viz_active_id_ = id;
+  viz_active_generation_ = generation;
+}
+
+void CommandProcessor::EndVIZQuery(uint32_t id) {
+  id &= 0x3Fu;
+  if (!cvars::occlusion_query_viz) {
+    return;
+  }
+  VIZQuery& query = viz_queries_[id];
+  if (viz_active_id_ == id && viz_active_generation_ == query.generation) {
+    viz_active_id_ = UINT32_MAX;
+    viz_active_generation_ = kInvalidVIZGeneration;
+  }
+  query.active = false;
+  if (query.resolved) {
+    return;
+  }
+  if (!query.surveyed) {
+    query.resolved = true;
+    query.visible = false;
+  } else if (query.fallback || !query.pending_segments) {
+    query.resolved = true;
+    query.visible = query.fallback || query.accumulated_visible;
+  }
+  const uint32_t bit = UINT32_C(1) << (id & 31u);
+  uint32_t& status_reg = register_file_->values[id < 32
+                                                    ? XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0
+                                                    : XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1];
+  if (!query.resolved || query.visible) {
+    status_reg |= bit;
+  } else {
+    status_reg &= ~bit;
+  }
+}
+
+void CommandProcessor::RecordVIZQuerySegment(uint32_t id, uint64_t generation,
+                                             uint64_t submission) {
+  id &= 0x3Fu;
+  VIZQuery& query = viz_queries_[id];
+  if (!query.active || query.generation != generation) {
+    return;
+  }
+  ++query.pending_segments;
+  ++viz_pending_resolves_;
+  query.last_segment_end_submission =
+      std::max(query.last_segment_end_submission, submission);
+}
+
+void CommandProcessor::OnVIZSurveyDraw(bool measured) {
+  if (!cvars::occlusion_query_viz) {
+    return;
+  }
+  const reg::PA_SC_VIZ_QUERY viz_query =
+      register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+  if (!viz_query.viz_query_ena) {
+    return;
+  }
+  const uint32_t id = viz_query.viz_query_id & 0x3Fu;
+  VIZQuery& query = viz_queries_[id];
+  if (!query.active) {
+    return;
+  }
+  query.surveyed = true;
+  if (measured && viz_active_id_ == id &&
+      viz_active_generation_ == query.generation) {
+    return;
+  }
+  query.fallback = true;
+}
+
+void CommandProcessor::OnVIZQueryResolved(uint32_t id, uint64_t generation,
+                                          bool visible) {
+  id &= 0x3Fu;
+  if (viz_pending_resolves_) {
+    --viz_pending_resolves_;
+  }
+  VIZQuery& query = viz_queries_[id];
+  if (query.generation != generation) {
+    return;
+  }
+  if (query.pending_segments) {
+    --query.pending_segments;
+  }
+  query.accumulated_visible |= visible;
+  if (!query.resolved && !query.active && !query.pending_segments) {
+    query.resolved = true;
+    query.visible = query.fallback || query.accumulated_visible;
+    const uint32_t bit = UINT32_C(1) << (id & 31u);
+    uint32_t& status_reg =
+        register_file_->values[id < 32 ? XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0
+                                       : XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1];
+    if (query.visible) {
+      status_reg |= bit;
+    } else {
+      status_reg &= ~bit;
+    }
+  }
+}
+
+bool CommandProcessor::PrepareVIZDraw(uint32_t token) {
+  viz_draw_predicate_ = {};
+  if (!cvars::occlusion_query_viz || !(token & 0x100u)) {
+    return true;
+  }
+  const uint32_t id = token & 0x3Fu;
+  VIZQuery& query = viz_queries_[id];
+  if (!query.resolved) {
+    PumpQueryResolves();
+  }
+  if (!query.resolved && query.pending_segments) {
+    if (query.predicate_armed && !query.fallback &&
+        !(viz_active_generation_ != kInvalidVIZGeneration &&
+          viz_active_id_ == id)) {
+      viz_draw_predicate_.id = id;
+      viz_draw_predicate_.generation = query.generation;
+    } else if (!query.active) {
+      AwaitVIZQueryResolve(query.last_segment_end_submission);
+    }
+  }
+  const bool draw = viz_draw_predicate_.generation != kInvalidVIZGeneration ||
+                    !query.resolved || query.visible;
+  if (draw && viz_draw_predicate_.generation == kInvalidVIZGeneration) {
+    return true;
+  }
+  const bool memexport_used_vertex =
+      active_vertex_shader_ && (!active_vertex_shader_->is_ucode_analyzed() ||
+                                active_vertex_shader_->memexport_eM_written());
+  const bool memexport_used_pixel =
+      active_pixel_shader_ && (!active_pixel_shader_->is_ucode_analyzed() ||
+                               active_pixel_shader_->memexport_eM_written());
+  if (!memexport_used_vertex && !memexport_used_pixel &&
+      register_file_->Get<reg::RB_MODECONTROL>().edram_mode !=
+          xenos::EdramMode::kCopy) {
+    return draw;
+  }
+  viz_draw_predicate_ = {};
+  return true;
 }
 
 void CommandProcessor::ReturnFromWait() {}
@@ -2344,7 +2633,9 @@ bool CommandProcessor::BeginZPDReport(uint32_t report_address) {
   }
 
   ReportHandle report_handle = zpd_next_report_handle_++;
-  if (report_handle == kInvalidReportHandle) {
+  if (report_handle == kInvalidReportHandle ||
+      IsVIZReportHandle(report_handle)) {
+    zpd_next_report_handle_ = 1;
     report_handle = zpd_next_report_handle_++;
   }
 
@@ -2355,6 +2646,8 @@ bool CommandProcessor::BeginZPDReport(uint32_t report_address) {
   logical.end_record = end_record;
   logical.begin_value = zpd_slot_values_[slot_base];
   logical.accumulated_samples = 0;
+  logical.accumulated_counts = {};
+  logical.has_full_counters = false;
   logical.first_segment_end_submission = 0;
   logical.last_segment_end_submission = 0;
   logical.pending_segments = 0;
@@ -2617,6 +2910,12 @@ void CommandProcessor::UpdateZPDScale(uint32_t scale_area) {
 void CommandProcessor::OnZPDQueryResolved(ReportHandle report_handle,
                                           uint64_t raw_samples,
                                           uint32_t scale_area) {
+  if (IsVIZReportHandle(report_handle)) {
+    OnVIZQueryResolved(GetVIZIdFromHandle(report_handle),
+                       GetVIZGenerationFromHandle(report_handle),
+                       raw_samples != 0);
+    return;
+  }
   auto it = logical_zpd_reports_.find(report_handle);
   if (it == logical_zpd_reports_.end()) {
     return;
@@ -2628,12 +2927,66 @@ void CommandProcessor::OnZPDQueryResolved(ReportHandle report_handle,
     logical.pending_segments--;
   }
 
-  logical.accumulated_samples += NormalizeSampleCount(raw_samples, scale_area);
+  const uint32_t normalized = NormalizeSampleCount(raw_samples, scale_area);
+  logical.accumulated_samples += normalized;
+  logical.accumulated_counts.z_pass += normalized;
+  logical.accumulated_counts.total += normalized;
 
   if (logical.ended && logical.pending_segments == 0) {
     uint32_t final_value = static_cast<uint32_t>(
         std::min<uint64_t>(logical.accumulated_samples, UINT32_MAX));
 
+    logical.cached_delta = final_value;
+    logical.has_cached_delta = true;
+    if (logical.end_record) {
+      if (fast_zpd_report_cached_values_.size() >= kFastZPDCacheMaxEntries &&
+          !fast_zpd_report_cached_values_.count(logical.end_record)) {
+        fast_zpd_report_cached_values_.clear();
+      }
+      fast_zpd_report_cached_values_[logical.end_record] = final_value;
+    }
+    if (IsZPDReportCurrent(logical)) {
+      CommitZPDReport(logical, final_value);
+    }
+    logical_zpd_reports_.erase(it);
+  }
+}
+
+void CommandProcessor::OnZPDQueryCountsResolved(
+    ReportHandle report_handle, const ZPDQueryCounts& raw_counts,
+    uint32_t scale_area) {
+  if (IsVIZReportHandle(report_handle)) {
+    OnVIZQueryResolved(GetVIZIdFromHandle(report_handle),
+                       GetVIZGenerationFromHandle(report_handle),
+                       raw_counts.z_pass != 0);
+    return;
+  }
+  auto it = logical_zpd_reports_.find(report_handle);
+  if (it == logical_zpd_reports_.end()) {
+    return;
+  }
+  ZPDReport& logical = it->second;
+  const uint32_t norm_z_pass =
+      NormalizeSampleCount(raw_counts.z_pass, scale_area);
+  const uint32_t norm_z_fail =
+      NormalizeSampleCount(raw_counts.z_fail, scale_area);
+  const uint32_t norm_stencil_fail =
+      NormalizeSampleCount(raw_counts.stencil_fail, scale_area);
+  const uint64_t norm_total =
+      std::max<uint64_t>(NormalizeSampleCount(raw_counts.total, scale_area),
+                         uint64_t(norm_z_pass) + norm_z_fail + norm_stencil_fail);
+  logical.has_full_counters = true;
+  logical.accumulated_counts.z_pass += norm_z_pass;
+  logical.accumulated_counts.z_fail += norm_z_fail;
+  logical.accumulated_counts.stencil_fail += norm_stencil_fail;
+  logical.accumulated_counts.total += norm_total;
+  if (logical.pending_segments) {
+    logical.pending_segments--;
+  }
+  logical.accumulated_samples += norm_z_pass;
+  if (logical.ended && logical.pending_segments == 0) {
+    uint32_t final_value = static_cast<uint32_t>(
+        std::min<uint64_t>(logical.accumulated_samples, UINT32_MAX));
     logical.cached_delta = final_value;
     logical.has_cached_delta = true;
     if (logical.end_record) {
@@ -2740,13 +3093,68 @@ void CommandProcessor::WriteZPDReport(uint32_t begin_record,
                                    write_begin_record);
 }
 
+void CommandProcessor::WriteZPDReportCounts(uint32_t begin_record,
+                                            uint32_t end_record,
+                                            const ZPDQueryCounts& begin_counts,
+                                            const ZPDQueryCounts& delta_counts,
+                                            bool write_begin_record) {
+  if (!end_record) {
+    return;
+  }
+  xenos::xe_gpu_depth_sample_counts* begin =
+      begin_record
+          ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
+                begin_record)
+          : nullptr;
+  xenos::xe_gpu_depth_sample_counts* end =
+      memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
+          end_record);
+  auto write_record = [](xenos::xe_gpu_depth_sample_counts* dst,
+                         const ZPDQueryCounts& c) {
+    dst->Total_A = static_cast<uint32_t>(c.total);
+    dst->Total_B = 0;
+    dst->ZFail_A = static_cast<uint32_t>(c.z_fail);
+    dst->ZFail_B = 0;
+    dst->ZPass_A = static_cast<uint32_t>(c.z_pass);
+    dst->ZPass_B = 0;
+    dst->StencilFail_A = static_cast<uint32_t>(c.stencil_fail);
+    dst->StencilFail_B = 0;
+  };
+  if (write_begin_record && begin && begin != end) {
+    write_record(begin, begin_counts);
+  }
+  ZPDQueryCounts end_counts;
+  end_counts.total = begin_counts.total + delta_counts.total;
+  end_counts.z_pass = begin_counts.z_pass + delta_counts.z_pass;
+  end_counts.z_fail = begin_counts.z_fail + delta_counts.z_fail;
+  end_counts.stencil_fail =
+      begin_counts.stencil_fail + delta_counts.stencil_fail;
+  write_record(end, end_counts);
+}
+
 void CommandProcessor::CommitZPDReport(ZPDReport& report,
                                        uint32_t delta_value) {
   uint32_t end_record =
       report.end_record ? report.end_record
                         : XenosZPDReport::GetEndRecordBase(report.slot_base);
-  WriteZPDReport(report.begin_record, end_record, report.begin_value,
-                 delta_value, report.begin_record != 0);
+  if (cvars::occlusion_query_full_counters && report.has_full_counters) {
+    ZPDQueryCounts& running = zpd_slot_counts_[report.slot_base];
+    ZPDQueryCounts delta = report.accumulated_counts;
+    delta.z_pass = XenosZPDReport::SaturateSampleCount(
+        static_cast<uint32_t>(std::min<uint64_t>(delta.z_pass, UINT32_MAX)));
+    delta.total =
+        std::max<uint64_t>(delta.total,
+                           delta.z_pass + delta.z_fail + delta.stencil_fail);
+    WriteZPDReportCounts(report.begin_record, end_record, running, delta,
+                         report.begin_record != 0);
+    running.total += delta.total;
+    running.z_pass += delta.z_pass;
+    running.z_fail += delta.z_fail;
+    running.stencil_fail += delta.stencil_fail;
+  } else {
+    WriteZPDReport(report.begin_record, end_record, report.begin_value,
+                   delta_value, report.begin_record != 0);
+  }
 
   // Advance running total so the next BeginReport on this slot picks up
   // the correct begin_value.

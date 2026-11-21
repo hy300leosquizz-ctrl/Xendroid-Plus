@@ -17,6 +17,7 @@ class CompanionHostControl(
     private val newHost: (LanCandidate) -> CompanionHost,
     private val pickNetwork: () -> LanCandidate? = { CompanionNetwork.choose(CompanionNetwork.candidates()) },
     private val onChange: () -> Unit = {},
+    private val newBluetoothHost: (() -> CompanionHost)? = null,
 ) : Closeable {
     sealed interface Status {
         data object Off : Status
@@ -62,6 +63,18 @@ class CompanionHostControl(
     private fun start() {
         val lan = runCatching(pickNetwork).getOrNull()
         if (lan == null) {
+            val btFactory = newBluetoothHost
+            if (btFactory != null) {
+                val btHost = try {
+                    btFactory().start()
+                } catch (_: Exception) {
+                    null
+                }
+                if (btHost != null) {
+                    if (!finish(Status.Starting, Status.On(btHost, "Bluetooth RFCOMM"))) btHost.close()
+                    return
+                }
+            }
             finish(Status.Starting, Status.Failed(Status.Failed.Why.NO_NETWORK))
             return
         }
@@ -114,7 +127,7 @@ class CompanionHostControl(
         }
         return buildString {
             append("On the other phone: Library → ⋮ → Use this phone as a controller → ")
-            append("${host.address.hostAddress}:${host.port}, code ${host.code} (${on.network}).")
+            append("${host.endpoint}, code ${host.code} (${on.network}).")
             append('\n')
             append(if (players.isEmpty()) "No phone connected yet. Phones play as P2–P4." else players)
             if (host.locked) append("\nPairing locked after ${CompanionHost.MAX_WRONG_CODES} wrong codes: turn off and on for a new code.")

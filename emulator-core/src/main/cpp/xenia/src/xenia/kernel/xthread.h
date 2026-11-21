@@ -427,6 +427,11 @@ class XThread : public XObject, public cpu::Thread {
   X_STATUS Exit(int exit_code);
   X_STATUS Terminate(int exit_code);
 
+  // Counts the requests this thread issued that pend on an I/O worker, which
+  // its exit waits for.
+  void AddPostedIo() { posted_io_.fetch_add(1, std::memory_order_relaxed); }
+  void RemovePostedIo() { posted_io_.fetch_sub(1, std::memory_order_release); }
+
   virtual void Execute();
 
   virtual void Reenter(uint32_t address);
@@ -585,6 +590,21 @@ class XThread : public XObject, public cpu::Thread {
   void RestoreInterruptedUserCr();
   void set_user_mode(std::unique_ptr<UserMode> user_mode) {
     user_mode_ = std::move(user_mode);
+  }
+
+  // A guest exception dispatch whose handler is running. One whose handler
+  // continued the thread elsewhere instead of returning stays here until the
+  // next dispatch on the thread finds it gone.
+  struct ExceptionDispatch {
+    // Where the handlers run, below the trap frame, and return to, which
+    // unwinding a handler's frame leads to.
+    uint32_t handler_sp;
+    uint32_t handler_return;
+    // Its CONTEXT, EXCEPTION_RECORD and DISPATCHER_CONTEXT in the system heap.
+    uint32_t records;
+  };
+  std::vector<ExceptionDispatch>& exception_dispatches() {
+    return exception_dispatches_;
   }
 
   // Drops the self reference from Create and any surviving handle. The delete
@@ -818,9 +838,11 @@ class XThread : public XObject, public cpu::Thread {
   std::unique_ptr<xe::threading::Fiber> fiber_;
   xe::threading::Fiber* active_fiber_ = nullptr;
   std::unique_ptr<UserMode> user_mode_;
+  std::vector<ExceptionDispatch> exception_dispatches_;
   SchedulerLinks scheduler_links_;
   // Set by the first ReclaimExited so both terminal paths reclaim once.
   std::atomic<bool> self_reference_dropped_{false};
+  std::atomic<uint32_t> posted_io_{0};
   // Owned by XObject::Enter/LeaveCooperativeWait.
   std::atomic<XObject*> cooperative_wait_object_{nullptr};
   // Signaled when a fiber-backed thread exits, so waits on the thread object

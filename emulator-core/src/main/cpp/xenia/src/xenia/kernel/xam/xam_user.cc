@@ -50,20 +50,15 @@ X_HRESULT_result_t XamUserGetXUID_entry(dword_t user_index, dword_t type_mask,
   const auto& user_profile =
       kernel_state()->xam_state()->GetUserProfile(user_index);
 
-  uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
-
-  auto type = user_profile->type() & type_mask;
-  if (type & (2 | 4)) {
-    // maybe online profile?
-    xuid = user_profile->xuid();
-    result = X_E_SUCCESS;
-  } else if (type & 1) {
-    // maybe offline profile?
-    xuid = user_profile->xuid();
-    result = X_E_SUCCESS;
+  const X_HRESULT result = SelectGetXuidResult(
+      user_profile->xuid(), user_profile->GetOnlineXUID(),
+      user_profile->signin_state() ==
+          static_cast<uint32_t>(SignInState::SignedInToLive),
+      type_mask, &xuid);
+  if (XSUCCEEDED(result)) {
+    *xuid_ptr = xuid;
   }
-  *xuid_ptr = xuid;
   return result;
 }
 DECLARE_XAM_EXPORT1(XamUserGetXUID, kUserProfiles, kImplemented);
@@ -112,6 +107,7 @@ X_HRESULT_result_t XamUserGetSigninInfo_entry(
   }
 
   info.Zero();
+  info->sponsor_user_index = XUserIndexNone;
 
   if (user_index >= XUserMaxUserCount) {
     return X_E_INVALIDARG;
@@ -127,9 +123,13 @@ X_HRESULT_result_t XamUserGetSigninInfo_entry(
   xe::string_util::copy_truncating(info->name, user_profile->name(),
                                    xe::countof(info->name));
 
-  if (!flags || flags & X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY) {
-    info->xuid = user_profile->xuid();
+  if (user_profile->IsLiveEnabled()) {
+    info->flags = X_USER_INFO_FLAG_LIVE_ENABLED;
   }
+
+  info->xuid = SelectSigninInfoXuid(user_profile->xuid(),
+                                    user_profile->GetOnlineXUID(),
+                                    user_profile->GetLogonXUID(), flags);
 
   info->signin_state = user_profile->signin_state();
   return X_E_SUCCESS;
@@ -417,18 +417,29 @@ dword_result_t XamUserWriteProfileSettings_entry(
 }
 DECLARE_XAM_EXPORT1(XamUserWriteProfileSettings, kUserProfiles, kImplemented);
 
-dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
-                                           lpdword_t out_value) {
+X_RESULT CheckUserPrivilege(uint32_t user_index, uint32_t mask,
+                            uint32_t* out_value) {
+  *out_value = 0;
+
+  // With no Live service, a user signed in to Live holds every Live privilege.
+  const bool granted = IsLivePrivilegeGranted(mask);
+
+  // Every Live user holds the same privileges so the first one answers.
   if (user_index == XUserIndexAny) {
-    for (uint8_t i = 0; i < XUserMaxUserCount; ++i) {
-      const auto result = XamUserCheckPrivilege_entry(i, mask, out_value);
-      if (result != X_ERROR_NO_SUCH_USER) {
-        *out_value = 0;
-        return result;
+    X_RESULT result = X_ERROR_NO_SUCH_USER;
+    for (uint32_t i = 0; i < XUserMaxUserCount; ++i) {
+      const auto user_profile = kernel_state()->xam_state()->GetUserProfile(i);
+      if (!user_profile) {
+        continue;
       }
+      if (user_profile->signin_state() ==
+          static_cast<uint32_t>(SignInState::SignedInToLive)) {
+        *out_value = granted;
+        return X_ERROR_SUCCESS;
+      }
+      result = X_ERROR_NOT_LOGGED_ON;
     }
-    *out_value = 0;
-    return X_ERROR_NO_SUCH_USER;
+    return result;
   }
 
   if (user_index >= XUserMaxUserCount) {
@@ -441,15 +452,21 @@ dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
 
   if (kernel_state()->xam_state()->GetUserProfile(user_index)->signin_state() !=
       static_cast<uint32_t>(SignInState::SignedInToLive)) {
-    *out_value = 0;
     return X_ERROR_NOT_LOGGED_ON;
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  *out_value = granted;
   return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamUserCheckPrivilege, kUserProfiles, kStub);
+
+dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
+                                           lpdword_t out_value) {
+  uint32_t value = 0;
+  const X_RESULT result = CheckUserPrivilege(user_index, mask, &value);
+  *out_value = value;
+  return result;
+}
+DECLARE_XAM_EXPORT1(XamUserCheckPrivilege, kUserProfiles, kSketchy);
 
 dword_result_t XamUserContentRestrictionGetFlags_entry(dword_t user_index,
                                                        lpdword_t out_flags) {
@@ -574,7 +591,6 @@ dword_result_t XamUserAreUsersFriends_entry(
         result = X_ERROR_NOT_LOGGED_ON;
       } else {
         // No friends!
-        are_friends = true;
         result = X_ERROR_SUCCESS;
       }
     } else {
@@ -1127,7 +1143,7 @@ dword_result_t XamUserGetUserFlags_entry(dword_t user_index) {
   const auto& user_profile =
       kernel_state()->xam_state()->GetUserProfile(user_index);
 
-  return user_profile->GetCachedFlags();
+  return user_profile->GetUserFlags();
 }
 DECLARE_XAM_EXPORT1(XamUserGetUserFlags, kUserProfiles, kImplemented);
 
@@ -1137,7 +1153,7 @@ dword_result_t XamUserGetUserFlagsFromXUID_entry(qword_t xuid) {
     return 0;
   }
 
-  return user_profile->GetCachedFlags();
+  return user_profile->GetUserFlags();
 }
 DECLARE_XAM_EXPORT1(XamUserGetUserFlagsFromXUID, kUserProfiles, kImplemented);
 
@@ -1178,6 +1194,15 @@ dword_result_t XamUserIsParentalControlled_entry(dword_t user_index) {
   return true;
 }
 DECLARE_XAM_EXPORT1(XamUserIsParentalControlled, kUserProfiles, kImplemented);
+
+dword_result_t XamUserIsGuest_entry(dword_t user_index) {
+  if (user_index >= XUserMaxUserCount) {
+    return false;
+  }
+
+  return false;
+}
+DECLARE_XAM_EXPORT1(XamUserIsGuest, kUserProfiles, kStub);
 
 dword_result_t XamUserCreateStatsEnumerator_entry(
     dword_t title_id, dword_t type, qword_t pivot, dword_t num_rows,

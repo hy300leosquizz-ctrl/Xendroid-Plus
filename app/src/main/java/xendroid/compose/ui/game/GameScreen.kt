@@ -257,7 +257,7 @@ fun GameScreen(
             },
             XdSection("launch", stringResource(R.string.xd_game_sec_launch), XdIcons.sliders,
                 lead = stringResource(R.string.xd_launch_sub, game.name)) {
-                LaunchForm(launchState, library, settings, overrides, patchCounts?.first)
+                LaunchForm(launchState, library, settings, overrides, patchCounts?.first, gameLaunchUri = game.launchUri, gameTitleId = game.titleId)
                 XdButton(stringResource(R.string.xd_launch_play_with), playWith, kind = XdButtonKind.PRIMARY, size = XdButtonSize.LG,
                     icon = XdIcons.play, enabled = !actions.preparing, modifier = Modifier.padding(top = 12.dp))
             },
@@ -325,7 +325,8 @@ fun GameScreen(
     }
 
     if (launchOpen) LaunchSheet(game.name, launchState, library, settings, overrides, patchCounts?.first,
-        onPlay = { options -> launchOpen = false; actions.play(game, options) }, onDismiss = { launchOpen = false })
+        onPlay = { options -> launchOpen = false; actions.play(game, options) }, onDismiss = { launchOpen = false },
+        gameLaunchUri = game.launchUri, gameTitleId = game.titleId)
     if (moreOpen) MoreSheet(game, actions, library, onDismiss = { moreOpen = false })
     if (presetsOpen && gameEditing != null && settings != null) PresetsSheet(game.name, gameEditing, settings) { presetsOpen = false }
     if (tomlOpen) editing?.let { e -> TomlSheet(e) { tomlOpen = false } }
@@ -351,7 +352,7 @@ private fun MoreSheet(game: Game, actions: GameActions, library: GameLibraryView
             }
             XdMenuItem(stringResource(R.string.lib_collections), { onDismiss(); actions.editCollections(game) }, icon = XdIcons.layers)
             if (actions.canShortcut) XdMenuItem(stringResource(R.string.lib_shortcut), { onDismiss(); actions.shortcut(game) }, icon = XdIcons.link)
-            if (game.format == GameFormat.ISO) XdMenuItem(stringResource(R.string.lib_compress), { onDismiss(); actions.compress(game) }, icon = XdIcons.zip)
+            if (GameCompressViewModel.canCompressFormat(game.format)) XdMenuItem(stringResource(R.string.lib_compress), { onDismiss(); actions.compress(game) }, icon = XdIcons.zip)
             XdMenuItem(stringResource(R.string.xd_game_rate), { onDismiss(); actions.rate(game) }, icon = XdIcons.shield)
         }
     }

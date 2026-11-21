@@ -392,6 +392,8 @@ class KernelState {
 
  private:
   void LoadKernelModule(object_ref<KernelModule> kernel_module);
+  // Attaches the pending DLLs that |loader_thread_id| loaded, on |thread|.
+  void AttachPendingModules(XThread* thread, uint32_t loader_thread_id);
   object_ref<XEvent> AcquireIoEvent();
   void ReleaseIoEvent(object_ref<XEvent> event);
   void InitializeProcess(X_KPROCESS* process, uint32_t type,
@@ -446,6 +448,14 @@ class KernelState {
   object_ref<UserModule> executable_module_;
   std::vector<object_ref<KernelModule>> kernel_modules_;
   std::vector<object_ref<UserModule>> user_modules_;
+  // DLLs waiting for DLL_PROCESS_ATTACH in the order they finished loading,
+  // which puts imports ahead of their importers. Thread ID 0 is a load made
+  // before any guest thread ran.
+  struct PendingProcessAttach {
+    object_ref<UserModule> module;
+    uint32_t loader_thread_id;
+  };
+  std::vector<PendingProcessAttach> pending_process_attaches_;
   std::vector<TerminateNotification> terminate_notifications_;
   uint32_t kernel_guest_globals_ = 0;
 
@@ -461,10 +471,19 @@ class KernelState {
   // KDPCs queued on the dispatch thread that haven't started.
   std::vector<uint32_t> dispatch_dpcs_;
 
+  struct QueuedDpc {
+    uint32_t dpc_ptr;
+    uint32_t arg1;
+    uint32_t arg2;
+  };
   // DPCs queued to each guest processor and the thread that runs them there.
   struct ProcessorDpcs {
+    // Never held across a guest memory access, which can fault into the watch
+    // handler while KeInsertQueueDpc holds the global region and waits here.
     std::mutex lock;
-    std::deque<uint32_t> queue;
+    std::deque<QueuedDpc> queue;
+    // Under lock.
+    std::deque<QueuedDpc>::iterator Find(uint32_t dpc_ptr);
     object_ref<XEvent> event;
     object_ref<XHostThread> thread;
     std::atomic<bool> started{false};

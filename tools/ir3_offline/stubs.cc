@@ -11,6 +11,9 @@ DEFINE_path(dump_shaders, "", "stub", "GPU");
 DEFINE_bool(draw_resolution_scaled_texture_offsets, true, "stub", "GPU");
 DEFINE_bool(texture_gradient_exp_bias, false, "stub", "GPU");
 DEFINE_bool(texture_integer_num_format, false, "stub", "GPU");
+DEFINE_bool(alu_round_toward_zero, true, "stub", "GPU");
+DEFINE_bool(texture_point_snap, false, "stub", "GPU");
+DEFINE_bool(spirv_specialize_no_alpha, true, "stub", "GPU");
 
 namespace xe {
 bool has_console_attached() { return true; }

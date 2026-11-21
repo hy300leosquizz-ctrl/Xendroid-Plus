@@ -131,6 +131,12 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
+void ExceptionHandler::SetFastAccessViolationHandler(
+    FastAccessViolationHandler fn, void* data) {
+  (void)fn;
+  (void)data;
+}
+
 void ExceptionHandler::Install(Handler fn, void* data) {
   if (!veh_handle_) {
     veh_handle_ = AddVectoredExceptionHandler(1, ExceptionHandlerCallback);

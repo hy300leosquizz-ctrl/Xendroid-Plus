@@ -13,6 +13,19 @@
 #include "endian.xesli"
 #include "resolve.xesli"
 
+// XE_RESOLVE_HOST_COLOR_SOURCE_2X2: a 4x surface kept as a 1x image of twice
+// the width and height (vulkan_msaa_4x_as_2x2, samples as pixels). The 4x
+// addressing below works in EDRAM sample coordinates, which are that image's
+// texel coordinates, so the samples are fetched as texels.
+#ifndef XE_RESOLVE_HOST_COLOR_SOURCE_2X2
+  #define XE_RESOLVE_HOST_COLOR_SOURCE_2X2 0
+#endif
+#if XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES == 1 || XE_RESOLVE_HOST_COLOR_SOURCE_2X2
+  #define XE_RESOLVE_HOST_COLOR_SOURCE_SINGLE 1
+#else
+  #define XE_RESOLVE_HOST_COLOR_SOURCE_SINGLE 0
+#endif
+
 #if XE_RESOLVE_HOST_COLOR_SOURCE_UINT
   #if SHADING_LANGUAGE_GLSL_XE
     #define texture_2d_host_color_uint_xe utexture2D
@@ -73,7 +86,7 @@ const_buffer_end_xe(xe_resolve_host_color)
 #endif
 
 #if XE_RESOLVE_HOST_COLOR_SOURCE_UINT
-  #if XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES == 1
+  #if XE_RESOLVE_HOST_COLOR_SOURCE_SINGLE
     #define XE_RESOLVE_HOST_COLOR_SOURCE_TEXTURE_DECLARE                 \
         texture_xe(texture_2d_host_color_uint_xe,                        \
                    xe_resolve_host_color_source, 2, 0, t0,   \
@@ -85,7 +98,7 @@ const_buffer_end_xe(xe_resolve_host_color)
                    space0, texture(0))
   #endif
 #else
-  #if XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES == 1
+  #if XE_RESOLVE_HOST_COLOR_SOURCE_SINGLE
     #define XE_RESOLVE_HOST_COLOR_SOURCE_TEXTURE_DECLARE                 \
         texture_xe(texture_2d_xe, xe_resolve_host_color_source, 2,   \
                    0, t0, space0, texture(0))
@@ -106,13 +119,13 @@ const_buffer_end_xe(xe_resolve_host_color)
 
 #if SHADING_LANGUAGE_MSL_XE
   #if XE_RESOLVE_HOST_COLOR_SOURCE_UINT
-    #if XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES == 1
+    #if XE_RESOLVE_HOST_COLOR_SOURCE_SINGLE
       #define param_texture_xe(name) texture2d<uint> name
     #else
       #define param_texture_xe(name) texture2d_ms<uint> name
     #endif
   #else
-    #if XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES == 1
+    #if XE_RESOLVE_HOST_COLOR_SOURCE_SINGLE
       #define param_texture_xe(name) texture2d<float> name
     #else
       #define param_texture_xe(name) texture2d_ms<float> name
@@ -257,7 +270,7 @@ uint4_xe XeResolveHostColorFetchUint(
       resolve_info, source_sample
       pass_next_after_const_buffer_xe
       pass_const_buffer_xe(xe_resolve_host_color));
-  #if XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES == 1
+  #if XE_RESOLVE_HOST_COLOR_SOURCE_SINGLE
     return texel_fetch_2d_xe(xe_resolve_host_color_source,
                              int2_xe(source_texel), 0);
   #elif XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES == 2
@@ -290,7 +303,7 @@ float4_xe XeResolveHostColorFetchFloat(
       resolve_info, source_sample
       pass_next_after_const_buffer_xe
       pass_const_buffer_xe(xe_resolve_host_color));
-  #if XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES == 1
+  #if XE_RESOLVE_HOST_COLOR_SOURCE_SINGLE
     return texel_fetch_2d_xe(xe_resolve_host_color_source,
                              int2_xe(source_texel), 0);
   #elif XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES == 2

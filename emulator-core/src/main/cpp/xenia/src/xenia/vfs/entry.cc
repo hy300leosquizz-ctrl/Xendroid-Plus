@@ -47,6 +47,10 @@ void Entry::Dump(xe::StringBuffer* string_buffer, int indent) {
 
 bool Entry::is_read_only() const { return device_->is_read_only(); }
 
+uint32_t Entry::sectors_per_allocation_unit() const {
+  return device_->sectors_per_allocation_unit();
+}
+
 Entry* Entry::GetChild(const std::string_view name) {
   auto global_lock = global_critical_region_.Acquire();
   auto it = std::find_if(children_.cbegin(), children_.cend(),
@@ -140,9 +144,6 @@ void Entry::Touch() {
 X_STATUS Entry::Rename(const std::filesystem::path file_path,
                        bool replace_existing) {
   auto global_lock = global_critical_region_.Acquire();
-  // A read-only device must not change: a read-only host folder would be
-  // renamed on the host, and disc and package entries count no handles a
-  // replaced entry may have open.
   if (is_read_only()) {
     return X_STATUS_ACCESS_DENIED;
   }
@@ -167,11 +168,28 @@ X_STATUS Entry::Rename(const std::filesystem::path file_path,
     const std::string guest_path = xe::utf8::join_guest_paths(path_parts);
     new_parent =
         device_->ResolvePath(xe::utf8::find_base_guest_path(guest_path));
-    if (!new_parent || !(new_parent->attributes() & kFileAttributeDirectory)) {
-      return X_STATUS_OBJECT_PATH_NOT_FOUND;
-    }
   }
-  const std::string_view name = path_parts.back();
+  return Rename(new_parent, path_parts.back(), replace_existing);
+}
+
+X_STATUS Entry::Rename(Entry* new_parent, std::string_view name,
+                       bool replace_existing) {
+  auto global_lock = global_critical_region_.Acquire();
+  // A read-only device must not change: a read-only host folder would be
+  // renamed on the host, and disc and package entries count no handles a
+  // replaced entry may have open.
+  if (is_read_only()) {
+    return X_STATUS_ACCESS_DENIED;
+  }
+  if (!parent_ || name.empty()) {
+    return X_STATUS_OBJECT_NAME_INVALID;
+  }
+  if (!new_parent || !(new_parent->attributes() & kFileAttributeDirectory)) {
+    return X_STATUS_OBJECT_PATH_NOT_FOUND;
+  }
+  if (new_parent->device() != device_) {
+    return X_STATUS_NOT_SAME_DEVICE;
+  }
 
   // Renaming to its own name fails too, even a change of case only.
   Entry* existing = new_parent->GetChild(name);

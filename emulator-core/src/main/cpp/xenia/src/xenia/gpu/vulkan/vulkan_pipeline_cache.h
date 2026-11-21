@@ -57,6 +57,11 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
    public:
     virtual ~PipelineLayoutProvider() {}
     virtual VkPipelineLayout GetPipelineLayout() const = 0;
+    virtual uint32_t GetDescriptorSetLayouts(
+        VkDescriptorSetLayout
+            layouts_out[SpirvShaderTranslator::kDescriptorSetCount]) const {
+      return 0;
+    }
 
    protected:
     PipelineLayoutProvider() = default;
@@ -139,6 +144,12 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // Whether the placeholder writes color (its pixel shader isn't the no-op
     // one), so the dynamic color write mask matches the static one.
     std::atomic<bool> placeholder_writes_color{false};
+    // Poisoning guard: true until EnsurePipelineCreated observes VK_SUCCESS for
+    // the real pipeline, preventing broken PSO descriptions from being written
+    // to persistent .vk.xpso storage.
+    std::atomic<bool> storage_write_pending{false};
+    // Set once a fast-linked GPL pipeline has queued its background LTO pass.
+    std::atomic<bool> lto_queued{false};
 
     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
         : pipeline_layout(pipeline_layout_provider), dynamic_state{} {}
@@ -160,7 +171,10 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
               other.creation_in_flight.load(std::memory_order_acquire)),
           creation_failed(other.creation_failed.load(std::memory_order_acquire)),
           placeholder_writes_color(
-              other.placeholder_writes_color.load(std::memory_order_acquire)) {}
+              other.placeholder_writes_color.load(std::memory_order_acquire)),
+          storage_write_pending(
+              other.storage_write_pending.load(std::memory_order_acquire)),
+          lto_queued(other.lto_queued.load(std::memory_order_acquire)) {}
 
     // Move constructor
     Pipeline(Pipeline&& other) noexcept
@@ -179,7 +193,10 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
               other.creation_in_flight.load(std::memory_order_acquire)),
           creation_failed(other.creation_failed.load(std::memory_order_acquire)),
           placeholder_writes_color(
-              other.placeholder_writes_color.load(std::memory_order_acquire)) {}
+              other.placeholder_writes_color.load(std::memory_order_acquire)),
+          storage_write_pending(
+              other.storage_write_pending.load(std::memory_order_acquire)),
+          lto_queued(other.lto_queued.load(std::memory_order_acquire)) {}
 
     // Deleted copy assignment to prevent accidental copying
     Pipeline& operator=(const Pipeline&) = delete;
@@ -254,6 +271,10 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // creation on this thread doesn't set creation_in_flight, so another caller
   // wouldn't wait for it.
   bool ExpeditePipeline(Pipeline* pipeline);
+  // Bounded wait (up to timeout_ms) on background creation threads for
+  // solid-color / visible-RT draws before dropping or standing in (adapted from
+  // XDroid360 33623e916, BSD-3-Clause).
+  bool WaitForPipeline(Pipeline* pipeline, uint32_t timeout_ms);
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type,
                            const uint32_t* host_address, uint32_t dword_count);
@@ -302,6 +323,35 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   void SetTextureExpAdjustZero(bool texture_exp_adjust_zero) {
     texture_exp_adjust_zero_ = texture_exp_adjust_zero;
   }
+  // PipelineDescription::texture_integer_scale_used of the next
+  // ConfigurePipeline calls (spirv_texture_iscale_specialization).
+  void SetTextureIntegerScaleUsed(uint32_t texture_integer_scale_used) {
+    texture_integer_scale_used_ = texture_integer_scale_used;
+  }
+
+  // VK_EXT_shader_object clean-room path (gated by vulkan_shader_object and
+  // device support, with automatic fallback to ConfigurePipeline).
+  struct ShaderObjectDrawConfig {
+    VkShaderEXT vertex_shader = VK_NULL_HANDLE;
+    VkShaderEXT fragment_shader = VK_NULL_HANDLE;
+    const PipelineLayoutProvider* pipeline_layout = nullptr;
+    DynamicState dynamic_state{};
+    VkSampleCountFlagBits rasterization_samples = VK_SAMPLE_COUNT_1_BIT;
+    VkSampleMask sample_mask = UINT32_MAX;
+    VkBool32 alpha_to_coverage_enable = VK_FALSE;
+    VkBool32 depth_bias_enable = VK_FALSE;
+  };
+  bool CanUseShaderObjects(
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result)
+      const;
+  bool ConfigureShaderObjects(
+      VulkanShader::VulkanTranslation* vertex_shader,
+      VulkanShader::VulkanTranslation* pixel_shader,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask,
+      VulkanRenderTargetCache::RenderPassKey render_pass_key,
+      ShaderObjectDrawConfig& config_out);
 
   // True while this draw must be fed the ucode interpreter's inputs (full float
   // constants + ucode location). False once hot-swapped to the real VS.
@@ -436,6 +486,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // fetches has a zero exponent adjustment (its specialization constant).
     // Zero (handled at runtime) in pipeline storages written before it.
     uint32_t texture_exp_adjust_zero : 1;  // 29
+    // spirv_texture_iscale_specialization: 32-bit per-slot bitmask of fetch
+    // constants with non-zero integer resolution scale / point-snap bits.
+    uint32_t texture_integer_scale_used;
 
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
@@ -460,7 +513,7 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
       }
     };
 
-    static constexpr uint32_t kVersion = 0x20260720;
+    static constexpr uint32_t kVersion = 0x20261118;
   });
 
   // Pipeline storage constants.
@@ -488,6 +541,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // Priority for async compilation (higher = compiled sooner).
     // Pipelines that write to visible render targets get higher priority.
     uint8_t priority = 0;
+    // True when queued solely to upgrade a fast-linked GPL pipeline to a
+    // link-time-optimized (LTO) pipeline in the background.
+    bool lto_link_only = false;
   };
 
   // Comparator for priority queue - higher priority first.
@@ -587,9 +643,7 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   bool depth_float24_round() const override {
     return render_target_cache_.depth_float24_round();
   }
-  bool depth_float24_convert_in_pixel_shader() const override {
-    return render_target_cache_.depth_float24_convert_in_pixel_shader();
-  }
+  bool depth_float24_convert_in_pixel_shader() const override;
 
   // Get the appropriate tessellation control shader (hull shader) module.
   VkShaderModule GetTessellationControlShader(
@@ -634,6 +688,37 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   uint32_t texture_sign_classes_ = 0;
   // SetTextureExpAdjustZero.
   bool texture_exp_adjust_zero_ = false;
+  // SetTextureIntegerScaleUsed.
+  uint32_t texture_integer_scale_used_ = 0;
+
+  //Substitute SPIR-V bytecode retained for VK_EXT_shader_object depth-only
+  // float24 draws.
+  std::vector<uint8_t> float24_truncate_fragment_shader_code_;
+  std::vector<uint8_t> float24_round_fragment_shader_code_;
+
+  // VK_EXT_graphics_pipeline_library state and 4-part library caches.
+  bool use_graphics_pipeline_library_ = false;
+  std::mutex gpl_mutex_;
+  std::unordered_map<uint64_t, VkPipeline, xe::hash::IdentityHasher<uint64_t>>
+      gpl_vertex_input_libs_;
+  std::unordered_map<uint64_t, VkPipeline, xe::hash::IdentityHasher<uint64_t>>
+      gpl_pre_raster_libs_;
+  std::unordered_map<uint64_t, VkPipeline, xe::hash::IdentityHasher<uint64_t>>
+      gpl_fragment_shader_libs_;
+  std::unordered_map<uint64_t, VkPipeline, xe::hash::IdentityHasher<uint64_t>>
+      gpl_fragment_output_libs_;
+
+  // VK_EXT_shader_object state and per-stage shader object cache.
+  std::mutex shader_objects_mutex_;
+  std::unordered_map<uint64_t, VkShaderEXT, xe::hash::IdentityHasher<uint64_t>>
+      shader_objects_;
+  VkShaderEXT GetOrCreateShaderObject(
+      VkShaderStageFlagBits stage, VkShaderStageFlags next_stage,
+      uint64_t shader_hash, uint64_t modification,
+      const uint8_t* spirv_bytes, size_t spirv_size,
+      const PipelineLayoutProvider* pipeline_layout,
+      const VkSpecializationInfo* specialization_info,
+      uint64_t specialization_key);
 
   // Cached device features for geometry shader creation.
   unsigned int spirv_version_;

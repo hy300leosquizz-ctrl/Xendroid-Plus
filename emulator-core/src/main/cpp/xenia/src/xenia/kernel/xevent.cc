@@ -115,10 +115,15 @@ void XEvent::RecordSetter() {
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
   set_priority_increment(priority_increment);
   RecordSetter();
+  if (manual_reset_) {
+    // Releases every waiter parked right now, even if the event is reset
+    // before they run. Must precede the wake below.
+    pulse_epoch_.fetch_add(1);
+  }
   // KeSetEvent returns the signal state from before.
   int32_t old_signal_state;
   {
-    std::lock_guard<std::mutex> lock(state_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
     old_signal_state = kevent->header.signal_state;
     kevent->header.signal_state = 1;
@@ -148,7 +153,7 @@ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
     pulse_epoch_.fetch_add(1);
   }
   {
-    std::lock_guard<std::mutex> lock(state_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     event_->Pulse();
     // Pulse leaves the event reset after releasing waiters.
     kevent->header.signal_state = 0;
@@ -159,7 +164,7 @@ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
 }
 
 int32_t XEvent::Reset() {
-  std::lock_guard<std::mutex> lock(state_lock_);
+  auto global_lock = global_critical_region_.Acquire();
   // KeResetEvent returns the signal state from before.
   auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
   const int32_t old_signal_state = kevent->header.signal_state;
@@ -172,7 +177,7 @@ int32_t XEvent::Reset() {
 void XEvent::WaitCallback() {
   // Auto-reset events atomically clear on successful wait; manual stay set.
   if (!manual_reset_) {
-    std::lock_guard<std::mutex> lock(state_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     memory()->TranslateVirtual<X_KEVENT*>(guest_object())->header.signal_state =
         0;
     host_signaled_ = false;
@@ -185,7 +190,7 @@ void XEvent::SyncFromGuest() {
   }
   bool guest_signaled = false;
   {
-    std::lock_guard<std::mutex> lock(state_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
     guest_signaled = kevent->header.signal_state ? true : false;
     if (guest_signaled == host_signaled_) {

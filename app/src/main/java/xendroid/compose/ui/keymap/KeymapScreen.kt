@@ -84,7 +84,7 @@ private val Warn = Color(0xFFE9A23B)
  * places (and says so). A controller works it too: A picks the key, Y clears, X swaps A/B and X/Y.
  */
 @Composable
-fun KeymapScreen(vm: KeymapViewModel, onBack: () -> Unit) {
+fun KeymapScreen(vm: KeymapViewModel, onBack: () -> Unit, inGame: Boolean = false) {
     val state by vm.state.collectAsStateWithLifecycle()
     val swap by vm.swap.collectAsStateWithLifecycle()
     val toast = LocalXdToast.current
@@ -140,6 +140,7 @@ fun KeymapScreen(vm: KeymapViewModel, onBack: () -> Unit) {
                 else -> false
             }
         },
+        showNav = !inGame,
     ) {
         BoxWithConstraints(Modifier.fillMaxWidth()) {
             val wide = maxWidth >= 720.dp
@@ -327,11 +328,10 @@ private fun KeyCaptureSheet(label: String, current: String, onKey: (Int) -> Unit
 private fun triggerKeyOf(event: MotionEvent): Int? {
     if (event.source and InputDevice.SOURCE_JOYSTICK != InputDevice.SOURCE_JOYSTICK) return null
     val half = AnalogTriggers.BUTTON_THRESHOLD
+    val axes = AnalogTriggers.readPadAxes(event)
     return when {
-        maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE)) > half ->
-            AndroidKeyEvent.KEYCODE_BUTTON_L2
-        maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS)) > half ->
-            AndroidKeyEvent.KEYCODE_BUTTON_R2
+        axes.lt > half -> AndroidKeyEvent.KEYCODE_BUTTON_L2
+        axes.rt > half -> AndroidKeyEvent.KEYCODE_BUTTON_R2
         else -> null
     }
 }

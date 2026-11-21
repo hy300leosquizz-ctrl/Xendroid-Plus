@@ -10,6 +10,10 @@
 #include <cstring>
 #include <vector>
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include "xenia/apu/conversion.h"
 
 namespace xe {
@@ -40,6 +44,50 @@ class AudioBlockRenderer {
   Result Render(float* out, int32_t count, float rate, float gain, Next&& next_block,
                 Done&& done) {
     Result result;
+    if (count <= 0) {
+      return result;
+    }
+
+    // Unity-rate memcpy fast-path when phase is integer-aligned (frac_ == 0.0f on initial
+    // call or 1.0f on steady-state unity callbacks). Preserves the exact 2-sample resampler
+    // pipeline state (prev_l_/r_, cur_l_/r_, pos_, frac_) so switching into or out of
+    // dynamic rate control is 100% seamless and bit-identical to the per-sample loop.
+    if (rate == 1.0f && (frac_ == 0.0f || frac_ == 1.0f)) {
+      int32_t i = 0;
+      if (frac_ == 0.0f) {
+        out[0] = prev_l_;
+        out[1] = prev_r_;
+        frac_ = 1.0f;
+        i = 1;
+      }
+      while (i < count) {
+        if (pos_ >= frames_) {
+          Load(next_block, done, gain, result);
+        }
+        const uint32_t avail =
+            std::min<uint32_t>(frames_ - pos_, static_cast<uint32_t>(count - i));
+        out[size_t(i) * 2] = cur_l_;
+        out[size_t(i) * 2 + 1] = cur_r_;
+        if (avail == 1) {
+          prev_l_ = cur_l_;
+          prev_r_ = cur_r_;
+          cur_l_ = block_[size_t(pos_) * 2];
+          cur_r_ = block_[size_t(pos_) * 2 + 1];
+        } else {
+          std::memcpy(&out[size_t(i + 1) * 2], &block_[size_t(pos_) * 2],
+                      size_t(avail - 1) * 2 * sizeof(float));
+          const size_t last = size_t(pos_ + avail - 1) * 2;
+          prev_l_ = block_[last - 2];
+          prev_r_ = block_[last - 1];
+          cur_l_ = block_[last];
+          cur_r_ = block_[last + 1];
+        }
+        pos_ += avail;
+        i += static_cast<int32_t>(avail);
+      }
+      return result;
+    }
+
     for (int32_t i = 0; i < count; ++i) {
       while (frac_ >= 1.0f) {
         frac_ -= 1.0f;
@@ -90,8 +138,39 @@ class AudioBlockRenderer {
   // counted) instead of reaching the device and the next gap's concealment.
   uint32_t GainAndClamp(float gain) {
     uint32_t clipped = 0;
-    for (float& sample : block_) {
-      float s = sample * gain;
+    float* const data = block_.data();
+    const size_t n = block_.size();
+    size_t i = 0;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const float32x4_t gain_v = vdupq_n_f32(gain);
+    const float32x4_t one_v = vdupq_n_f32(1.0f);
+    const float32x4_t neg_one_v = vdupq_n_f32(-1.0f);
+    const float32x4_t zero_v = vdupq_n_f32(0.0f);
+    uint32x4_t clip_acc = vdupq_n_u32(0);
+
+    for (; i + 4 <= n; i += 4) {
+      const float32x4_t s = vmulq_f32(vld1q_f32(data + i), gain_v);
+      const uint32x4_t not_nan = vceqq_f32(s, s);
+      const uint32x4_t in_range =
+          vandq_u32(vcgeq_f32(s, neg_one_v), vcleq_f32(s, one_v));
+      clip_acc = vaddq_u32(clip_acc, vshrq_n_u32(vmvnq_u32(in_range), 31));
+      const float32x4_t finite_or_zero = vbslq_f32(not_nan, s, zero_v);
+      const float32x4_t bounded =
+          vminq_f32(vmaxq_f32(finite_or_zero, neg_one_v), one_v);
+      vst1q_f32(data + i, bounded);
+    }
+#if defined(__aarch64__)
+    clipped += vaddvq_u32(clip_acc);
+#else
+    const uint32x2_t pair_sum =
+        vadd_u32(vget_low_u32(clip_acc), vget_high_u32(clip_acc));
+    clipped += vget_lane_u32(vpadd_u32(pair_sum, pair_sum), 0);
+#endif
+#endif
+
+    for (; i < n; ++i) {
+      float s = data[i] * gain;
       if (s > 1.0f) {
         s = 1.0f;
         ++clipped;
@@ -102,7 +181,7 @@ class AudioBlockRenderer {
         s = 0.0f;
         ++clipped;
       }
-      sample = s;
+      data[i] = s;
     }
     return clipped;
   }
@@ -110,9 +189,7 @@ class AudioBlockRenderer {
   // A block that did not arrive. The first one after real audio continues the last block
   // mirrored in time - from its last frame, so there is no step where it starts - and fades
   // it to silence across the block (a raised cosine); the next missing ones are silence, and
-  // the next real block ramps in from silence. Repeating the last block as it was put a step
-  // where its end met its start again, at every repeat, and another where the repeat (decayed,
-  // not silent) met the next block's ramp from zero: clicks on every underrun.
+  // the next real block ramps in from silence.
   void Conceal() {
     fade_in_ = true;
     if (!continues_) {

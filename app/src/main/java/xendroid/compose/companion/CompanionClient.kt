@@ -3,6 +3,7 @@ package xendroid.compose.companion
 import java.io.Closeable
 import java.io.IOException
 import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.Semaphore
@@ -20,24 +21,86 @@ class CompanionRejected(val reason: Int) : IOException(
     })
 
 /**
- * The phone-as-controller side (I06): joins a host with the code it shows, then streams
- * full pad states. Answers the host's pings (which keeps the connection alive and lets
- * the host measure latency) and plays the host's rumble through [onRumble].
- *
- * [connect] blocks: call it off Android's main thread. [update] never blocks: a sender
- * thread writes the newest state (Android forbids socket writes on the main thread).
+ * The phone-as-controller side (I06) over LAN TCP or Bluetooth RFCOMM: joins a host with the
+ * 6-digit code it shows, then streams full pad states and receives guest rumble.
  */
-class CompanionClient(
-    private val host: String,
-    private val port: Int,
+class CompanionClient private constructor(
+    private val openStream: (timeoutMs: Int) -> CompanionHost.StreamConn,
+    private val abortPendingConnect: () -> Unit,
     private val code: String,
     private val name: String,
-    /** Stable per install, so a reconnect gets the same player slot back. */
     private val clientId: ByteArray,
-    private val onRumble: (left: Int, right: Int) -> Unit = { _, _ -> },
-    private val onClosed: (reason: String) -> Unit = {},
+    private val onRumble: (left: Int, right: Int) -> Unit,
+    private val onClosed: (reason: String) -> Unit,
 ) : Closeable {
-    private val socket = Socket()
+
+    constructor(
+        host: String,
+        port: Int,
+        code: String,
+        name: String,
+        clientId: ByteArray,
+        onRumble: (left: Int, right: Int) -> Unit = { _, _ -> },
+        onClosed: (reason: String) -> Unit = {},
+    ) : this(
+        tcpSocket = Socket(),
+        host = host,
+        port = port,
+        code = code,
+        name = name,
+        clientId = clientId,
+        onRumble = onRumble,
+        onClosed = onClosed,
+    )
+
+    private constructor(
+        tcpSocket: Socket,
+        host: String,
+        port: Int,
+        code: String,
+        name: String,
+        clientId: ByteArray,
+        onRumble: (left: Int, right: Int) -> Unit,
+        onClosed: (reason: String) -> Unit,
+    ) : this(
+        openStream = { timeoutMs ->
+            tcpSocket.connect(InetSocketAddress(host, port), timeoutMs)
+            tcpSocket.tcpNoDelay = true
+            tcpSocket.soTimeout = timeoutMs
+            object : CompanionHost.StreamConn {
+                override val inputStream: InputStream get() = tcpSocket.getInputStream()
+                override val outputStream: OutputStream get() = tcpSocket.getOutputStream()
+                override fun clearTimeout() { tcpSocket.soTimeout = 0 }
+                override fun close() = tcpSocket.close()
+            }
+        },
+        abortPendingConnect = { try { tcpSocket.close() } catch (_: IOException) {} },
+        code = code,
+        name = name,
+        clientId = clientId,
+        onRumble = onRumble,
+        onClosed = onClosed,
+    )
+
+    /** Secondary constructor for non-TCP stream transports such as Bluetooth RFCOMM. */
+    constructor(
+        streamOpener: (timeoutMs: Int) -> CompanionHost.StreamConn,
+        code: String,
+        name: String,
+        clientId: ByteArray,
+        onRumble: (left: Int, right: Int) -> Unit = { _, _ -> },
+        onClosed: (reason: String) -> Unit = {},
+    ) : this(
+        openStream = streamOpener,
+        abortPendingConnect = {},
+        code = code,
+        name = name,
+        clientId = clientId,
+        onRumble = onRumble,
+        onClosed = onClosed,
+    )
+
+    @Volatile private var activeConn: CompanionHost.StreamConn? = null
     private val writeLock = Any()
     private val open = AtomicBoolean(false)
     private val latest = AtomicReference(PadState.RELEASED)
@@ -45,33 +108,32 @@ class CompanionClient(
 
     /** Connects and pairs; returns the player slot (1..3 = P2..P4). */
     fun connect(timeoutMs: Int = 3_000): Int {
-        val (input, slot) = try {
-            socket.connect(InetSocketAddress(host, port), timeoutMs)
-            socket.tcpNoDelay = true
-            socket.soTimeout = timeoutMs
-            val input = socket.getInputStream().buffered()
+        val (conn, input, slot) = try {
+            val c = openStream(timeoutMs)
+            activeConn = c
+            val input = c.inputStream.buffered()
             val challenge = CompanionCodec.read(input) as? CompanionMessage.Challenge
                 ?: throw CompanionProtocolException("Not a XenDroid game")
             if (challenge.version != CompanionProtocol.VERSION) throw CompanionRejected(CompanionProtocol.REJECT_VERSION)
             write(CompanionMessage.Hello(CompanionProtocol.VERSION, clientId, name,
                 CompanionProtocol.proof(code, challenge.nonce, clientId)))
             when (val reply = CompanionCodec.read(input)) {
-                is CompanionMessage.Welcome -> input to reply.slot
+                is CompanionMessage.Welcome -> Triple(c, input, reply.slot)
                 is CompanionMessage.Reject -> throw CompanionRejected(reply.reason)
                 else -> throw CompanionProtocolException("Unexpected reply")
             }
         } catch (e: Exception) {
-            runCatching { socket.close() }
+            runCatching { activeConn?.close() }
+            abortPendingConnect()
             throw e
         }
-        socket.soTimeout = 0
+        conn.clearTimeout()
         open.set(true)
         thread(name = "companion-client-read", isDaemon = true) { readLoop(input) }
         thread(name = "companion-client-send", isDaemon = true) { sendLoop() }
         return slot
     }
 
-    /** The pad's newest state; only changes reach the network. */
     fun update(pad: PadState) {
         latest.set(pad)
         wake.release()
@@ -79,12 +141,12 @@ class CompanionClient(
 
     val isOpen: Boolean get() = open.get()
 
-    /** The round trip to the game the host last measured (ms), null until it has one. */
     @Volatile var latencyMs: Int? = null
         private set
 
     private fun write(message: CompanionMessage) {
-        synchronized(writeLock) { CompanionCodec.write(socket.getOutputStream(), message) }
+        val out: OutputStream = activeConn?.outputStream ?: throw IOException("Socket not connected")
+        synchronized(writeLock) { CompanionCodec.write(out, message) }
     }
 
     private fun sendLoop() {
@@ -101,9 +163,8 @@ class CompanionClient(
                     sent = pad
                 }
             }
-            // Leaving on purpose: the host releases this pad on BYE.
             runCatching { write(CompanionMessage.Bye) }
-            runCatching { socket.close() }
+            runCatching { activeConn?.close() }
         } catch (e: Exception) {
             finish(e.message ?: "connection lost")
         }
@@ -129,22 +190,22 @@ class CompanionClient(
         finish(reason)
     }
 
-    /** The connection ended without the user leaving. */
     private fun finish(reason: String) {
         if (!open.getAndSet(false)) return
         wake.release()
-        runCatching { socket.close() }
+        runCatching { activeConn?.close() }
         onRumble(0, 0)
         onClosed(reason)
     }
 
     override fun close() {
         if (open.getAndSet(false)) {
-            wake.release()  // the sender says goodbye and closes the socket
+            wake.release()
             onRumble(0, 0)
             onClosed("you left")
         } else {
-            runCatching { socket.close() }  // also aborts a connect in progress
+            runCatching { activeConn?.close() }
+            abortPendingConnect()
         }
     }
 }

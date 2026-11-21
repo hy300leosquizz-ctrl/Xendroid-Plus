@@ -16,6 +16,7 @@
 #include <cstring>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/hash.h"
@@ -297,6 +298,12 @@ class TextureCache {
           tiled, format, packed_mips, base_page != 0, mip_max_level);
     }
 
+    bool IsResolveLinkShape() const {
+      return tiled && !packed_mips && !scaled_resolve &&
+             dimension == xenos::DataDimension::k2DOrStacked &&
+             depth_or_array_size_minus_1 == 0;
+    }
+
     static const char* GetLogDimensionName(xenos::DataDimension dimension);
     const char* GetLogDimensionName() const {
       return GetLogDimensionName(dimension);
@@ -347,7 +354,12 @@ class TextureCache {
     // not).
     bool base_outdated_lockless() const { return base_outdated_; }
     bool mips_outdated_lockless() const { return mips_outdated_; }
-    bool MakeUpToDateAndWatch(const global_unique_lock_type& global_lock);
+    bool ever_loaded() const { return ever_loaded_; }
+    bool MakeUpToDateAndWatch(const global_unique_lock_type& global_lock,
+                              bool update_base = true,
+                              bool update_mips = true);
+    bool CompleteResolveLinkLevel(const global_unique_lock_type& global_lock,
+                                  uint32_t level, uint32_t layer = 0);
 
     // 0 - the base, 1 - the mips, 2 + index - a subresource.
     void WatchCallback(const global_unique_lock_type& global_lock,
@@ -424,6 +436,7 @@ class TextureCache {
     bool base_outdated_ = false;
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
+    bool ever_loaded_ = false;
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
@@ -582,6 +595,14 @@ class TextureCache {
     kLoadShaderIndexCTX1,
     kLoadShaderIndexDepthUnorm,
     kLoadShaderIndexDepthFloat,
+    kLoadShaderIndexR16XenosHalfToFloat32,
+    kLoadShaderIndexRG16XenosHalfToFloat32,
+    kLoadShaderIndexRGBA16XenosHalfToFloat32,
+    kLoadShaderIndexDXT1ToASTC4x4,
+    kLoadShaderIndexDXT3ToASTC4x4,
+    kLoadShaderIndexDXT5ToASTC4x4,
+    kLoadShaderIndexDXNToEACRG11,
+    kLoadShaderIndexCTX1ToEACRG11,
 
     kLoadShaderCount,
     kLoadShaderIndexUnknown = kLoadShaderCount,
@@ -713,6 +734,25 @@ class TextureCache {
   void SetPartialReloadsSupported(bool supported) {
     partial_reloads_supported_ = supported;
   }
+  void SetDecompressedBCnFallbackActive(bool active) {
+    decompressed_bcn_fallback_active_ = active;
+  }
+
+  struct LinkCandidate {
+    Texture* texture = nullptr;
+    uint32_t level = 0;
+    uint32_t x = 0;
+    uint32_t y = 0;
+  };
+  void GetResolveLinkCandidates(uint32_t dest_base, uint32_t pitch_tiles,
+                                uint32_t dest_x0, uint32_t dest_y0,
+                                uint32_t width, uint32_t height,
+                                xenos::ColorFormat dest_format,
+                                xenos::Endian dest_endian,
+                                std::vector<LinkCandidate>& out);
+  void CompleteResolveLink(Texture& texture, uint32_t level,
+                           uint32_t layer = 0);
+  void ApplyMipChainSharing(TextureKey& key) const;
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data
@@ -828,6 +868,12 @@ class TextureCache {
 
   // SetPartialReloadsSupported.
   bool partial_reloads_supported_ = false;
+  bool decompressed_bcn_fallback_active_ = false;
+
+  void RegisterLinkCandidate(Texture* texture);
+  void UnregisterLinkCandidate(Texture* texture);
+  std::unordered_multimap<uint32_t, Texture*> link_candidates_;
+  std::unordered_map<uint64_t, uint32_t> chain_max_levels_;
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount>
       texture_bindings_;

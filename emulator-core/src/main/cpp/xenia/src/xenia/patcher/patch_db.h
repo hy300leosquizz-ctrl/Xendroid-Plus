@@ -15,6 +15,9 @@
 #include <map>
 #include <optional>
 #include <regex>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -139,16 +142,34 @@ class PatchDB {
   std::vector<PatchFileEntry> loaded_patches_;
 };
 
-struct BundledPatchFile {
+// One .patch.toml, from the embedded bundle or from the patches directory.
+struct PatchSourceFile {
   std::string filename;
   std::string toml_content;
   PatchFileEntry entry;
 };
 
-std::vector<BundledPatchFile> EnumerateBundledPatchesForTitle(
-    uint32_t title_id);
+using BundledPatchFile = PatchSourceFile;
+
+std::vector<PatchSourceFile> EnumerateBundledPatchesForTitle(uint32_t title_id);
+
+// The patch files of |title_id|: the bundled ones, each merged with its saved
+// copy in |patches_dir| (a file of the same name), then the other files there.
+std::vector<PatchSourceFile> EnumeratePatchesForTitle(
+    const std::filesystem::path& patches_dir, uint32_t title_id);
+
+// Merges two versions of one patch file, pairing patches by name. A pair keeps
+// |base|'s patch, with |extra|'s is_enabled when |keep_extra_enabled|.
+// |extra|'s unpaired patches are added after |base|'s. Nothing comes back when
+// either file doesn't parse into one block per patch.
+std::optional<std::string> MergePatchFiles(std::string_view base,
+                                           std::string_view extra,
+                                           bool keep_extra_enabled);
+
+// Filename with the "<title id> - " prefix and ".patch.toml" suffix trimmed.
+std::string PatchDisplayName(const PatchSourceFile& file);
 
 }  // namespace patcher
 }  // namespace xe
 
-#endif  // XENIA_PATCH_LOADER_H_
+#endif  // XENIA_PATCH_DB_H_

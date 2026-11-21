@@ -2,6 +2,8 @@ package xendroid.compose.companion
 
 import java.io.Closeable
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -15,74 +17,166 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
 /**
- * The game side of the companion protocol (I07/I08). Listens on the one LAN address it
- * is given (never every interface) while the user keeps companion mode on; a phone that
- * proves the code shown on the host gets a free player slot P2..P4 (never P1) and its
- * full pad states become that slot's input. A phone silent for [timeoutMs] has its input
- * released and its slot freed; a phone that reconnects starts from a released pad, so
- * no old button comes back. After [MAX_WRONG_CODES] wrong codes pairing locks until
- * companion mode is turned off and on (a new code), which bounds guessing.
- *
- * Callbacks run on the host's socket threads, never on Android's main thread.
+ * The game side of the companion protocol (I07/I08) over LAN TCP or Bluetooth RFCOMM fallback.
+ * A phone that proves the 6-digit code shown on the host gets a free player slot P2..P4 (never P1)
+ * and its full pad states become that slot's input.
  */
-class CompanionHost(
-    bindAddress: InetAddress,
+class CompanionHost private constructor(
+    private val streamServer: StreamServer,
+    val address: InetAddress,
+    val port: Int,
     private val claimSlot: (clientKey: String, name: String) -> Int?,
     private val releaseSlot: (clientKey: String, slot: Int) -> Unit,
     private val onInput: (slot: Int, change: PadKeys.KeyChange) -> Unit,
-    private val onEvent: (String) -> Unit = {},
-    private val clock: () -> Long = System::currentTimeMillis,
-    private val timeoutMs: Long = 1_000,
-    private val heartbeatMs: Long = 250,
-    private val handshakeTimeoutMs: Int = 4_000,
-    port: Int = 0,
+    private val onEvent: (String) -> Unit,
+    private val clock: () -> Long,
+    private val timeoutMs: Long,
+    private val heartbeatMs: Long,
+    private val handshakeTimeoutMs: Int,
 ) : Closeable {
+
+    interface StreamConn : Closeable {
+        val inputStream: InputStream
+        val outputStream: OutputStream
+        fun configureHandshakeTimeout(ms: Int) {}
+        fun clearTimeout() {}
+    }
+
+    interface StreamServer : Closeable {
+        val endpointLabel: String
+        fun accept(): StreamConn
+    }
+
+    constructor(
+        bindAddress: InetAddress,
+        claimSlot: (clientKey: String, name: String) -> Int?,
+        releaseSlot: (clientKey: String, slot: Int) -> Unit,
+        onInput: (slot: Int, change: PadKeys.KeyChange) -> Unit,
+        onEvent: (String) -> Unit = {},
+        clock: () -> Long = System::currentTimeMillis,
+        timeoutMs: Long = 1_000,
+        heartbeatMs: Long = 250,
+        handshakeTimeoutMs: Int = 4_000,
+        port: Int = 0,
+    ) : this(
+        tcpServer = ServerSocket().apply {
+            reuseAddress = true
+            bind(InetSocketAddress(bindAddress, port))
+        },
+        claimSlot = claimSlot,
+        releaseSlot = releaseSlot,
+        onInput = onInput,
+        onEvent = onEvent,
+        clock = clock,
+        timeoutMs = timeoutMs,
+        heartbeatMs = heartbeatMs,
+        handshakeTimeoutMs = handshakeTimeoutMs,
+    )
+
+    private constructor(
+        tcpServer: ServerSocket,
+        claimSlot: (clientKey: String, name: String) -> Int?,
+        releaseSlot: (clientKey: String, slot: Int) -> Unit,
+        onInput: (slot: Int, change: PadKeys.KeyChange) -> Unit,
+        onEvent: (String) -> Unit,
+        clock: () -> Long,
+        timeoutMs: Long,
+        heartbeatMs: Long,
+        handshakeTimeoutMs: Int,
+    ) : this(
+        streamServer = object : StreamServer {
+            override val endpointLabel: String = "${tcpServer.inetAddress.hostAddress}:${tcpServer.localPort}"
+            override fun accept(): StreamConn {
+                val sock = tcpServer.accept()
+                return object : StreamConn {
+                    override val inputStream: InputStream get() = sock.getInputStream()
+                    override val outputStream: OutputStream get() = sock.getOutputStream()
+                    override fun configureHandshakeTimeout(ms: Int) {
+                        sock.tcpNoDelay = true
+                        sock.soTimeout = ms
+                    }
+                    override fun clearTimeout() {
+                        sock.soTimeout = 0
+                    }
+                    override fun close() {
+                        sock.close()
+                    }
+                }
+            }
+            override fun close() = tcpServer.close()
+        },
+        address = tcpServer.inetAddress,
+        port = tcpServer.localPort,
+        claimSlot = claimSlot,
+        releaseSlot = releaseSlot,
+        onInput = onInput,
+        onEvent = onEvent,
+        clock = clock,
+        timeoutMs = timeoutMs,
+        heartbeatMs = heartbeatMs,
+        handshakeTimeoutMs = handshakeTimeoutMs,
+    )
+
+    /** Secondary constructor for non-TCP stream transports such as Bluetooth RFCOMM. */
+    constructor(
+        streamServer: StreamServer,
+        claimSlot: (clientKey: String, name: String) -> Int?,
+        releaseSlot: (clientKey: String, slot: Int) -> Unit,
+        onInput: (slot: Int, change: PadKeys.KeyChange) -> Unit,
+        onEvent: (String) -> Unit = {},
+        clock: () -> Long = System::currentTimeMillis,
+        timeoutMs: Long = 1_500,
+        heartbeatMs: Long = 250,
+        handshakeTimeoutMs: Int = 5_000,
+    ) : this(
+        streamServer = streamServer,
+        address = InetAddress.getLoopbackAddress(),
+        port = 0,
+        claimSlot = claimSlot,
+        releaseSlot = releaseSlot,
+        onInput = onInput,
+        onEvent = onEvent,
+        clock = clock,
+        timeoutMs = timeoutMs,
+        heartbeatMs = heartbeatMs,
+        handshakeTimeoutMs = handshakeTimeoutMs,
+    )
+
     /** Shown to the user; a new one every time companion mode is turned on. */
     val code: String = CompanionProtocol.newCode()
-    private val server = ServerSocket().apply {
-        reuseAddress = true
-        bind(InetSocketAddress(bindAddress, port))
-    }
-    val address: InetAddress = server.inetAddress
-    val port: Int = server.localPort
+    val endpoint: String get() = streamServer.endpointLabel
+
     private val running = AtomicBoolean(true)
     private val clients = ConcurrentHashMap<String, Client>()
-    /** Joins, replacements and shutdown happen one at a time. */
     private val joinLock = Any()
     private val pairLock = Any()
     private var wrongCodes = 0
     private val handshakes = AtomicInteger(0)
-    /** Rumble is sent off the caller's thread: Android forbids socket writes on the main thread. */
     private val rumbleSender = Executors.newSingleThreadExecutor { r -> Thread(r, "companion-rumble").apply { isDaemon = true } }
-    /** See [holdInput]. */
     @Volatile private var inputHeld = false
     private val holdLock = Any()
 
-    /** [connection] is unique per accepted phone connection in this process (a reconnect gets a new one). */
     data class ClientInfo(val slot: Int, val name: String, val latencyMs: Long?, val connection: Long)
 
-    private inner class Client(val key: String, val name: String, val slot: Int, val socket: Socket) {
+    private inner class Client(val key: String, val name: String, val slot: Int, val conn: StreamConn) {
         val connection = connections.incrementAndGet()
         @Volatile var lastHeard: Long = clock()
         @Volatile var latencyMs: Long? = null
         var lastSeq = -1L
-        /** The phone's newest state, and what the guest has (released while input is held). */
         private var latest = PadState.RELEASED
         private var applied = PadState.RELEASED
         private val writeLock = Any()
         private val closed = AtomicBoolean(false)
 
         fun send(message: CompanionMessage) {
-            synchronized(writeLock) { CompanionCodec.write(socket.getOutputStream(), message) }
+            synchronized(writeLock) { CompanionCodec.write(conn.outputStream, message) }
         }
 
-        /** Must hold this client's lock. */
         private fun apply(next: PadState) {
             PadKeys.diff(applied, next).forEach { onInput(slot, it) }
             applied = next
         }
 
-        /** Applies a new state unless the client is already gone (no key pressed after its release) or input is held. */
         fun update(next: PadState) {
             synchronized(this) {
                 if (closed.get()) return
@@ -98,14 +192,13 @@ class CompanionHost(
             }
         }
 
-        /** Releases what this phone held, frees its slot once, closes the socket. */
         fun close(reason: String) {
             if (!closed.compareAndSet(false, true)) return
             synchronized(this) { apply(PadState.RELEASED) }
             clients.remove(key, this)
             releaseSlot(key, slot)
             runCatching { send(CompanionMessage.Bye) }
-            runCatching { socket.close() }
+            runCatching { conn.close() }
             onEvent("phone controller P${slot + 1} left: $reason")
         }
     }
@@ -113,12 +206,6 @@ class CompanionHost(
     val connected: List<ClientInfo>
         get() = clients.values.map { ClientInfo(it.slot, it.name, it.latencyMs, it.connection) }.sortedBy { it.slot }
 
-    /**
-     * While held (the game's menu is open, it is paused or in the background) every phone's
-     * input is released in the guest and new states are only remembered, like the menu
-     * isolates local controllers; releasing the hold applies each phone's current state,
-     * so a stick still pushed keeps working without being moved again.
-     */
     fun holdInput(held: Boolean) {
         synchronized(holdLock) {
             if (inputHeld == held) return
@@ -127,19 +214,18 @@ class CompanionHost(
         }
     }
 
-    /** True once too many wrong codes were tried: only a new code (off and on) pairs again. */
     val locked: Boolean get() = synchronized(pairLock) { wrongCodes >= MAX_WRONG_CODES }
 
     fun start(): CompanionHost {
         thread(name = "companion-accept", isDaemon = true) {
             while (running.get()) {
-                val socket = try { server.accept() } catch (e: IOException) { break }
+                val conn = try { streamServer.accept() } catch (e: IOException) { break }
                 if (handshakes.incrementAndGet() > MAX_HANDSHAKES) {
                     handshakes.decrementAndGet()
-                    runCatching { socket.close() }
+                    runCatching { conn.close() }
                     continue
                 }
-                thread(name = "companion-client", isDaemon = true) { serve(socket) }
+                thread(name = "companion-client", isDaemon = true) { serve(conn) }
             }
         }
         thread(name = "companion-heartbeat", isDaemon = true) {
@@ -148,7 +234,6 @@ class CompanionHost(
                 val now = clock()
                 for (client in clients.values) {
                     val silent = now - client.lastHeard
-                    // The phone shows the round trip the host measured (I09).
                     val rtt = client.latencyMs?.coerceAtMost(Short.MAX_VALUE.toLong())?.toInt() ?: -1
                     if (silent > timeoutMs) client.close("no data for $silent ms")
                     else runCatching { client.send(CompanionMessage.Ping(now, rtt)) }.onFailure { client.close("send failed") }
@@ -158,7 +243,6 @@ class CompanionHost(
         return this
     }
 
-    /** The guest's rumble for [slot] (0..65535 per motor), forwarded to the phone playing it (I09). */
     fun sendRumble(slot: Int, left: Int, right: Int) {
         val client = clients.values.firstOrNull { it.slot == slot } ?: return
         runCatching {
@@ -166,22 +250,21 @@ class CompanionHost(
         }
     }
 
-    private fun serve(socket: Socket) {
+    private fun serve(conn: StreamConn) {
         var handshaking = true
         var client: Client? = null
         fun handshakeDone() { if (handshaking) { handshaking = false; handshakes.decrementAndGet() } }
         try {
-            socket.tcpNoDelay = true
-            socket.soTimeout = handshakeTimeoutMs
-            val input = socket.getInputStream().buffered()
+            conn.configureHandshakeTimeout(handshakeTimeoutMs)
+            val input = conn.inputStream.buffered()
             val nonce = CompanionProtocol.newNonce()
-            CompanionCodec.write(socket.getOutputStream(), CompanionMessage.Challenge(CompanionProtocol.VERSION, nonce))
+            CompanionCodec.write(conn.outputStream, CompanionMessage.Challenge(CompanionProtocol.VERSION, nonce))
             val hello = CompanionCodec.read(input) as? CompanionMessage.Hello
                 ?: throw CompanionProtocolException("Expected HELLO")
             fun reject(reason: Int, why: String) {
-                runCatching { CompanionCodec.write(socket.getOutputStream(), CompanionMessage.Reject(reason)) }
+                runCatching { CompanionCodec.write(conn.outputStream, CompanionMessage.Reject(reason)) }
                 onEvent("phone controller refused: $why")
-                socket.close()
+                conn.close()
             }
             if (hello.version != CompanionProtocol.VERSION) return reject(CompanionProtocol.REJECT_VERSION, "protocol ${hello.version}")
             val verdict = synchronized(pairLock) {
@@ -202,22 +285,19 @@ class CompanionHost(
             val name = hello.name.filter { it >= ' ' }.trim().take(32).ifBlank { "Phone" }
             val joined = synchronized(joinLock) {
                 if (!running.get()) return reject(CompanionProtocol.REJECT_CLOSED, "companion mode off")
-                // The same phone reconnecting replaces its old connection (released first).
                 clients[key]?.close("reconnected")
                 val slot = claimSlot(key, name) ?: return reject(CompanionProtocol.REJECT_FULL, "no free player slot")
-                Client(key, name, slot, socket).also { clients[key] = it }
+                Client(key, name, slot, conn).also { clients[key] = it }
             }
             client = joined
             handshakeDone()
-            socket.soTimeout = 0  // liveness comes from the heartbeat from now on
+            conn.clearTimeout()
             joined.send(CompanionMessage.Welcome(joined.slot))
-            // Not the phone's name: like a Bluetooth name it can carry its owner's name.
             onEvent("phone controller joined as P${joined.slot + 1}")
             while (running.get()) {
                 when (val message = CompanionCodec.read(input)) {
                     is CompanionMessage.State -> {
                         joined.lastHeard = clock()
-                        // TCP keeps order; the sequence guards a confused or replaying client.
                         if (message.seq > joined.lastSeq) {
                             joined.lastSeq = message.seq
                             joined.update(message.pad)
@@ -234,7 +314,7 @@ class CompanionHost(
             }
         } catch (e: Exception) {
             val current = client
-            if (current != null) current.close(e.message ?: e.javaClass.simpleName) else runCatching { socket.close() }
+            if (current != null) current.close(e.message ?: e.javaClass.simpleName) else runCatching { conn.close() }
         } finally {
             handshakeDone()
         }
@@ -243,7 +323,7 @@ class CompanionHost(
     override fun close() {
         synchronized(joinLock) {
             if (!running.compareAndSet(true, false)) return
-            runCatching { server.close() }
+            runCatching { streamServer.close() }
             clients.values.toList().forEach { it.close("companion mode off") }
         }
         rumbleSender.shutdown()
@@ -252,7 +332,6 @@ class CompanionHost(
     companion object {
         const val MAX_WRONG_CODES = 10
         const val MAX_HANDSHAKES = 4
-        /** Player keys of companion phones in ControllerSlots. */
         const val KEY_PREFIX = "companion:"
         private val connections = AtomicLong()
     }

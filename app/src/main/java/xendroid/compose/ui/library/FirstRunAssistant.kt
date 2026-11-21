@@ -116,6 +116,8 @@ fun FirstRunAssistant(
     onCreateProfile: ((String) -> Unit)? = null,
     /** Round 2: makes XenDroid/<Games>, /TU and /DLC and adds them. */
     onCreateStandard: (() -> Unit)? = null,
+    onChangeFolder: ((String) -> Unit)? = null,
+    onRemoveFolder: ((String) -> Unit)? = null,
     step: FirstRunStep = FirstRunStep.PHONE,
     onStep: (FirstRunStep) -> Unit = {},
 ) {
@@ -147,7 +149,8 @@ fun FirstRunAssistant(
                     Column(Modifier.widthIn(max = 680.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                         when (step) {
                             FirstRunStep.PHONE -> PhoneStep(folderReady)
-                            FirstRunStep.GAMES -> GamesStep(folderReady, folders, gamesFound, scanning, covers, onChooseFolder, onCreateStandard)
+                            FirstRunStep.GAMES -> GamesStep(folderReady, folders, gamesFound, scanning, covers, onChooseFolder, onCreateStandard,
+                                onChangeFolder, onRemoveFolder)
                             FirstRunStep.LOCALE -> LocaleStep()
                             FirstRunStep.PROFILE -> ProfileStep(activeProfile, onCreateProfile, onOpenProfiles)
                             FirstRunStep.USE -> UseStep()
@@ -264,7 +267,7 @@ private fun PhoneStep(folderReady: Boolean) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun GamesStep(folderReady: Boolean, folders: List<String>, gamesFound: Int?, scanning: Boolean, covers: List<Any>, onChooseFolder: () -> Unit,
-                      onCreateStandard: (() -> Unit)?) {
+                      onCreateStandard: (() -> Unit)?, onChangeFolder: ((String) -> Unit)? = null, onRemoveFolder: ((String) -> Unit)? = null) {
     val c = Xd.colors
     StepHead(stringResource(R.string.fr_your_games))
     if (!AllFilesAccess.isSupported) {
@@ -285,9 +288,15 @@ private fun GamesStep(folderReady: Boolean, folders: List<String>, gamesFound: I
     }
     XdCard(Modifier.fillMaxWidth()) {
         folders.forEach { folder ->
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Icon(XdIcons.folder, null, Modifier.size(20.dp), tint = c.fg3)
-                Text(displayPath(folder), style = XdText.label, color = c.fg, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(displayPath(folder), style = XdText.label, color = c.fg, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                if (onChangeFolder != null) {
+                    XdButton(stringResource(R.string.xd_fd_change), { onChangeFolder(folder) }, kind = XdButtonKind.GHOST, size = XdButtonSize.SM)
+                }
+                if (onRemoveFolder != null) {
+                    XdButton(stringResource(R.string.common_remove), { onRemoveFolder(folder) }, kind = XdButtonKind.GHOST, size = XdButtonSize.SM)
+                }
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {

@@ -238,7 +238,7 @@ DECLARE_XAM_EXPORT1(XamGetOnlineCountryFromLocale, kLocale, kImplemented);
 
 dword_result_t XamGetOnlineCountryString_entry(dword_t id,
                                                dword_t buffer_length,
-                                               lpu16string_t buffer) {
+                                               pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -260,7 +260,7 @@ dword_result_t XamGetOnlineCountryString_entry(dword_t id,
 DECLARE_XAM_EXPORT1(XamGetOnlineCountryString, kLocale, kImplemented);
 
 dword_result_t XamGetCountryString_entry(dword_t id, dword_t buffer_length,
-                                         lpu16string_t buffer) {
+                                         pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -282,7 +282,7 @@ dword_result_t XamGetCountryString_entry(dword_t id, dword_t buffer_length,
 DECLARE_XAM_EXPORT1(XamGetCountryString, kLocale, kImplemented);
 
 dword_result_t XamGetLanguageString_entry(dword_t id, dword_t buffer_length,
-                                          lpu16string_t buffer) {
+                                          pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -306,7 +306,7 @@ DECLARE_XAM_EXPORT1(XamGetLanguageString, kLocale, kImplemented);
 dword_result_t XamGetLanguageLocaleString_entry(dword_t language_id,
                                                 dword_t locale_id,
                                                 dword_t buffer_length,
-                                                lpu16string_t buffer) {
+                                                pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -366,7 +366,7 @@ DECLARE_XAM_EXPORT1(XamGetOnlineLanguageAndCountry, kLocale, kImplemented);
 
 dword_result_t XamGetOnlineLanguageAndCountryString_entry(
     dword_t language_id, dword_t country_id, dword_t buffer_length,
-    lpu16string_t buffer) {
+    pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -397,7 +397,7 @@ DECLARE_XAM_EXPORT1(XamGetOnlineLanguageAndCountryString, kLocale,
                     kImplemented);
 
 dword_result_t XamGetLocaleString_entry(dword_t id, dword_t buffer_length,
-                                        lpu16string_t buffer) {
+                                        pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -430,7 +430,7 @@ DECLARE_XAM_EXPORT1(XamGetLanguageFromOnlineLanguage, kLocale, kImplemented);
 
 dword_result_t XamGetOnlineLanguageString_entry(dword_t id,
                                                 dword_t buffer_length,
-                                                lpu16string_t buffer) {
+                                                pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }

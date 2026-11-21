@@ -37,6 +37,11 @@ DEFINE_string(logged_profile_slot_2_xuid, "",
               "XUID of the profile to load on boot in slot 2", "Profiles");
 DEFINE_string(logged_profile_slot_3_xuid, "",
               "XUID of the profile to load on boot in slot 3", "Profiles");
+DEFINE_bool(
+    live_signin, false,
+    "Report signed-in local profiles as signed in to Xbox Live offline without "
+    "modifying profile files on disk.",
+    "Profiles");
 
 namespace xe {
 namespace kernel {
@@ -221,6 +226,16 @@ void ProfileManager::SyncProfilesWithConfig() {
                                        GetUsedUserSlots().to_ulong());
 }
 
+UserProfile* ProfileManager::GetProfileLive(const uint64_t xuid) const {
+  uint8_t user_index = GetUserIndexAssignedToLiveProfile(xuid);
+
+  if (user_index >= XUserMaxUserCount) {
+    return nullptr;
+  }
+
+  return GetProfile(user_index);
+}
+
 UserProfile* ProfileManager::GetProfile(const uint64_t xuid) const {
   const uint8_t user_index = GetUserIndexAssignedToProfile(xuid);
   if (user_index >= XUserMaxUserCount) {
@@ -380,6 +395,11 @@ void ProfileManager::Login(const uint64_t xuid, const uint8_t user_index,
 
   MountProfile(xuid);
 
+  if (profile.IsLiveEnabled() && SetLiveDefaults(&profile) &&
+      !WriteAccount(xuid, &profile)) {
+    XELOGW("Profile {:016X}: could not save its Live defaults", xuid);
+  }
+
   logged_profiles_[assigned_user_slot] =
       std::make_unique<UserProfile>(xuid, &profile);
 
@@ -498,6 +518,28 @@ uint8_t ProfileManager::GetUserIndexAssignedToProfile(
 
     return index;
   }
+  // Titles know a user signed in to Live by the online XUID.
+  return GetUserIndexAssignedToLiveProfile(xuid);
+}
+
+uint8_t ProfileManager::GetUserIndexAssignedToLiveProfile(
+    const uint64_t xuid_online) const {
+  // GetOnlineXUID() is 0 for a profile without Live, so INVALID_XUID must not
+  // match it.
+  if (!xuid_online) {
+    return XUserIndexAny;
+  }
+  for (const auto& [index, entry] : logged_profiles_) {
+    if (!entry) {
+      continue;
+    }
+
+    if (entry->GetOnlineXUID() != xuid_online) {
+      continue;
+    }
+
+    return index;
+  }
   return XUserIndexAny;
 }
 
@@ -583,7 +625,7 @@ bool ProfileManager::CreateAccount(const uint64_t xuid,
   string_util::copy_and_swap_truncating(account.gamertag, gamertag_u16,
                                         xe::countof(account.gamertag));
 
-  const bool result = UpdateAccount(xuid, &account);
+  const bool result = WriteAccount(xuid, &account);
   DismountProfile(xuid);
 
   if (result) {
@@ -594,7 +636,7 @@ bool ProfileManager::CreateAccount(const uint64_t xuid,
 
 bool ProfileManager::CreateAccount(const uint64_t xuid,
                                    const X_XAMACCOUNTINFO* account) {
-  const bool result = UpdateAccount(xuid, account);
+  const bool result = WriteAccount(xuid, account);
   if (result) {
     accounts_.insert({xuid, *account});
   }
@@ -603,6 +645,43 @@ bool ProfileManager::CreateAccount(const uint64_t xuid,
 
 bool ProfileManager::UpdateAccount(const uint64_t xuid,
                                    const X_XAMACCOUNTINFO* account) {
+  X_XAMACCOUNTINFO updated = *account;
+  if (updated.IsLiveEnabled()) {
+    SetLiveDefaults(&updated);
+  }
+
+  // A signed-in profile is mounted already.
+  UserProfile* profile = GetProfile(xuid);
+  if (!profile && !MountProfile(xuid)) {
+    return false;
+  }
+  const bool written = WriteAccount(xuid, &updated);
+  if (!profile) {
+    DismountProfile(xuid);
+  }
+  if (!written) {
+    return false;
+  }
+
+  accounts_.insert_or_assign(xuid, updated);
+
+  if (profile) {
+    const bool live_changed =
+        profile->IsLiveEnabled() !=
+        ResolveAccountLiveEnabled(updated, cvars::live_signin);
+    profile->account_info_ = updated;
+    // Turning Live on or off moves the user between signed in locally and
+    // signed in to Live.
+    if (live_changed) {
+      kernel_state_->BroadcastNotification(kXNotificationSystemSignInChanged,
+                                           GetUsedUserSlots().to_ulong());
+    }
+  }
+  return true;
+}
+
+bool ProfileManager::WriteAccount(const uint64_t xuid,
+                                  const X_XAMACCOUNTINFO* account) {
   const std::string guest_path =
       fmt::format(kDefaultMountFormat, xuid) + ":\\Account";
 
@@ -627,10 +706,34 @@ bool ProfileManager::UpdateAccount(const uint64_t xuid,
       std::span<uint8_t>(encrypted_data.data(), encrypted_data.size()), 0,
       &written_bytes);
   output_file->Destroy();
-
-  // Refresh the in-memory account data
-  accounts_.insert_or_assign(xuid, *account);
   return true;
+}
+
+bool ProfileManager::SetLiveDefaults(X_XAMACCOUNTINFO* account) const {
+  const X_XAMACCOUNTINFO original = *account;
+
+  if (!account->xuid_online) {
+    account->xuid_online = GenerateOnlineXuid();
+  }
+  if (account->GetSubscriptionTier() ==
+      X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierNone) {
+    account->SetSubscriptionTier(
+        X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierGold);
+  }
+  if (kernel_state_ && kernel_state_->xconfig()) {
+    if (!static_cast<uint32_t>(account->GetCountry())) {
+      account->SetCountry(static_cast<XOnlineCountry>(
+          kernel_state_->xconfig()->ReadSetting<uint8_t>(
+              XCONFIG_USER_CATEGORY, XCONFIG_USER_COUNTRY)));
+    }
+    if (account->GetLanguage() == XLanguage::kInvalid) {
+      account->SetLanguage(static_cast<XLanguage>(
+          kernel_state_->xconfig()->ReadSetting<uint32_t>(
+              XCONFIG_USER_CATEGORY, XCONFIG_USER_LANGUAGE)));
+    }
+  }
+
+  return std::memcmp(&original, account, sizeof(X_XAMACCOUNTINFO)) != 0;
 }
 
 void ProfileManager::UpdateConfig(const uint64_t xuid, const uint8_t slot) {

@@ -9,6 +9,9 @@
 
 #include "xenia/cpu/processor.h"
 
+#include <algorithm>
+#include <thread>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/atomic.h"
 #include "xenia/base/byte_order.h"
@@ -532,6 +535,127 @@ uint32_t Processor::SweptCodeEnd(uint32_t address) {
   // The range may be keyed by another address for the same memory, so convert
   // back to this one.
   return address + uint32_t(range->second - key);
+}
+
+namespace {
+struct PendingDataFault {
+  Processor* processor;
+  uint32_t pc;
+  bool is_store;
+  uint32_t address;
+  uint64_t host_address;
+};
+thread_local PendingDataFault pending_data_fault;
+
+[[noreturn]] void GuestDataFaultThunk() {
+  const PendingDataFault fault = pending_data_fault;
+  auto* thread_state = ThreadState::Get();
+  auto* processor = fault.processor;
+  if (thread_state && processor) {
+    auto* context = thread_state->context();
+    if (auto hook = processor->data_fault_hook()) {
+      const uint32_t resume_address =
+          hook(context, fault.pc, fault.is_store, fault.address);
+      if (resume_address) {
+        processor->ExecuteRaw(thread_state, resume_address);
+        XELOGE(
+            "Guest access violation at {:08X}: the code the handler continued "
+            "at, {:08X}, returned",
+            fault.pc, resume_address);
+      }
+    }
+    if (auto crash_hook = processor->guest_crash_hook()) {
+      crash_hook(fault.pc, fault.is_store, fault.host_address);
+    }
+  }
+  while (true) {
+    xe::threading::NanoSleep(int64_t(1'000'000'000));
+  }
+}
+}  // namespace
+
+bool Processor::HandleGuestDataFault(Exception* ex,
+                                     GuestFunction* guest_function) {
+  if (!ex || ex->code() != Exception::Code::kAccessViolation ||
+      !guest_function || !data_fault_hook() || !ThreadState::Get()) {
+    return false;
+  }
+  if (is_debugger_attached() || debugging::IsDebuggerAttached()) {
+    return false;
+  }
+  const uint64_t fault_offset =
+      ex->fault_address() -
+      reinterpret_cast<uint64_t>(memory()->virtual_membase());
+  if (fault_offset > UINT32_MAX) {
+    return false;
+  }
+  const uint32_t pc = guest_function->MapMachineCodeToGuestAddress(ex->pc());
+  const bool is_store = ex->access_violation_operation() ==
+                        Exception::AccessViolationOperation::kWrite;
+  XELOGW("Guest {} at {:08X} faulted at {:08X}, delivering it to the guest",
+         is_store ? "store" : "load", pc, uint32_t(fault_offset));
+  pending_data_fault = {this, pc, is_store, uint32_t(fault_offset),
+                        ex->fault_address()};
+  DivertToThunk(ex, &GuestDataFaultThunk);
+  return true;
+}
+
+Function* Processor::ResolveCallTarget(ppc::PPCContext* context,
+                                       uint32_t* address) {
+  Function* function = ResolveFunction(*address);
+  while (!function || !function->is_guest()) {
+    const CodeFaultHook hook = code_fault_hook();
+    const uint32_t resume_address = hook ? hook(context, *address) : 0;
+    if (!resume_address) {
+      return nullptr;
+    }
+    *address = resume_address;
+    function = ResolveFunction(*address);
+  }
+  return function;
+}
+
+size_t Processor::ResolveFunctionsInParallel(
+    const std::vector<uint32_t>& addresses) {
+  if (addresses.empty()) {
+    return 0;
+  }
+  const uint32_t hw_threads = std::thread::hardware_concurrency();
+  const size_t worker_count = std::min<size_t>(
+      addresses.size(),
+      std::clamp<uint32_t>(hw_threads ? hw_threads : 4u, 1u, 8u));
+  if (worker_count <= 1 || addresses.size() < 8) {
+    size_t resolved = 0;
+    for (uint32_t addr : addresses) {
+      if (ResolveFunction(addr)) {
+        ++resolved;
+      }
+    }
+    return resolved;
+  }
+  std::atomic<size_t> next_index{0};
+  std::atomic<size_t> resolved_count{0};
+  auto worker_fn = [&]() {
+    while (true) {
+      const size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
+      if (idx >= addresses.size()) {
+        break;
+      }
+      if (ResolveFunction(addresses[idx])) {
+        resolved_count.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  };
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count - 1);
+  for (size_t w = 1; w < worker_count; ++w) {
+    workers.emplace_back(worker_fn);
+  }
+  worker_fn();
+  for (auto& w : workers) {
+    w.join();
+  }
+  return resolved_count.load(std::memory_order_relaxed);
 }
 
 Function* Processor::ResolveFunction(uint32_t address) {

@@ -85,6 +85,8 @@ object Routes {
     const val CONTROLS = "controls"
     /** Lote 6: app updates (channel, version, the offered update and its steps). */
     const val UPDATES = "updates"
+    /** Game folders screen reachable from Settings and the controller Start menu (#133). */
+    const val GAME_FOLDERS = "game_folders"
 }
 
 /** The game sheet's route for [game], opened at [section] (null: the overview). */
@@ -133,6 +135,7 @@ fun AppNavHost(container: AppContainer) {
                 XdArea.SETTINGS -> top(Routes.SETTINGS)
             }
             override fun shortcut(shortcut: XdShortcut) = when (shortcut) {
+                XdShortcut.FOLDERS -> top(Routes.GAME_FOLDERS)
                 XdShortcut.DIAGNOSTICS -> top("${Routes.DIAGNOSTICS}?title=")
                 XdShortcut.COMPARE -> top(Routes.BENCHMARK)
                 XdShortcut.ABOUT -> top(Routes.ABOUT)
@@ -266,7 +269,12 @@ fun AppNavHost(container: AppContainer) {
         }
         composable(Routes.CONTROLLER_TEST) { entry ->
             val vm: SettingsViewModel = viewModel(factory = container.settingsViewModelFactory())
-            xendroid.compose.ui.controllertest.ControllerTestScreen(onBack = entry.backOnce(nav), global = vm)
+            val go: (String) -> Unit = { route -> if (entry.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) nav.navigate(route) }
+            xendroid.compose.ui.controllertest.ControllerTestScreen(
+                onBack = entry.backOnce(nav),
+                global = vm,
+                onKeymap = { go(Routes.KEYMAP) },
+            )
         }
         composable(Routes.PHONE_CONTROLLER) { entry ->
             val vm: PhoneControllerViewModel = viewModel()
@@ -278,6 +286,7 @@ fun AppNavHost(container: AppContainer) {
             val go: (String) -> Unit = { route -> if (entry.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) nav.navigate(route) }
             SettingsScreen(vm = vm, onBack = entry.backOnce(nav), links = xendroid.compose.ui.settings.SettingsLinks(
                 onDrivers = { go(Routes.DRIVERS) },
+                onGameFolders = { go(Routes.GAME_FOLDERS) },
                 onGameSettings = { title -> games.byTitle[title]?.let { go(gameRoute(it, xendroid.compose.ui.game.GameSections.SETTINGS)) } },
                 onDiagnostics = { go("${Routes.DIAGNOSTICS}?title=") },
                 onCompare = { go(Routes.BENCHMARK) },
@@ -324,6 +333,11 @@ fun AppNavHost(container: AppContainer) {
         }
         composable(Routes.UPDATES) { entry ->
             xendroid.compose.updater.UpdateScreen(onBack = entry.backOnce(nav))
+        }
+        composable(Routes.GAME_FOLDERS) { entry ->
+            val libraryEntry = remember(entry) { nav.getBackStackEntry(Routes.LIBRARY) }
+            val library: GameLibraryViewModel = viewModel(libraryEntry, factory = container.libraryViewModelFactory())
+            xendroid.compose.ui.library.ManagedGameFoldersScreen(viewModel = library, onBack = entry.backOnce(nav))
         }
         composable(Routes.PROFILES) { entry ->
             val vm: ProfileManagerViewModel =

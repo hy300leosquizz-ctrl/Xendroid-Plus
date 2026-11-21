@@ -42,6 +42,11 @@ std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
 static std::atomic<ExceptionHandler::UnhandledFaultHook> unhandled_fault_hook_{
     nullptr};
 
+// Zero-copy fast path for watched-memory Data Aborts on ARM64 Linux/Android.
+static void* fast_av_data_ = nullptr;
+static std::atomic<ExceptionHandler::FastAccessViolationHandler> fast_av_fn_{
+    nullptr};
+
 static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                      void* signal_context) {
   if (signal_number == SIGSEGV &&
@@ -57,6 +62,49 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
     XELOGE("Fiber stack overflow: fault at {:X}",
            reinterpret_cast<uintptr_t>(signal_info->si_addr));
   }
+
+#if XE_ARCH_ARM64 && !XE_PLATFORM_MAC
+  // Zero-copy SIGSEGV/SIGBUS fast path: inspect ucontext_t.__reserved for
+  // esr_context (ESR_MAGIC = 0x45535201) directly and resolve watched-memory
+  // Data Aborts without copying GPRs or 2x512 B of NEON fpsimd_context.
+  if ((signal_number == SIGSEGV || signal_number == SIGBUS) && signal_info) {
+    if (ExceptionHandler::FastAccessViolationHandler fast_fn =
+            fast_av_fn_.load(std::memory_order_acquire)) {
+      const mcontext_t& fast_mc =
+          reinterpret_cast<const ucontext_t*>(signal_context)->uc_mcontext;
+      const uint8_t* const reserved_base =
+          reinterpret_cast<const uint8_t*>(fast_mc.__reserved);
+      constexpr size_t kReservedSize = sizeof(fast_mc.__reserved);
+      size_t offset = 0;
+      while (offset + sizeof(struct _aarch64_ctx) <= kReservedSize) {
+        const auto* ext = reinterpret_cast<const struct _aarch64_ctx*>(
+            reserved_base + offset);
+        if (!ext->magic || ext->size < sizeof(struct _aarch64_ctx) ||
+            (ext->size & 3) != 0 || offset + ext->size > kReservedSize) {
+          break;
+        }
+        if (ext->magic == ESR_MAGIC &&
+            ext->size >= sizeof(struct esr_context)) {
+          const uint64_t esr =
+              reinterpret_cast<const struct esr_context*>(ext)->esr;
+          // Data Abort EC: 0b100100 (lower EL) or 0b100101 (same EL).
+          if (((esr >> 26) & 0b111110) == 0b100100) {
+            constexpr uint64_t kEsrWnR = UINT64_C(1) << 6;
+            constexpr uint64_t kEsrCm = UINT64_C(1) << 8;
+            const bool is_write = (esr & (kEsrWnR | kEsrCm)) == kEsrWnR;
+            if (fast_fn(fast_av_data_, uint64_t(fast_mc.pc),
+                        reinterpret_cast<uint64_t>(signal_info->si_addr),
+                        is_write)) {
+              return;
+            }
+          }
+          break;
+        }
+        offset += ext->size;
+      }
+    }
+  }
+#endif  // XE_ARCH_ARM64 && !XE_PLATFORM_MAC
 #if XE_PLATFORM_MAC && XE_ARCH_ARM64
   // The Darwin kernel may pass an unaligned ucontext_t pointer to signal
   // handlers; copy into an aligned local before reading. mcontext_t is a
@@ -417,8 +465,6 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
           std::memcpy(&mcontext_fpsimd->vregs[modified_register_index],
                       &thread_context.v[modified_register_index],
                       sizeof(vec128_t));
-          mcontext.regs[modified_register_index] =
-              thread_context.x[modified_register_index];
         }
       }
 #endif  // XE_PLATFORM_MAC
@@ -478,6 +524,17 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   // faulting instruction terminates the process at the real fault site,
   // producing an accurate tombstone.
   signal(signal_number, SIG_DFL);
+}
+
+void ExceptionHandler::SetFastAccessViolationHandler(
+    FastAccessViolationHandler fn, void* data) {
+  if (fn) {
+    fast_av_data_ = data;
+    fast_av_fn_.store(fn, std::memory_order_release);
+  } else {
+    fast_av_fn_.store(nullptr, std::memory_order_release);
+    fast_av_data_ = nullptr;
+  }
 }
 
 void ExceptionHandler::SetUnhandledFaultHook(UnhandledFaultHook hook) {

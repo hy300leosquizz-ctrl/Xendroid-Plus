@@ -18,6 +18,7 @@
 
 #include "xenia/base/byte_order.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
@@ -29,6 +30,13 @@
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 #include "xenia/cpu/hir/instr.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+
+DEFINE_bool(
+    a64_fast_vmx_estimates, false,
+    "Use inline ARM64 NEON reciprocal / reciprocal-square-root estimate + "
+    "Newton-Raphson refinement (frsqrte+frsqrts / frecpe+frecps) for VMX "
+    "vrsqrtefp and vrefp instead of table-lookup helpers or full fdiv.",
+    "CPU");
 
 namespace xe {
 namespace cpu {
@@ -4407,30 +4415,85 @@ struct MUL_ADD_V128
                I<OPCODE_MUL_ADD, V128Op, V128Op, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     // dest = s1*s2 + s3 with VMX denormal flushing + PPC NaN propagation.
-    // Scratch register plan:
-    //   1. Flush s3 into v3, save to stack[32].
-    //   2. Flush s1/s2 into v0/v1, save to stack[0]/stack[16].
-    //   3. Restore s3 into v3, fmla into v2, NaN fixup, flush output.
     EmitWithVmxFpcr(e, [&] {
-      int d = i.dest.reg().getIdx();
+      const int d = i.dest.reg().getIdx();
+      if (e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+        if (!cvars::a64_vmx_nan_fixup) {
+          // Zero-spill fast path: hardware FZ flushes denormal inputs/outputs.
+          const int s1 = SrcVReg(e, i.src1, 0);
+          const int s2 = SrcVReg(e, i.src2, 1);
+          const int s3 = SrcVReg(e, i.src3, 2);
+          if (d != s1 && d != s2) {
+            if (d != s3) {
+              e.mov(VReg(d).b16, VReg(s3).b16);
+            }
+            e.fmla(VReg(d).s4, VReg(s1).s4, VReg(s2).s4);
+          } else {
+            if (s3 != 2) {
+              e.mov(VReg(2).b16, VReg(s3).b16);
+            }
+            e.fmla(VReg(2).s4, VReg(s1).s4, VReg(s2).s4);
+            e.mov(VReg(d).b16, VReg(2).b16);
+          }
+          return;
+        }
+        // Hardware FZ with PPC NaN fixup: keep sources in v0/v1/v3 and spill
+        // to the stack ONLY on the cold NaN tail path.
+        const int s1 = SrcVReg(e, i.src1, 0);
+        if (s1 != 0) {
+          e.mov(VReg(0).b16, VReg(s1).b16);
+        }
+        const int s2 = SrcVReg(e, i.src2, 1);
+        if (s2 != 1) {
+          e.mov(VReg(1).b16, VReg(s2).b16);
+        }
+        const int s3 = SrcVReg(e, i.src3, 3);
+        if (s3 != 3) {
+          e.mov(VReg(3).b16, VReg(s3).b16);
+        }
+        e.mov(VReg(2).b16, VReg(3).b16);
+        e.fmla(VReg(2).s4, VReg(0).s4, VReg(1).s4);
+        auto& done = e.NewCachedLabel();
+        auto& nan_tail =
+            e.AddToTail([&done](A64Emitter& e, Xbyak_aarch64::Label&) {
+              e.str(QReg(0),
+                    Xbyak_aarch64::ptr(
+                        e.sp,
+                        static_cast<int32_t>(StackLayout::GUEST_SCRATCH)));
+              e.str(QReg(1),
+                    Xbyak_aarch64::ptr(
+                        e.sp,
+                        static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 16));
+              e.str(QReg(3),
+                    Xbyak_aarch64::ptr(
+                        e.sp,
+                        static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 32));
+              FixupVmxNan_V128_Fma(e);
+              e.b(done);
+            });
+        // d >= 4 and all sources were copied to v0/v1/v3, so VReg(d) is free.
+        e.fcmeq(VReg(d).s4, VReg(2).s4, VReg(2).s4);
+        e.uminv(SReg(d), VReg(d).s4);
+        e.fmov(e.w0, SReg(d));
+        e.cbz(e.w0, nan_tail);
+        e.L(done);
+        e.mov(VReg(d).b16, VReg(2).b16);
+        return;
+      }
 
-      // Flush s3 → v3, save to stack slot 2.
+      // Software denormal-flushing fallback.
       int s3 = SrcVReg(e, i.src3, 3);
       if (s3 != 3) {
         e.mov(VReg(3).b16, VReg(s3).b16);
       }
-      if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-        FlushDenormals_V128(e, 3, 0, 1);
-      }
+      FlushDenormals_V128(e, 3, 0, 1);
       e.str(QReg(3),
             Xbyak_aarch64::ptr(
                 e.sp, static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 32));
 
-      // Flush s1/s2 → v0/v1, save to stack slots 0/1.
       int s1, s2;
       PrepareVmxFpSources(e, i.src1, i.src2, s1, s2);
       if (cvars::a64_vmx_nan_fixup) {
-        // These stack copies feed only the NaN fixup's slow-path lane reads.
         e.str(QReg(0),
               Xbyak_aarch64::ptr(
                   e.sp, static_cast<int32_t>(StackLayout::GUEST_SCRATCH)));
@@ -4439,24 +4502,16 @@ struct MUL_ADD_V128
                   e.sp, static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 16));
       }
 
-      // Restore flushed s3, compute fmla into v2 via copy.
-      // (The stack[32] spill/reload is kept in both cvar states: it also
-      // preserves flushed s3 across PrepareVmxFpSources, which clobbers
-      // v2/v3 when software denormal flushing is in use.)
       e.ldr(QReg(2),
             Xbyak_aarch64::ptr(
                 e.sp, static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 32));
       e.fmla(VReg(2).s4, VReg(s1).s4, VReg(s2).s4);
 
-      // PPC NaN fixup (sources on stack at offsets 0/16/32).
       if (cvars::a64_vmx_nan_fixup) {
         FixupVmxNan_V128_Fma(e);
       }
 
-      // Flush output denormals.
-      if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-        FlushDenormals_V128(e, 2, 0, 1);
-      }
+      FlushDenormals_V128(e, 2, 0, 1);
       e.mov(VReg(d).b16, VReg(2).b16);
     });
   }
@@ -4509,27 +4564,80 @@ struct MUL_SUB_V128
                I<OPCODE_MUL_SUB, V128Op, V128Op, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     // dest = s1*s2 - s3 with VMX denormal flushing + PPC NaN propagation.
-    // Same as MUL_ADD but negate s3 before the fmla.
     EmitWithVmxFpcr(e, [&] {
-      int d = i.dest.reg().getIdx();
+      const int d = i.dest.reg().getIdx();
+      if (e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+        if (!cvars::a64_vmx_nan_fixup) {
+          // Zero-spill fast path: negate s3 directly and fuse s1*s2 + (-s3).
+          const int s1 = SrcVReg(e, i.src1, 0);
+          const int s2 = SrcVReg(e, i.src2, 1);
+          const int s3 = SrcVReg(e, i.src3, 2);
+          if (d != s1 && d != s2) {
+            e.fneg(VReg(d).s4, VReg(s3).s4);
+            e.fmla(VReg(d).s4, VReg(s1).s4, VReg(s2).s4);
+          } else {
+            e.fneg(VReg(2).s4, VReg(s3).s4);
+            e.fmla(VReg(2).s4, VReg(s1).s4, VReg(s2).s4);
+            e.mov(VReg(d).b16, VReg(2).b16);
+          }
+          return;
+        }
+        // Hardware FZ with PPC NaN fixup: keep un-negated s3 in v3 and spill
+        // only on the cold NaN tail path.
+        const int s1 = SrcVReg(e, i.src1, 0);
+        if (s1 != 0) {
+          e.mov(VReg(0).b16, VReg(s1).b16);
+        }
+        const int s2 = SrcVReg(e, i.src2, 1);
+        if (s2 != 1) {
+          e.mov(VReg(1).b16, VReg(s2).b16);
+        }
+        const int s3 = SrcVReg(e, i.src3, 3);
+        if (s3 != 3) {
+          e.mov(VReg(3).b16, VReg(s3).b16);
+        }
+        e.fneg(VReg(2).s4, VReg(3).s4);
+        e.fmla(VReg(2).s4, VReg(0).s4, VReg(1).s4);
+        auto& done = e.NewCachedLabel();
+        auto& nan_tail =
+            e.AddToTail([&done](A64Emitter& e, Xbyak_aarch64::Label&) {
+              e.str(QReg(0),
+                    Xbyak_aarch64::ptr(
+                        e.sp,
+                        static_cast<int32_t>(StackLayout::GUEST_SCRATCH)));
+              e.str(QReg(1),
+                    Xbyak_aarch64::ptr(
+                        e.sp,
+                        static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 16));
+              e.str(QReg(3),
+                    Xbyak_aarch64::ptr(
+                        e.sp,
+                        static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 32));
+              FixupVmxNan_V128_Fma(e);
+              e.b(done);
+            });
+        e.fcmeq(VReg(d).s4, VReg(2).s4, VReg(2).s4);
+        e.uminv(SReg(d), VReg(d).s4);
+        e.fmov(e.w0, SReg(d));
+        e.cbz(e.w0, nan_tail);
+        e.L(done);
+        e.mov(VReg(d).b16, VReg(2).b16);
+        return;
+      }
 
-      // Flush s3 → v3, save un-negated for NaN fixup.
+      // Software denormal-flushing fallback.
       int s3 = SrcVReg(e, i.src3, 3);
       if (s3 != 3) {
         e.mov(VReg(3).b16, VReg(s3).b16);
       }
-      if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-        FlushDenormals_V128(e, 3, 0, 1);
-      }
+      FlushDenormals_V128(e, 3, 0, 1);
       e.str(QReg(3),
             Xbyak_aarch64::ptr(
                 e.sp, static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 32));
 
-      // Flush s1/s2 → v0/v1, save for NaN fixup.
       int s1, s2;
       PrepareVmxFpSources(e, i.src1, i.src2, s1, s2);
       if (cvars::a64_vmx_nan_fixup) {
-        // These stack copies feed only the NaN fixup's slow-path lane reads.
         e.str(QReg(0),
               Xbyak_aarch64::ptr(
                   e.sp, static_cast<int32_t>(StackLayout::GUEST_SCRATCH)));
@@ -4538,25 +4646,17 @@ struct MUL_SUB_V128
                   e.sp, static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 16));
       }
 
-      // Reload flushed s3, negate into v2, fmla: v2 = -s3 + s1*s2 = s1*s2 - s3.
-      // (The stack[32] spill/reload is kept in both cvar states: it also
-      // preserves flushed s3 across PrepareVmxFpSources, which clobbers
-      // v2/v3 when software denormal flushing is in use.)
       e.ldr(QReg(2),
             Xbyak_aarch64::ptr(
                 e.sp, static_cast<int32_t>(StackLayout::GUEST_SCRATCH) + 32));
       e.fneg(VReg(2).s4, VReg(2).s4);
       e.fmla(VReg(2).s4, VReg(s1).s4, VReg(s2).s4);
 
-      // PPC NaN fixup (sources on stack at offsets 0/16/32).
       if (cvars::a64_vmx_nan_fixup) {
         FixupVmxNan_V128_Fma(e);
       }
 
-      // Flush output denormals.
-      if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-        FlushDenormals_V128(e, 2, 0, 1);
-      }
+      FlushDenormals_V128(e, 2, 0, 1);
       e.mov(VReg(d).b16, VReg(2).b16);
     });
   }
@@ -4662,18 +4762,24 @@ EMITTER_OPCODE_TABLE(OPCODE_LOG2, LOG2_F32, LOG2_F64, LOG2_V128);
 // infinite. Takes the result in s0 and the sum in d1; clobbers v2, v3 and x17.
 static void EmitDotProductResult(A64Emitter& e, int dest_idx) {
   auto& done = e.NewCachedLabel();
-  e.fabs(SReg(2), SReg(0));
-  e.mov(e.w17, 0x7F800000u);  // +inf
-  e.fmov(SReg(3), e.w17);
-  e.fcmp(SReg(2), SReg(3));
-  e.b(Xbyak_aarch64::NE, done);
-  e.fabs(DReg(2), DReg(1));
-  e.mov(e.x17, 0x7FF0000000000000ULL);  // +inf
-  e.fmov(DReg(3), e.x17);
-  e.fcmp(DReg(2), DReg(3));
-  e.b(Xbyak_aarch64::EQ, done);
-  e.mov(e.w17, 0x7FC00000u);  // QNaN
-  e.fmov(SReg(0), e.w17);
+  auto& non_finite = e.AddToTail([&done](A64Emitter& e, Xbyak_aarch64::Label&) {
+    // Already NaN -> keep s0 as-is.
+    e.fcmp(SReg(0), SReg(0));
+    e.b(Xbyak_aarch64::VS, done);
+    // s0 is +-inf. If d1 was also +-inf (d1 - d1 is NaN -> VS), keep +-inf;
+    // if d1 was finite, narrowing overflowed -> return PPC QNaN (0x7FC00000).
+    e.fsub(DReg(2), DReg(1), DReg(1));
+    e.fcmp(DReg(2), DReg(2));
+    e.b(Xbyak_aarch64::VS, done);
+    e.mov(e.w17, 0x7FC00000u);  // QNaN
+    e.fmov(SReg(0), e.w17);
+    e.b(done);
+  });
+  // Finite s0 gives s0 - s0 == +0.0 (VC); +-inf or NaN gives QNaN (VS) and
+  // branches to the cold tail without any GPR->FPR transfer on the hot path.
+  e.fsub(SReg(2), SReg(0), SReg(0));
+  e.fcmp(SReg(2), SReg(2));
+  e.b(Xbyak_aarch64::VS, non_finite);
   e.L(done);
   // Splat result to all 4 lanes.
   e.dup(VReg(dest_idx).s4, VReg(0).s4[0]);
@@ -4732,13 +4838,12 @@ struct DOT_PRODUCT_4_V128
       e.fcvtl2(VReg(2).d2, VReg(s1).s4);
       e.fcvtl2(VReg(3).d2, VReg(s2).s4);
       e.fmul(VReg(2).d2, VReg(2).d2, VReg(3).d2);
-      // Widen low 2 floats to double, multiply.
+      // Widen low 2 floats to double and fuse multiply-accumulate into v2
+      // (f32*f32 has 48 mantissa bits <= 53 in f64, so fmla.2d is bit-exact).
       e.fcvtl(VReg(0).d2, VReg(s1).s2);
       e.fcvtl(VReg(1).d2, VReg(s2).s2);
-      e.fmul(VReg(0).d2, VReg(0).d2, VReg(1).d2);
-      // Sum all 4 products: v0 = {a0*b0+a2*b2, a1*b1+a3*b3}
-      e.fadd(VReg(0).d2, VReg(0).d2, VReg(2).d2);
-      e.faddp(DReg(1), VReg(0).d2);
+      e.fmla(VReg(2).d2, VReg(0).d2, VReg(1).d2);
+      e.faddp(DReg(1), VReg(2).d2);
       // Convert back to float.
       e.fcvt(SReg(0), DReg(1));
       EmitDotProductResult(e, d);
@@ -4867,6 +4972,32 @@ struct RSQRT_F64 : Sequence<RSQRT_F64, I<OPCODE_RSQRT, F64Op, F64Op>> {
 };
 struct RSQRT_V128 : Sequence<RSQRT_V128, I<OPCODE_RSQRT, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    if (cvars::a64_fast_vmx_estimates) {
+      EmitWithVmxFpcr(e, [&] {
+        const int d = i.dest.reg().getIdx();
+        const int s = SrcVReg(e, i.src1, 1);
+        if (s != 1) {
+          e.mov(VReg(1).b16, VReg(s).b16);
+        }
+        if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+          FlushDenormals_V128(e, 1, 2, 3);
+        }
+        // Hardware estimate + 1 Newton-Raphson step, masking special lanes
+        // (+-0 -> +-inf, <0 -> QNaN, +inf -> +0, NaN -> QNaN) where frsqrts
+        // turns 0 * inf into NaN.
+        e.frsqrte(VReg(0).s4, VReg(1).s4);
+        e.fmul(VReg(2).s4, VReg(0).s4, VReg(0).s4);
+        e.frsqrts(VReg(2).s4, VReg(1).s4, VReg(2).s4);
+        e.fcmeq(VReg(3).s4, VReg(2).s4, VReg(2).s4);
+        e.fmul(VReg(2).s4, VReg(0).s4, VReg(2).s4);
+        e.bsl(VReg(3).b16, VReg(2).b16, VReg(0).b16);
+        if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+          FlushDenormals_V128(e, 3, 0, 1);
+        }
+        e.mov(VReg(d).b16, VReg(3).b16);
+      });
+      return;
+    }
     const int src_idx = SrcVReg(e, i.src1, 0);
     // The vast majority of inputs to vrsqrte come from vmsum3 or vmsum4 as part
     // of a vector normalization sequence, where every lane holds the same value
@@ -4929,6 +5060,30 @@ struct RECIP_F64 : Sequence<RECIP_F64, I<OPCODE_RECIP, F64Op, F64Op>> {
 };
 struct RECIP_V128 : Sequence<RECIP_V128, I<OPCODE_RECIP, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    if (cvars::a64_fast_vmx_estimates) {
+      EmitWithVmxFpcr(e, [&] {
+        const int d = i.dest.reg().getIdx();
+        const int s = SrcVReg(e, i.src1, 1);
+        if (s != 1) {
+          e.mov(VReg(1).b16, VReg(s).b16);
+        }
+        if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+          FlushDenormals_V128(e, 1, 2, 3);
+        }
+        // Hardware estimate + 1 Newton-Raphson step, masking special lanes
+        // (+-0 -> +-inf, +-inf -> +-0, NaN -> QNaN) where frecps produces NaN.
+        e.frecpe(VReg(0).s4, VReg(1).s4);
+        e.frecps(VReg(2).s4, VReg(1).s4, VReg(0).s4);
+        e.fcmeq(VReg(3).s4, VReg(2).s4, VReg(2).s4);
+        e.fmul(VReg(2).s4, VReg(0).s4, VReg(2).s4);
+        e.bsl(VReg(3).b16, VReg(2).b16, VReg(0).b16);
+        if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+          FlushDenormals_V128(e, 3, 0, 1);
+        }
+        e.mov(VReg(d).b16, VReg(3).b16);
+      });
+      return;
+    }
     EmitWithVmxFpcr(e, [&] {
       if (i.src1.is_constant) {
         LoadV128Const(e, 1, i.src1.constant());

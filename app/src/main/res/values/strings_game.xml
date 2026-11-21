@@ -179,4 +179,7 @@
     <string name="xd_hud_battery_time">Battery time</string>
     <string name="menu_chip_charge">Charge</string>
     <string name="menu_chip_battery_time">Battery time</string>
+    <string name="xd_hud_controller_battery">Pad</string>
+    <string name="menu_chip_controller_battery">Pad battery</string>
+    <string name="host_glitch_saved">6s diagnostic glitch snapshot saved</string>
 </resources>

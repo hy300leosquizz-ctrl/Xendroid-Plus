@@ -87,6 +87,18 @@ class SlotInputRouterTest {
         assertTrue(sent.none { it.startsWith("P2:14:up") })
     }
 
+    @Test fun forgettingAHeldTriggerKeyAdoptsItIntoAxisTrackingEvenOnRemappedButton() {
+        // P2 in Both mode with L2 mapped to guest A (4): digital press arrives before LT crosses deadzone (0.25f <= 0.5f).
+        router.keyDown(1, identity = 7, key = 4)
+        sent.clear()
+        router.forget(1, identity = 7)
+        router.motion(1, lx = 0f, ly = 0f, rx = 0f, ry = 0f, lt = 0.25f, rt = 0f, hatX = 0f, hatY = 0f, ltKey = 4, rtKey = 15)
+        assertEquals(listOf("P2:4:up:-1"), sent.filter { it.startsWith("P2:4:") })
+        sent.clear()
+        router.motion(1, lx = 0f, ly = 0f, rx = 0f, ry = 0f, lt = 0f, rt = 0f, hatX = 0f, hatY = 0f, ltKey = 4, rtKey = 15)
+        assertEquals(emptyList<String>(), sent)
+    }
+
     @Test fun releasingAPlayerReleasesOnlyWhatItsControllerHeld() {
         router.keyDown(1, 7, 4)
         router.motion(1, lx = 1f, ly = 0f, rx = 0f, ry = 0f, lt = 0f, rt = 1f, hatX = 0f, hatY = -1f)

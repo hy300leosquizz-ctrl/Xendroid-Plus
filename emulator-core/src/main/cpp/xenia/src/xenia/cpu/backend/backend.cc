@@ -12,6 +12,8 @@
 #include <cstring>
 
 #include "xenia/base/byte_order.h"
+#include "xenia/base/platform.h"
+#include "xenia/base/threading.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 
 namespace xe {
@@ -33,6 +35,25 @@ void Backend::FreeThreadData(void* thread_data) {}
 void (*preempt_yield_handler)(void* raw_context) = nullptr;
 
 bool (*spin_backoff_yield_handler)(void* raw_context) = nullptr;
+
+uint32_t AwaitReserveGranule(const std::atomic<uint32_t>& granule) {
+  // Bounded so a claim that never ends leaves the guest loop at its safepoint.
+  constexpr uint32_t kSpinsPerYield = 64;
+  constexpr uint32_t kYields = 4;
+  uint32_t generation = granule.load(std::memory_order_acquire);
+  for (uint32_t yields = 0; (generation & 1) && yields < kYields; ++yields) {
+    for (uint32_t spins = 0; (generation & 1) && spins < kSpinsPerYield;
+         ++spins) {
+      SpinPause();
+      generation = granule.load(std::memory_order_acquire);
+    }
+    if (generation & 1) {
+      threading::MaybeYield();
+      generation = granule.load(std::memory_order_acquire);
+    }
+  }
+  return generation;
+}
 
 uint32_t Backend::ReservedLoad32(ppc::PPCContext* context, uint32_t address) {
   return xe::byte_swap(*context->TranslateVirtual<uint32_t*>(address));

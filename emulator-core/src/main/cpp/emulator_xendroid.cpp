@@ -39,6 +39,8 @@
 
 #include "xenia/vfs/devices/disc_image_device.h"     // real-path DiscImageDevice (ISO)
 #include "xenia/vfs/devices/disc_zarchive_device.h"  // real-path DiscZarchiveDevice (.zar)
+#include "xenia/vfs/devices/host_path_device.h"      // extracted .xex folder -> .zar
+#include "xenia/vfs/devices/xcontent_container_device.h" // GOD / SVOD / STFS -> .zar
 #include "xenia/vfs/file.h"                           // vfs::File::ReadSync
 #include "xenia/vfs/iso_metadata.h"                   // ExtractIsoMetadata(path)
 #include "xenia/vfs/zar_metadata.h"                   // ExtractZarMetadata(path)
@@ -46,13 +48,16 @@
 #include "xenia/vfs/stfs_metadata.h"                  // ExtractStfsMetadata(path)
 #include "xenia/vfs/content_install_standalone.h"     // InstallContentPackageStandalone
 #include "xenia/vfs/fatx_package_name.h"              // FatxPackageName
+#include "xenia/vfs/saf_tree_device.h"                // Android SAF tree + document FD VFS
 #include "xenia/kernel/xam/profile_standalone.h"       // CreateStandaloneProfile / ListStandaloneProfiles / RenameStandaloneProfile
 
 #include <cstdio>
+#include <dlfcn.h>
 
 #include "cpuinfo.h"
 #include "vkapi.h"
 #include "vkutil.h"
+#include "third_party/libadrenotools/include/adrenotools/driver.h"
 
 //#include "cpptoml/include/cpptoml.h"
 
@@ -67,6 +72,7 @@ std::vector<std::string> g_launch_args;
 std::string g_uri_info_list_file_path;
 std::string g_native_lib_dir;
 static void j_setup_context(JNIEnv* env,jobject self,jobject context ){
+    xe::vfs::saf::ScopedJniEnv::SetJavaVmFromEnv(env);
     g_context = env->NewGlobalRef(context);
     //getApplicationInfo().nativeLibraryDir;
     jmethodID mid_get_application_info = env->GetMethodID(env->GetObjectClass(context), "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
@@ -582,6 +588,23 @@ static jobject j_meta_from_path(JNIEnv* env, jobject self,
 
     switch (format) {
         case TID_FMT_XEX_FOLDER: {
+            const std::string p_utf8 = xe::path_to_utf8(p);
+            if (xe::vfs::saf::IsSafContentUri(p_utf8)) {
+                int fd = xe::vfs::saf::OpenUriReadFd(p_utf8);
+                if (fd >= 0) {
+                    auto mmap = xe::MappedMemory::OpenForUnixFd(fd);
+                    if (mmap) {
+                        meta = extract_xex_meta(mmap->data(), mmap->size());
+                    }
+                } else {
+                    xe::vfs::SafTreeDevice dev("\\Device\\Package_0", p_utf8);
+                    if (dev.Initialize()) {
+                        auto xex = read_vfs_entry_bytes(dev.ResolvePath("default.xex"));
+                        if (!xex.empty()) meta = extract_xex_meta(xex.data(), xex.size());
+                    }
+                }
+                break;
+            }
             // path already points at default.xex; mmap its bytes directly.
             std::unique_ptr<xe::MappedMemory> mmap =
                     xe::MappedMemory::Open(p, xe::MappedMemory::Mode::kRead);
@@ -1288,10 +1311,22 @@ static jstring j_active_driver_identity(JNIEnv* env, jobject thiz) {
 static jlongArray j_presenter_work(JNIEnv* env, jobject thiz) {
     const auto& runtime = xe::ui::RuntimePresentation();
     const jlong values[] = {runtime.presenter_tid.load(), runtime.presenter_work_ns.load(),
-        static_cast<jlong>(runtime.presenter_work_sequence.load(std::memory_order_acquire))};
-    auto array = env->NewLongArray(3);
-    if (array) env->SetLongArrayRegion(array, 0, 3, values);
+        static_cast<jlong>(runtime.presenter_work_sequence.load(std::memory_order_acquire)),
+        runtime.presenter_adpf_state.load(std::memory_order_relaxed)};
+    auto array = env->NewLongArray(4);
+    if (array) env->SetLongArrayRegion(array, 0, 4, values);
     return array;
+}
+static void j_set_presenter_adpf_target(JNIEnv* env, jobject thiz, jlong target_ns) {
+    auto& runtime = xe::ui::RuntimePresentation();
+    const int64_t clamped = target_ns > 0 ? int64_t(target_ns) : 0;
+    runtime.presenter_adpf_target_ns.store(clamped, std::memory_order_relaxed);
+    void (*sync)(int64_t) = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runtime.configuration_mutex);
+        sync = runtime.presenter_adpf_sync;
+    }
+    if (sync) sync(clamped);
 }
 // The diagnostic build's "Capture frame" (ae::request_frame_trace).
 static jboolean j_frame_trace_available(JNIEnv* env, jobject thiz) { return ae::frame_trace_available(); }
@@ -1569,19 +1604,69 @@ static jint j_compressIsoToZar(JNIEnv* env, jobject self, jstring isoPath,
     env->ReleaseStringUTFChars(isoPath, ip);
     env->ReleaseStringUTFChars(outZarPath, op);
 
-    // Mount the ISO from its real host path via the core real-path DiscImageDevice.
-    // RAII frees the mmap on scope exit; the device walk stays entirely native.
-    auto dev = std::make_unique<xe::vfs::DiscImageDevice>("\\Device\\Cdrom0", in);
-    if (!dev->Initialize()) return (jint)X_STATUS_UNSUCCESSFUL;  // not XDVDFS / corrupt
+    // Multi-format VFS mount for .zar compression:
+    // 1) Extracted .xex folder (directory path, path to default.xex, or SAF tree)
+    // 2) GOD / SVOD / STFS container (XContentContainerDevice)
+    // 3) .iso / XISO disc image (DiscImageDevice via pread64)
+    std::unique_ptr<xe::vfs::Device> dev;
+    const std::string in_utf8 = xe::path_to_utf8(in);
+    std::error_code in_ec;
+
+    if (xe::vfs::saf::IsSafContentUri(in_utf8)) {
+        if (xe::vfs::XContentContainerDevice::IsContainerFile(in)) {
+            dev = xe::vfs::XContentContainerDevice::CreateContentDevice("\\Device\\Cdrom0", in);
+            if (dev && !dev->Initialize()) dev.reset();
+        }
+        if (!dev) {
+            auto iso_dev = std::make_unique<xe::vfs::DiscImageDevice>("\\Device\\Cdrom0", in);
+            if (iso_dev->Initialize()) {
+                dev = std::move(iso_dev);
+            }
+        }
+        if (!dev) {
+            std::string parent_doc_id;
+            std::string leaf_name;
+            const bool has_parent = xe::vfs::saf::DeriveSafParentDocumentId(
+                    in_utf8, parent_doc_id, leaf_name);
+            auto saf_dev = std::make_unique<xe::vfs::SafTreeDevice>(
+                    "\\Device\\Cdrom0", in_utf8, has_parent ? parent_doc_id : std::string());
+            if (saf_dev->Initialize()) {
+                dev = std::move(saf_dev);
+            }
+        }
+    } else if (std::filesystem::is_directory(in, in_ec)) {
+        auto host_dev = std::make_unique<xe::vfs::HostPathDevice>("\\Device\\Cdrom0", in, true);
+        if (host_dev->Initialize()) {
+            dev = std::move(host_dev);
+        }
+    } else {
+        if (xe::utf8::equal_case(xe::path_to_utf8(in.extension()), ".xex")) {
+            auto host_dev = std::make_unique<xe::vfs::HostPathDevice>(
+                    "\\Device\\Cdrom0", in.parent_path(), true);
+            if (host_dev->Initialize()) {
+                dev = std::move(host_dev);
+            }
+        } else if (xe::vfs::XContentContainerDevice::IsContainerFile(in)) {
+            dev = xe::vfs::XContentContainerDevice::CreateContentDevice("\\Device\\Cdrom0", in);
+            if (dev && !dev->Initialize()) dev.reset();
+        } else {
+            auto iso_dev = std::make_unique<xe::vfs::DiscImageDevice>("\\Device\\Cdrom0", in);
+            if (iso_dev->Initialize()) {
+                dev = std::move(iso_dev);
+            }
+        }
+    }
+
+    if (!dev) return (jint)X_STATUS_UNSUCCESSFUL;
 
     // Transient emulator: the zar ops touch no runtime state -- same pattern as
     // the metadata probes. It never boots a title.
     auto emulator = std::make_unique<xe::Emulator>("", "", "", "");
-    g_zar_progress_total.store(0);  // reset so the getter reads 0 until the pre-walk
+    g_zar_progress_total.store(0);
     g_zar_progress_done.store(0);
     xe::X_STATUS s = emulator->CompressDiscToZarchive(
             dev.get(), out, &g_zar_progress_done, &g_zar_progress_total);
-    return (jint)s;  // dev (mmap) freed here on scope exit
+    return (jint)s;
 #else
     return (jint)X_STATUS_UNSUCCESSFUL;
 #endif
@@ -2129,7 +2214,226 @@ static void j_disc_set_known(JNIEnv* env, jobject self, jobjectArray labels,
 #endif
 }
 
+// Isolated `:driver_probe` process probe: opens a custom Vulkan ICD via
+// libadrenotools (on Adreno KGSL / namespace-isolated loaders) with fallback
+// to direct dlopen (for Arm Mali PanVK and Samsung Xclipse ICDs), and exercises
+// vkCreateInstance -> vkEnumeratePhysicalDevices -> vkCreateDevice -> teardown.
+extern "C" JNIEXPORT jstring JNICALL
+Java_xendroid_compose_driver_DriverProbeActivity_nativeProbeVulkanDriver(
+    JNIEnv* env, jclass /*cls*/, jstring j_driver_path,
+    jstring j_native_lib_dir) {
+    if (!j_driver_path) {
+        return env->NewStringUTF("ERR|Missing driver library path");
+    }
+    const char* raw_chars = env->GetStringUTFChars(j_driver_path, nullptr);
+    if (!raw_chars) {
+        return env->NewStringUTF("ERR|Out of memory reading driver path");
+    }
+    std::string custom_path(raw_chars);
+    env->ReleaseStringUTFChars(j_driver_path, raw_chars);
+
+    std::string passed_native_dir;
+    if (j_native_lib_dir) {
+        if (const char* nd = env->GetStringUTFChars(j_native_lib_dir, nullptr)) {
+            passed_native_dir = nd;
+            env->ReleaseStringUTFChars(j_native_lib_dir, nd);
+        }
+    }
+
+    if (custom_path.empty() || !std::filesystem::exists(custom_path)) {
+        return env->NewStringUTF("ERR|Driver shared library does not exist");
+    }
+
+    const size_t slash = custom_path.find_last_of('/');
+    if (slash == std::string::npos) {
+        return env->NewStringUTF("ERR|Invalid driver path");
+    }
+    std::string custom_dir = custom_path.substr(0, slash + 1);
+    std::string custom_name = custom_path.substr(slash + 1);
+    const std::string& resolved_native_dir =
+        !passed_native_dir.empty() ? passed_native_dir : g_native_lib_dir;
+    std::string hook_dir = resolved_native_dir.empty()
+                               ? custom_dir
+                               : (resolved_native_dir.back() == '/'
+                                      ? resolved_native_dir
+                                      : (resolved_native_dir + '/'));
+
+    const bool has_kgsl = std::filesystem::exists("/dev/kgsl-3d0");
+    int driver_flags = ADRENOTOOLS_DRIVER_CUSTOM;
+    if (has_kgsl) {
+        driver_flags |= ADRENOTOOLS_DRIVER_CONTEXT_PRIORITY;
+    }
+
+    // Attempt libadrenotools namespace-bridged loading first across all mobile
+    // GPU vendors (Adreno Turnip, Mali PanVK, Samsung Xclipse), matching
+    // VulkanInstance::Create, then fall back to direct dlopen.
+    void* handle = adrenotools_open_libvulkan(
+        RTLD_NOW, driver_flags, nullptr, hook_dir.c_str(),
+        custom_dir.c_str(), custom_name.c_str(), nullptr, nullptr);
+    if (!handle) {
+        handle = dlopen(custom_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!handle) {
+        const char* err = dlerror();
+        std::string msg = std::string("ERR|dlopen failed: ") + (err ? err : "unknown error");
+        return env->NewStringUTF(msg.c_str());
+    }
+
+    auto close_handle = [&]() {
+        if (handle) {
+            dlclose(handle);
+            handle = nullptr;
+        }
+    };
+
+    auto get_inst_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        dlsym(handle, "vkGetInstanceProcAddr"));
+    if (!get_inst_proc) {
+        get_inst_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+            dlsym(handle, "vk_icdGetInstanceProcAddr"));
+    }
+    auto create_inst = get_inst_proc
+        ? reinterpret_cast<PFN_vkCreateInstance>(get_inst_proc(VK_NULL_HANDLE, "vkCreateInstance"))
+        : nullptr;
+    if (!create_inst) {
+        create_inst = reinterpret_cast<PFN_vkCreateInstance>(dlsym(handle, "vkCreateInstance"));
+    }
+    if (!create_inst || !get_inst_proc) {
+        close_handle();
+        return env->NewStringUTF("ERR|Missing vkGetInstanceProcAddr / vkCreateInstance entry point");
+    }
+
+    VkApplicationInfo app_info = {};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "xendroid-driver-probe";
+    app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    app_info.pEngineName = "xendroid";
+    app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    app_info.apiVersion = VK_API_VERSION_1_0;
+
+    VkInstanceCreateInfo inst_ci = {};
+    inst_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    inst_ci.pApplicationInfo = &app_info;
+
+    VkInstance instance = VK_NULL_HANDLE;
+    VkResult res = create_inst(&inst_ci, nullptr, &instance);
+    if (res != VK_SUCCESS || instance == VK_NULL_HANDLE) {
+        close_handle();
+        std::string msg = "ERR|vkCreateInstance failed (VkResult " + std::to_string(int(res)) + ")";
+        return env->NewStringUTF(msg.c_str());
+    }
+
+    auto destroy_inst = reinterpret_cast<PFN_vkDestroyInstance>(
+        get_inst_proc(instance, "vkDestroyInstance"));
+    auto enum_pdevs = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+        get_inst_proc(instance, "vkEnumeratePhysicalDevices"));
+    auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        get_inst_proc(instance, "vkGetPhysicalDeviceProperties"));
+    auto get_qprops = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+        get_inst_proc(instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+    auto create_dev = reinterpret_cast<PFN_vkCreateDevice>(
+        get_inst_proc(instance, "vkCreateDevice"));
+    auto get_dev_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+        get_inst_proc(instance, "vkGetDeviceProcAddr"));
+
+    if (!enum_pdevs || !get_props || !get_qprops || !create_dev) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        return env->NewStringUTF("ERR|Incomplete Vulkan 1.0 instance dispatch table");
+    }
+
+    uint32_t pdev_count = 0;
+    if (enum_pdevs(instance, &pdev_count, nullptr) != VK_SUCCESS || pdev_count == 0) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        return env->NewStringUTF("ERR|No compatible Vulkan physical device reported by driver");
+    }
+    std::vector<VkPhysicalDevice> pdevs(pdev_count);
+    if (enum_pdevs(instance, &pdev_count, pdevs.data()) != VK_SUCCESS || pdevs.empty()) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        return env->NewStringUTF("ERR|vkEnumeratePhysicalDevices failed");
+    }
+
+    VkPhysicalDevice pdev = pdevs[0];
+    VkPhysicalDeviceProperties props = {};
+    get_props(pdev, &props);
+
+    uint32_t qcount = 0;
+    get_qprops(pdev, &qcount, nullptr);
+    if (qcount == 0) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        return env->NewStringUTF("ERR|Driver reported zero Vulkan queue families");
+    }
+    std::vector<VkQueueFamilyProperties> qprops(qcount);
+    get_qprops(pdev, &qcount, qprops.data());
+
+    uint32_t chosen_q = 0;
+    for (uint32_t i = 0; i < qcount; ++i) {
+        if ((qprops[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+                (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT) &&
+            qprops[i].queueCount > 0) {
+            chosen_q = i;
+            break;
+        }
+    }
+
+    const float qprio = 1.0f;
+    VkDeviceQueueCreateInfo qci = {};
+    qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qci.queueFamilyIndex = chosen_q;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &qprio;
+
+    VkDeviceCreateInfo dev_ci = {};
+    dev_ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dev_ci.queueCreateInfoCount = 1;
+    dev_ci.pQueueCreateInfos = &qci;
+
+    VkDevice device = VK_NULL_HANDLE;
+    VkResult dev_res = create_dev(pdev, &dev_ci, nullptr, &device);
+    if (dev_res != VK_SUCCESS || device == VK_NULL_HANDLE) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        std::string msg = "ERR|vkCreateDevice failed (VkResult " + std::to_string(int(dev_res)) + ")";
+        return env->NewStringUTF(msg.c_str());
+    }
+
+    PFN_vkDestroyDevice destroy_dev = nullptr;
+    if (get_dev_proc) {
+        destroy_dev = reinterpret_cast<PFN_vkDestroyDevice>(
+            get_dev_proc(device, "vkDestroyDevice"));
+    }
+    if (!destroy_dev) {
+        destroy_dev = reinterpret_cast<PFN_vkDestroyDevice>(
+            get_inst_proc(instance, "vkDestroyDevice"));
+    }
+    if (destroy_dev) {
+        destroy_dev(device, nullptr);
+    }
+    if (destroy_inst) {
+        destroy_inst(instance, nullptr);
+    }
+    close_handle();
+
+    std::string device_name(props.deviceName);
+    for (char& ch : device_name) {
+        if (ch == '|' || ch == '\n' || ch == '\r') ch = ' ';
+    }
+    if (!is_well_formed_utf8(device_name)) {
+        device_name = "Vulkan GPU";
+    }
+    std::ostringstream ver;
+    ver << VK_VERSION_MAJOR(props.apiVersion) << "."
+        << VK_VERSION_MINOR(props.apiVersion) << "."
+        << VK_VERSION_PATCH(props.apiVersion);
+    std::string reply = "OK|" + device_name + "|" + ver.str();
+    return env->NewStringUTF(reply.c_str());
+}
+
 int register_xendroid_Emulator(JNIEnv* env){
+    xe::vfs::saf::ScopedJniEnv::SetJavaVmFromEnv(env);
 
     g_class_Emulator = env->FindClass("xendroid/compose/Emulator");
     g_class_Emulator = (jclass)env->NewGlobalRef(g_class_Emulator);
@@ -2167,6 +2471,7 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"frame_trace_available", "()Z", (void *) j_frame_trace_available}
             ,{"request_frame_trace", "()Z", (void *) j_request_frame_trace}
             ,{"presenter_work", "()[J", (void *) j_presenter_work}
+            ,{"set_presenter_adpf_target", "(J)V", (void *) j_set_presenter_adpf_target}
             ,{"set_frame_generation", "(ZIF)V", (void *) j_set_frame_generation}
             ,{"set_zerofg_mode", "(I)V", (void *) j_set_zerofg_mode}
             ,{"zerofg_mode", "()I", (void *) j_zerofg_mode}

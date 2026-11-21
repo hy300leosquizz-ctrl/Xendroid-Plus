@@ -10,8 +10,11 @@
 #ifndef XENIA_VFS_DEVICES_XCONTENT_DEVICES_STFS_CONTAINER_DEVICE_H_
 #define XENIA_VFS_DEVICES_XCONTENT_DEVICES_STFS_CONTAINER_DEVICE_H_
 
+#include <memory>
+#include <span>
 #include <unordered_map>
 
+#include "xenia/base/filesystem.h"
 #include "xenia/kernel/util/xex2_info.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
@@ -25,7 +28,11 @@ namespace vfs {
 class StfsContainerDevice : public XContentContainerDevice {
  public:
   StfsContainerDevice(const std::string_view mount_path,
-                      const std::filesystem::path& host_path);
+                      const std::filesystem::path& host_path,
+                      std::unique_ptr<XContentContainerHeader> header,
+                      size_t files_size,
+                      std::unique_ptr<xe::filesystem::FileHandle> host_file);
+  StfsContainerDevice(const std::string_view mount_path, File* package_file);
   ~StfsContainerDevice() override;
 
   bool is_read_only() const override {
@@ -53,6 +60,9 @@ class StfsContainerDevice : public XContentContainerDevice {
     return 0;
   }
 
+  bool ReadData(size_t offset, std::span<uint8_t> buffer) const;
+  size_t ReadDataUpTo(size_t offset, std::span<uint8_t> buffer) const;
+
  private:
   static const uint8_t kBlocksHashLevelAmount = 3;
   const uint32_t kBlocksPerHashLevel[kBlocksHashLevelAmount] = {170, 28900,
@@ -76,9 +86,9 @@ class StfsContainerDevice : public XContentContainerDevice {
   const uint8_t GetAmountOfHashLevelsToCheck(uint32_t total_block_count) const;
 
   const StfsHashEntry* GetBlockHash(uint32_t block_index);
-  void UpdateCachedHashTable(uint32_t block_index, uint8_t hash_level,
+  bool UpdateCachedHashTable(uint32_t block_index, uint8_t hash_level,
                              uint32_t& secondary_table_offset);
-  void UpdateCachedHashTables(uint32_t block_index,
+  bool UpdateCachedHashTables(uint32_t block_index,
                               uint8_t highest_hash_level_to_update,
                               uint32_t& secondary_table_offset);
   const uint8_t GetBlocksPerHashTableFromContainerHeader() const;
@@ -86,12 +96,9 @@ class StfsContainerDevice : public XContentContainerDevice {
   uint8_t blocks_per_hash_table_;
   uint32_t block_step_[2];
 
-  // Set when a hash-table read would fall past the mapped file (corrupt /
-  // truncated package); Read() converts it into Result::kReadError.
-  bool hash_table_out_of_bounds_ = false;
-
   std::unordered_map<size_t, StfsHashTable> cached_hash_tables_;
-  std::unique_ptr<MappedMemory> data_;
+  // Read via FileHandle (pread) rather than mapping the whole container.
+  std::unique_ptr<xe::filesystem::FileHandle> host_file_;
 };
 
 }  // namespace vfs

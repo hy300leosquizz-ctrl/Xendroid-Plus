@@ -166,11 +166,11 @@ class Param {
 template <>
 inline void Param::LoadValue<float>(Param::Init& init, float* out_value) {
   *out_value =
-      static_cast<float>(init.ppc_context->f[1 + ++init.float_ordinal]);
+      static_cast<float>(init.ppc_context->f[1 + init.float_ordinal++]);
 }
 template <>
 inline void Param::LoadValue<double>(Param::Init& init, double* out_value) {
-  *out_value = init.ppc_context->f[1 + ++init.float_ordinal];
+  *out_value = init.ppc_context->f[1 + init.float_ordinal++];
 }
 template <typename T>
 class ParamBase : public Param {
@@ -351,7 +351,11 @@ class ResultBase : public Result {
  public:
   ResultBase(T value) : value_(value) {}
   void Store(PPCContext* ppc_context) {
-    ppc_context->r[3] = uint64_t(int32_t(value_));
+    if constexpr (sizeof(T) == sizeof(uint64_t)) {
+      ppc_context->r[3] = uint64_t(value_);
+    } else {
+      ppc_context->r[3] = uint64_t(int32_t(value_));
+    }
   }
   ResultBase() = delete;
   ResultBase& operator=(const ResultBase&) = delete;
@@ -453,7 +457,7 @@ inline void AppendParam(StringBuffer* string_buffer, lpstring_t param) {
 inline void AppendParam(StringBuffer* string_buffer, lpu16string_t param) {
   string_buffer->AppendHexUInt32(param.guest_address());
   if (param) {
-    string_buffer->AppendFormat("({})", xe::to_utf8(param.value()));
+    string_buffer->AppendFormat("({})", xe::to_utf8_lossy(param.value()));
   }
 }
 inline void AppendParam(StringBuffer* string_buffer,

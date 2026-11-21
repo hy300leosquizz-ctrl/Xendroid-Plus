@@ -703,9 +703,13 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
       }
     }
   }
-  auto fn = thread_state->processor()->ResolveFunction(
-      static_cast<uint32_t>(target_address));
-  assert_not_null(fn);
+  uint32_t address = static_cast<uint32_t>(target_address);
+  auto fn =
+      thread_state->processor()->ResolveCallTarget(guest_context, &address);
+  if (!fn) {
+    XELOGE("No guest code at {:08X} for a call", address);
+    return 0;
+  }
   auto x64_fn = static_cast<X64Function*>(fn);
   uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
 
@@ -808,6 +812,22 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
     if (reg.cvt32() != edx) {
       mov(edx, reg.cvt32());
     }
+    // Without dynamic code, a target the table doesn't cover goes to the
+    // resolve thunk, since its slot would be read from whatever the host maps
+    // there. Returns, the most common sites, are left to RedirectUncoveredCall.
+    Xbyak::Label table_slot;
+    Xbyak::Label slot_ready;
+    const bool check_range = !processor()->dynamic_code_enabled() &&
+                             !(instr->flags & hir::CALL_POSSIBLE_RETURN);
+    if (check_range) {
+      mov(eax, edx);
+      sub(eax, code_cache_->indirection_guest_base());
+      cmp(eax, code_cache_->indirection_guest_size());
+      jb(table_slot, T_SHORT);
+      mov(rax, reinterpret_cast<uint64_t>(backend()->resolve_function_thunk()));
+      jmp(slot_ready, code_cache_->encoded_indirection() ? T_NEAR : T_SHORT);
+      L(table_slot);
+    }
     if (!code_cache_->encoded_indirection()) {
       // Fast path: table mapped at host VA == guest addr; slot holds raw
       // 32-bit host target.
@@ -834,6 +854,9 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
       mov(rax, qword[r8 + rax * 8]);
 
       L(indirection_ready);
+    }
+    if (check_range) {
+      L(slot_ready);
     }
   } else {
     // Old-style resolve.

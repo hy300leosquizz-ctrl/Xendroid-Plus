@@ -16,22 +16,22 @@ class SettingsSchemaTest {
     // 146 before the redesign, plus the 29 cvars of the core it shows now (docs/ui-redesign/README.md),
     // less APU|mute and GPU|readback_memexport, which the core never defined (ajustes-2.md).
     // Display|host_present_from_non_ui_thread is intentionally absent (forced true natively).
-    // Plus adds Vulkan|zerofg_mode, in its own ZeroFG section, and System link's Network|systemlink and
-    // Network|systemlink_peers: 176. The MFG test branch adds Vulkan|zerofg_multiplier, zerofg_vsync_retire and
-    // zerofg_mfg_tick_retire: 179 (Zero light and the x4 quarters retired 2026-11-21).
-    @Test fun total_entry_count_is_179() {
-        assertEquals(179, all.size)
+    // Plus adds Vulkan|zerofg_mode, System link's Network|systemlink + Network|systemlink_peers (176),
+    // the 19 Plus Ultra Track A/B/C/D canonical engine cvars (195), and the MFG branch Vulkan|zerofg_multiplier,
+    // zerofg_vsync_retire and zerofg_mfg_tick_retire: 198.
+    @Test fun total_entry_count_is_198() {
+        assertEquals(198, all.size)
         assertEquals(
-            179,
+            198,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
     }
 
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(122, all.count { it is Setting.Bool })        // 103 + 18 new - 2 the core never had + systemlink + zerofg_vsync_retire + zerofg_mfg_tick_retire
+        assertEquals(140, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra bool cvars + zerofg_vsync_retire + zerofg_mfg_tick_retire
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
-        assertEquals(32, all.count { it is Setting.ListChoice })   // 27 + 3 new + zerofg_mode + zerofg_multiplier
+        assertEquals(33, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start + zerofg_multiplier
         assertEquals(2, all.count { it is Setting.Action })
         assertEquals(3, all.count { it is Setting.Text })          // launch_module, cl, systemlink_peers
     }
@@ -54,7 +54,8 @@ class SettingsSchemaTest {
             "Vulkan|vulkan_dynamic_rendering", "Vulkan|vulkan_avoid_geometry_shaders", "Vulkan|vulkan_depth_unorm24",
             "General|guest_crash_is_fatal").forEach { b(it, true) }
         listOf("GPU|depth_bias_shader_offset", "GPU|memexport_enable", "UI|achievement_notification_position_by_game",
-            "Storage|mount_memory_unit").forEach { b(it, false) }
+            "Storage|mount_memory_unit", "Vulkan|vulkan_allow_present_mode_immediate",
+            "Vulkan|vulkan_allow_present_mode_mailbox").forEach { b(it, false) }
         assertEquals("0", (SettingsSchema.byKey["GPU|draw_resolution_scale_threshold"] as Setting.ListChoice).default)
         assertEquals("-1", (SettingsSchema.byKey["Kernel|console_type"] as Setting.ListChoice).default)
         val gamma = SettingsSchema.byKey["Kernel|kernel_display_gamma_power"] as Setting.ListChoice
@@ -160,6 +161,19 @@ class SettingsSchemaTest {
             "Display|postprocess_ffx_cas_additional_sharpness", "Display|postprocess_ffx_fsr_sharpness_reduction")
             .map { SettingsSchema.byKey[it] as Setting.ListChoice }
             .forEach { s -> s.options.forEach { assertEquals("${s.key} ${it.value}", 1, it.value.count { c -> c == '.' }) } }
+    }
+
+    @Test fun framerate_limit_offers_20_and_40_fps_options() {
+        val s = SettingsSchema.byKey["GPU|framerate_limit"] as Setting.ListChoice
+        // 15 is the MFG branch's addition (a source for x4 tests: 15 -> 60).
+        assertEquals(listOf("60", "15", "20", "30", "40", "45", "90", "120", "0"), s.options.map { it.value })
+        assertEquals("60", s.default)
+        assertTrue(s.key in SettingsSchema.playerKeys)
+    }
+
+    @Test fun jit_frame_start_defaults_to_off() {
+        val s = SettingsSchema.byKey["HID|jit_frame_start"] as Setting.ListChoice
+        assertEquals("0", s.default)
     }
 
     /** vulkan_texture_cache reads -1 (no override) and 0..5 (off, 1x..16x). */

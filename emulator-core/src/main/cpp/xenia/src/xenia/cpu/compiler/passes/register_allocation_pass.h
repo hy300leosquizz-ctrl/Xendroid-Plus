@@ -63,9 +63,12 @@ class RegisterAllocationPass : public CompilerPass {
                            const hir::RegAssignment& preferred_reg);
   bool TryAllocateRegister(hir::Value* value);
   bool SpillOneRegister(hir::HIRBuilder* builder, hir::Block* block,
-                        hir::TypeName required_type);
+                        hir::TypeName required_type, bool allow_volatile);
 
-  RegisterSetUsage* RegisterSetForValue(const hir::Value* value);
+  bool CanUseVolatileRegister(const hir::Value* value) const;
+  static bool ClobbersVolatileGprs(const hir::Instr* instr);
+
+  RegisterSetUsage* RegisterSetForValue(const hir::Value* value) const;
 
   void SortUsageList(hir::Value* value);
 
@@ -76,6 +79,9 @@ class RegisterAllocationPass : public CompilerPass {
     RegisterSetUsage* vec_set = nullptr;
     RegisterSetUsage* all_sets[3];
   } usage_sets_;
+  bool volatile_gprs_enabled_ = false;
+  uint32_t block_base_ordinal_ = 0;
+  std::vector<uint32_t> clobber_prefix_;
 };
 
 }  // namespace passes

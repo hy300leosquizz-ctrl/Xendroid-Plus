@@ -31,7 +31,6 @@ void Patcher::ApplyPatchesForTitle(Memory* memory, const uint32_t title_id,
       module_hashes_.push_back(entry);
     }
   }
-  patch_db_->LoadPatches();
   const auto title_patches = patch_db_->GetTitlePatches(title_id, hash);
 
   for (const PatchFileEntry& patchFile : title_patches) {

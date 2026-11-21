@@ -14,6 +14,7 @@
 
 #include "xenia/base/byte_order.h"
 #include "xenia/base/string.h"
+#include "xenia/base/string_util.h"
 #include "xenia/xbox.h"
 
 namespace xe {
@@ -23,10 +24,11 @@ namespace xam {
 #pragma pack(push, 4)
 struct X_XAMACCOUNTINFO {
   enum AccountReservedFlags {
+    kVersionMask = 0x000000FF,
     kPasswordProtected = 0x10000000,
     kLiveEnabled = 0x20000000,
     kRecovering = 0x40000000,
-    kVersionMask = 0x000000FF
+    KPartialProfile = 0x80000000
   };
 
   enum AccountUserFlags {
@@ -135,6 +137,11 @@ static_assert_size(X_XAMACCOUNTINFO, 0x17C);
 
 #define X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY 0x00000001
 #define X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY 0x00000002
+
+#define X_USER_INFO_FLAG_LIVE_ENABLED 0x00000001
+
+#define X_USER_XUID_OFFLINE 0x00000001
+#define X_USER_XUID_ONLINE 0x00000002
 
 #define MAX_FIRSTNAME_SIZE 64
 #define MAX_LASTNAME_SIZE 64

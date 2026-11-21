@@ -10,6 +10,7 @@
 #include "xenia/kernel/xam/xam_ui.h"
 
 #include <cstdlib>
+#include <cstring>
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/png_utils.h"
 #include "xenia/base/system.h"
@@ -339,6 +340,19 @@ void MessageBoxDialog::OnDraw(ImGuiIO& io) {
   }
 }
 
+void KeyboardInputDialog::CopyText(std::string_view text) {
+  if (text_buffer_.empty()) {
+    return;
+  }
+  size_t length = std::min(text.size(), text_buffer_.size() - 1);
+  while (length && length < text.size() &&
+         (uint8_t(text[length]) & 0xC0) == 0x80) {
+    --length;
+  }
+  std::memcpy(text_buffer_.data(), text.data(), length);
+  text_buffer_[length] = '\0';
+}
+
 void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
   if (!has_opened_) {
     ImGui::OpenPopup(title_.c_str());
@@ -392,10 +406,8 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
     // Context menu for paste functionality
     if (ImGui::BeginPopupContextItem("input_context_menu")) {
       if (ImGui::MenuItem("Paste")) {
-        if (ImGui::GetClipboardText() != nullptr) {
-          std::string clipboard_text = ImGui::GetClipboardText();
-          xe::string_util::copy_truncating(text_buffer_.data(), clipboard_text,
-                                           text_buffer_.size());
+        if (const char* clipboard = ImGui::GetClipboardText()) {
+          CopyText(clipboard);
         }
       }
       ImGui::EndPopup();
@@ -403,7 +415,7 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
     ImGui::PopID();
 
     if (input_submitted) {
-      text_ = std::string(text_buffer_.data(), text_buffer_.size());
+      text_ = text_buffer_.data();
       cancelled_ = false;
       ImGui::CloseCurrentPopup();
       Close();
@@ -411,7 +423,7 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
 
     // OK button
     if (ImGui::Button("OK")) {
-      text_ = std::string(text_buffer_.data(), text_buffer_.size());
+      text_ = text_buffer_.data();
       cancelled_ = false;
       ImGui::CloseCurrentPopup();
       Close();
@@ -626,10 +638,12 @@ dword_result_t XamShowKeyboardUI_entry(
   // being true once a provider is installed. Only text entry is affected.
   if (xe::ui::HasHostTextInputProvider()) {
     xe::ui::HostTextInputRequest request;
-    request.title = title ? xe::to_utf8(title.value()) : "";
-    request.description = description ? xe::to_utf8(description.value()) : "";
+    request.title = title ? xe::to_utf8_lossy(title.value()) : "";
+    request.description =
+        description ? xe::to_utf8_lossy(description.value()) : "";
     request.default_text = XeKeyboardDefaultText(
-        user_index, default_text ? xe::to_utf8(default_text.value()) : "");
+        user_index,
+        default_text ? xe::to_utf8_lossy(default_text.value()) : "");
     // buffer_length includes the terminator copy_and_swap_truncating reserves.
     request.max_length =
         buffer_length ? static_cast<uint32_t>(buffer_length) - 1 : 0;
@@ -708,10 +722,12 @@ dword_result_t XamShowKeyboardUI_entry(
     xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
     xe::hid::InputSystem* input_system = emulator->input_system();
 
-    std::string title_str = title ? xe::to_utf8(title.value()) : "";
-    std::string desc_str = description ? xe::to_utf8(description.value()) : "";
+    std::string title_str = title ? xe::to_utf8_lossy(title.value()) : "";
+    std::string desc_str =
+        description ? xe::to_utf8_lossy(description.value()) : "";
     std::string def_text_str = XeKeyboardDefaultText(
-        user_index, default_text ? xe::to_utf8(default_text.value()) : "");
+        user_index,
+        default_text ? xe::to_utf8_lossy(default_text.value()) : "");
 
     result = xeXamDispatchDialogEx<KeyboardInputDialog>(
         new KeyboardInputDialog(imgui_drawer, input_system, title_str, desc_str,

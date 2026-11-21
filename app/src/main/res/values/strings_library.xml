@@ -80,7 +80,7 @@
     <string name="xd_data_cover_reset">Use the icon</string>
     <string name="xd_data_edit">Edit</string>
     <string name="xd_data_compress">Compress…</string>
-    <string name="xd_data_compress_sub">The .iso stays until the .zar is made and checked</string>
+    <string name="xd_data_compress_sub">The original disc or folder stays until the .zar is made and checked</string>
     <string name="xd_data_create">Create</string>
     <string name="xd_data_shortcut_sub">A shortcut on the Android home screen</string>
     <string name="xd_data_open">Open</string>
@@ -182,4 +182,6 @@
     <string name="xd_game_patches_others_note">They do not apply to the version you play.</string>
     <string name="xd_game_patches_any">No version stated</string>
     <string name="xd_game_version_of">version %1$s</string>
+    <string name="xd_launch_xex_pick">Choose executable</string>
+    <string name="xd_launch_xex_pick_sub">Multi-game compilation or folder modules</string>
 </resources>

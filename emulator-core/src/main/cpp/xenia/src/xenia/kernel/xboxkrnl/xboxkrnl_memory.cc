@@ -9,14 +9,21 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 
+#include <algorithm>
 #include <atomic>
+#include <utility>
+#include <vector>
+
 #include "xenia/base/logging.h"
+#include "xenia/base/mutex.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/xex_module.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/xbox.h"
+
+DECLARE_bool(scribble_heap);
 
 DEFINE_bool(
     ignore_offset_for_ranged_allocations, false,
@@ -62,6 +69,47 @@ uint32_t FromXdkProtectFlags(uint32_t protect) {
     result |= kMemoryProtectWriteCombine;
   }
   return result;
+}
+
+// The runs of a range that hold no committed pages.
+static std::vector<std::pair<uint32_t, uint32_t>> UncommittedRuns(
+    BaseHeap* heap, uint32_t address, uint32_t size) {
+  std::vector<std::pair<uint32_t, uint32_t>> runs;
+  const uint32_t end = address + size;
+  while (address < end) {
+    HeapAllocationInfo info = {};
+    uint32_t length = end - address;
+    if (heap->QueryRegionInfoUpTo(address, length, &info) && info.region_size) {
+      length = std::min(length, info.region_size);
+    }
+    if (!(info.state & kMemoryAllocationCommit)) {
+      runs.emplace_back(address, length);
+    }
+    address += length;
+  }
+  return runs;
+}
+
+// Zeroes the runs, or fills them.
+static void InitializeRuns(
+    BaseHeap* heap, const std::vector<std::pair<uint32_t, uint32_t>>& runs,
+    uint32_t protect, bool nozero) {
+  for (const auto& [start, length] : runs) {
+    if (!IsWritableProtect(protect)) {
+      heap->Protect(start, length, kMemoryProtectRead | kMemoryProtectWrite);
+    }
+    if (!nozero) {
+      kernel_memory()->Zero(start, length);
+    } else if (!cvars::scribble_heap || !IsWritableProtect(protect)) {
+      // The console leaves stale data in these pages and titles can read it.
+      // scribble_heap has already filled the writable ones.
+      auto fill = kernel_memory()->TranslateVirtualBE<uint16_t>(start);
+      std::fill_n(fill, length / 2, uint16_t(0x7175));
+    }
+    if (!IsWritableProtect(protect)) {
+      heap->Protect(start, length, protect);
+    }
+  }
 }
 
 dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
@@ -170,66 +218,75 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
     XELOGE("X_MEM_RESET not implemented");
     assert_always();
   }
-  uint32_t protect = FromXdkProtectFlags(protect_bits);
+  const uint32_t protect = FromXdkProtectFlags(protect_bits);
+  const bool commit = !!(alloc_type & X_MEM_COMMIT);
+  const bool nozero = !!(alloc_type & X_MEM_NOZERO);
   uint32_t address = 0;
-  BaseHeap* heap;
-  HeapAllocationInfo prev_alloc_info = {};
-  bool was_commited = false;
+  BaseHeap* heap = nullptr;
+  // What this call initializes: every page it commits when it zeroes them,
+  // only the pages no commit has initialized before when it fills them.
+  std::vector<std::pair<uint32_t, uint32_t>> init_runs;
+  {
+    // Held from the checks through the fill of fixed-base ranges so no other
+    // call commits or frees these pages in between.
+    auto global_lock = global_critical_region::AcquireDirect();
+    std::vector<std::pair<uint32_t, uint32_t>> commit_runs;
 
-  if (adjusted_base != 0) {
-    heap = kernel_memory()->LookupHeap(adjusted_base);
-    if (heap->page_size() != page_size) {
-      // Specified the wrong page size for the wrong heap.
-      return X_STATUS_ACCESS_DENIED;
-    }
-    was_commited = heap->QueryRegionInfo(adjusted_base, &prev_alloc_info) &&
-                   (prev_alloc_info.state & kMemoryAllocationCommit) != 0;
+    if (adjusted_base != 0) {
+      heap = kernel_memory()->LookupHeap(adjusted_base);
+      if (heap->page_size() != page_size) {
+        // Specified the wrong page size for the wrong heap.
+        return X_STATUS_ACCESS_DENIED;
+      }
+      if (commit) {
+        commit_runs = UncommittedRuns(heap, adjusted_base, adjusted_size);
+      }
 
-    if (heap->AllocFixed(adjusted_base, adjusted_size, page_size,
-                         allocation_type, protect)) {
-      address = adjusted_base;
+      if (heap->AllocFixed(adjusted_base, adjusted_size, page_size,
+                           allocation_type, protect)) {
+        address = adjusted_base;
+      }
+    } else {
+      bool top_down = !!(alloc_type & X_MEM_TOP_DOWN);
+      heap = kernel_memory()->LookupHeapByType(false, page_size);
+      if (heap->Alloc(adjusted_size, page_size, allocation_type, protect,
+                      top_down, &address) &&
+          commit) {
+        commit_runs.emplace_back(address, adjusted_size);
+      }
     }
-  } else {
-    bool top_down = !!(alloc_type & X_MEM_TOP_DOWN);
-    heap = kernel_memory()->LookupHeapByType(false, page_size);
-    heap->Alloc(adjusted_size, page_size, allocation_type, protect, top_down,
-                &address);
+    if (!address) {
+      // Failed - assume no memory available.
+      return X_STATUS_NO_MEMORY;
+    }
+
+    // Clamp runs to the actual region in case a partial allocation occurred.
+    HeapAllocationInfo alloc_info = {};
+    const uint32_t max_init_end =
+        heap->QueryRegionInfo(address, &alloc_info)
+            ? address + std::min(adjusted_size, alloc_info.region_size)
+            : address + adjusted_size;
+    for (auto [start, length] : commit_runs) {
+      if (start >= max_init_end) {
+        continue;
+      }
+      length = std::min(length, max_init_end - start);
+      auto uninitialized = heap->TakeUninitializedRuns(start, length);
+      if (!nozero) {
+        init_runs.emplace_back(start, length);
+      } else {
+        init_runs.insert(init_runs.end(), uninitialized.begin(),
+                         uninitialized.end());
+      }
+    }
+    // A region this call placed is new to every other call so only a range at
+    // a caller-provided base has to be initialized before the lock is released.
+    if (adjusted_base != 0) {
+      InitializeRuns(heap, init_runs, protect, nozero);
+    }
   }
-  if (!address) {
-    // Failed - assume no memory available.
-    return X_STATUS_NO_MEMORY;
-  }
-
-  // Zero memory, if needed.
-  if (address && !(alloc_type & X_MEM_NOZERO)) {
-    if (alloc_type & X_MEM_COMMIT) {
-      // Query the actual allocated size from the heap to ensure we don't
-      // attempt to zero more memory than was actually allocated
-      HeapAllocationInfo alloc_info = {};
-      if (!heap->QueryRegionInfo(address, &alloc_info)) {
-        XELOGE(
-            "NtAllocateVirtualMemory: Failed to query allocation info for "
-            "address {:08X}",
-            address);
-        // Try to release the allocation since we can't safely zero it
-        heap->Release(address);
-        return X_STATUS_UNSUCCESSFUL;
-      }
-
-      // Use the smaller of adjusted_size and the actual allocated region size
-      uint32_t size_to_zero = std::min(adjusted_size, alloc_info.region_size);
-
-      if (!IsWritableProtect(protect)) {
-        heap->Protect(address, size_to_zero,
-                      kMemoryProtectRead | kMemoryProtectWrite);
-      }
-      if (!was_commited) {
-        kernel_memory()->Zero(address, size_to_zero);
-      }
-      if (!IsWritableProtect(protect)) {
-        heap->Protect(address, size_to_zero, protect);
-      }
-    }
+  if (adjusted_base == 0) {
+    InitializeRuns(heap, init_runs, protect, nozero);
   }
 
   XELOGD("NtAllocateVirtualMemory = {:08X}", address);

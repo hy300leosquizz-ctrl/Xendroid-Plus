@@ -258,41 +258,44 @@ void* AllocFixed(void* base_address, size_t length,
 
   if (base_address != nullptr) {
     if (allocation_type == AllocationType::kCommit) {
-#if XE_PLATFORM_MAC
-      size_t host_page = page_size();
-      uintptr_t aligned_addr =
-          reinterpret_cast<uintptr_t>(base_address) & ~(host_page - 1);
-      uintptr_t end_addr = reinterpret_cast<uintptr_t>(base_address) + length;
-      end_addr = (end_addr + host_page - 1) & ~(host_page - 1);
-      if (mprotect(reinterpret_cast<void*>(aligned_addr),
-                   end_addr - aligned_addr, prot) == 0) {
-        return base_address;
-      }
-      return nullptr;
-#else
       if (Protect(base_address, length, access)) {
         return base_address;
       }
       return nullptr;
-#endif  // XE_PLATFORM_MAC
     }
 
     flags |= MAP_FIXED;
   }
 
-  void* result = mmap(base_address, length, prot, flags, -1, 0);
+  const size_t host_page = page_size();
+  void* mmap_base = base_address;
+  size_t mmap_length = length;
+  if (host_page > 0x1000) {
+    if (mmap_base != nullptr) {
+      const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(mmap_base);
+      const uintptr_t aligned_begin = raw_begin & ~(host_page - 1);
+      const uintptr_t aligned_end =
+          (raw_begin + mmap_length + host_page - 1) & ~(host_page - 1);
+      mmap_base = reinterpret_cast<void*>(aligned_begin);
+      mmap_length = aligned_end - aligned_begin;
+    } else if (mmap_length != 0) {
+      mmap_length = (mmap_length + host_page - 1) & ~(host_page - 1);
+    }
+  }
+
+  void* result = mmap(mmap_base, mmap_length, prot, flags, -1, 0);
 
   if (result == MAP_FAILED) {
     return nullptr;
   }
 
-  if (base_address != nullptr && result != base_address) {
-    munmap(result, length);
+  if (mmap_base != nullptr && result != mmap_base) {
+    munmap(result, mmap_length);
     return nullptr;
   }
 
-  RememberReservation(result, length);
-  return result;
+  RememberReservation(result, mmap_length);
+  return base_address != nullptr ? base_address : result;
 }
 
 bool DeallocFixed(void* base_address, size_t length,
@@ -346,16 +349,27 @@ bool DeallocFixed(void* base_address, size_t length,
 
 bool Protect(void* base_address, size_t length, PageAccess access,
              PageAccess* out_old_access) {
+  if (length == 0) {
+    return true;
+  }
+  const size_t host_page = page_size();
+  const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(base_address);
+  const uintptr_t aligned_begin = raw_begin & ~(host_page - 1);
+  const uintptr_t aligned_end =
+      (raw_begin + length + host_page - 1) & ~(host_page - 1);
+  void* aligned_address = reinterpret_cast<void*>(aligned_begin);
+  const size_t aligned_length = aligned_end - aligned_begin;
+
   if (out_old_access) {
-    size_t length_copy = length;
-    QueryProtect(base_address, length_copy, *out_old_access);
+    size_t length_copy = aligned_length;
+    QueryProtect(aligned_address, length_copy, *out_old_access);
   }
 
   uint32_t prot = ToPosixProtectFlags(access);
-  int ret = mprotect(base_address, length, prot);
+  int ret = mprotect(aligned_address, aligned_length, prot);
   if (ret != 0) {
-    XELOGE("mprotect({}, 0x{:X}, {}) failed: {} ({})", base_address, length,
-           prot, strerror(errno), errno);
+    XELOGE("mprotect({}, 0x{:X}, {}) failed: {} ({})", aligned_address,
+           aligned_length, prot, strerror(errno), errno);
   }
   return ret == 0;
 }

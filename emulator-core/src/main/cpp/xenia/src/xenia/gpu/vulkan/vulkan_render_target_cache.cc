@@ -18,21 +18,26 @@
 
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/emulator.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/registers.h"
+#include "xenia/gpu/shader_storage.h"
 #include "xenia/gpu/spirv_builder.h"
 #include "xenia/gpu/spirv_compatibility.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/texture_cache.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
+#include "xenia/gpu/vulkan/spirv_single_sample_patch.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
 DECLARE_bool(accurate_resolve_number_formats);
@@ -41,6 +46,45 @@ DECLARE_bool(msaa_4x_as_2x);
 DECLARE_bool(vulkan_resolve_dest_diag);
 DECLARE_bool(rt_cache_ownership_claim_memo);
 DECLARE_bool(vulkan_dynamic_rendering);
+DECLARE_path(storage_root);
+
+DEFINE_bool(
+    vulkan_msaa_4x_as_2x2, true,
+    "Store guest 4x MSAA render targets (color and depth) as 1x images of "
+    "double width and height, one host pixel per guest sample in the EDRAM "
+    "order. Auto-enabled on Arm Mali, PanVK and Samsung Xclipse when "
+    "non-Turnip so render targets remain VK_SAMPLE_COUNT_1_BIT with hardware "
+    "AFBC compression preserved and 1x <-> 4x EDRAM ownership transfers "
+    "eliminated.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_direct_host_resolve_2x2, true,
+    "With vulkan_direct_host_resolve: resolve 4x surfaces kept as 1x images of "
+    "twice the size (vulkan_msaa_4x_as_2x2 / samples as pixels) directly from "
+    "those images, reading their texels as the EDRAM samples, instead of "
+    "dumping them through the EDRAM buffer first.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_msaa_single_sample_storage, false,
+    "Host render target path: keep the images of 2x / 4x multisampled guest "
+    "render targets single-sampled and rasterize one sample per pixel into "
+    "them so AFBC compression stays active at quarter/half tile bandwidth.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_rasterization_order_attachment_access, true,
+    "Use VK_EXT_rasterization_order_attachment_access (or VK_ARM_*) for "
+    "in-pass color attachment reads and ordered SNORM16 blending without "
+    "explicit tile-flushing pipeline barriers.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_render_target_pipeline_cache, true,
+    "Persist internal EDRAM resolve, ownership transfer and depth store "
+    "pipelines across launches in shaders/local/render_targets.vk.bin.",
+    "Vulkan");
 
 DEFINE_bool(
     vulkan_in_pass_resolve_debug_read_usage, false,
@@ -262,6 +306,34 @@ DEFINE_bool(
 namespace xe {
 namespace gpu {
 namespace vulkan {
+namespace {
+
+VkPipeline CreateSourceReadingComputePipeline(
+    bool single_sample_storage, const ui::vulkan::VulkanDevice* vulkan_device,
+    VkPipelineLayout layout, const uint32_t* shader_code,
+    size_t shader_code_size_bytes,
+    const VkSpecializationInfo* specialization_info = nullptr,
+    const char* entry_point = "main", uint32_t required_subgroup_size = 0,
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE) {
+  if (!single_sample_storage) {
+    return ui::vulkan::util::CreateComputePipeline(
+        vulkan_device, layout, shader_code, shader_code_size_bytes,
+        specialization_info, entry_point, required_subgroup_size,
+        pipeline_cache);
+  }
+  std::vector<uint32_t> patched;
+  if (!PatchSpirvMultisampledFetchesToSingleSample(
+          shader_code, shader_code_size_bytes, patched)) {
+    XELOGE("VulkanRenderTargetCache: Failed to rewrite a shader for "
+           "single-sample storage");
+    return VK_NULL_HANDLE;
+  }
+  return ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, layout, patched.data(), patched.size() * sizeof(uint32_t),
+      specialization_info, entry_point, required_subgroup_size, pipeline_cache);
+}
+
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -509,6 +581,11 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
                  {XE_DHR_SHADER(resolve_host_color_32bpp_4xmsaa_scaled_cs),
                   XE_DHR_SHADER(
                       resolve_host_color_uint_32bpp_4xmsaa_scaled_cs)}},
+                {{XE_DHR_SHADER(resolve_host_color_32bpp_4xmsaa_2x2_cs),
+                  XE_DHR_SHADER(resolve_host_color_uint_32bpp_4xmsaa_2x2_cs)},
+                 {XE_DHR_SHADER(resolve_host_color_32bpp_4xmsaa_scaled_2x2_cs),
+                  XE_DHR_SHADER(
+                      resolve_host_color_uint_32bpp_4xmsaa_scaled_2x2_cs)}},
             },
             {
                 // 64bpp
@@ -527,6 +604,11 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
                  {XE_DHR_SHADER(resolve_host_color_64bpp_4xmsaa_scaled_cs),
                   XE_DHR_SHADER(
                       resolve_host_color_uint_64bpp_4xmsaa_scaled_cs)}},
+                {{XE_DHR_SHADER(resolve_host_color_64bpp_4xmsaa_2x2_cs),
+                  XE_DHR_SHADER(resolve_host_color_uint_64bpp_4xmsaa_2x2_cs)},
+                 {XE_DHR_SHADER(resolve_host_color_64bpp_4xmsaa_scaled_2x2_cs),
+                  XE_DHR_SHADER(
+                      resolve_host_color_uint_64bpp_4xmsaa_scaled_2x2_cs)}},
             },
 };
 
@@ -566,6 +648,18 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
    XE_DHR_SHADER(prefix##_32bpp_4xmsaa_scaled_cs), \
    XE_DHR_SHADER(prefix##_64bpp_4xmsaa_scaled_cs), \
    XE_DHR_SHADER(prefix##_128bpp_4xmsaa_scaled_cs)}
+#define XE_DHR_FULL_DESTS_2X2(prefix)            \
+  {XE_DHR_SHADER(prefix##_8bpp_4xmsaa_2x2_cs),   \
+   XE_DHR_SHADER(prefix##_16bpp_4xmsaa_2x2_cs),  \
+   XE_DHR_SHADER(prefix##_32bpp_4xmsaa_2x2_cs),  \
+   XE_DHR_SHADER(prefix##_64bpp_4xmsaa_2x2_cs),  \
+   XE_DHR_SHADER(prefix##_128bpp_4xmsaa_2x2_cs)}
+#define XE_DHR_FULL_DESTS_2X2_SCALED(prefix)            \
+  {XE_DHR_SHADER(prefix##_8bpp_4xmsaa_scaled_2x2_cs),   \
+   XE_DHR_SHADER(prefix##_16bpp_4xmsaa_scaled_2x2_cs),  \
+   XE_DHR_SHADER(prefix##_32bpp_4xmsaa_scaled_2x2_cs),  \
+   XE_DHR_SHADER(prefix##_64bpp_4xmsaa_scaled_2x2_cs),  \
+   XE_DHR_SHADER(prefix##_128bpp_4xmsaa_scaled_2x2_cs)}
 
 const VulkanRenderTargetCache::DirectHostResolveShaderCode
     VulkanRenderTargetCache::kDirectHostResolveColorFullShaders
@@ -585,8 +679,14 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
               XE_DHR_FULL_DESTS_4X(resolve_host_color_full_uint)},
              {XE_DHR_FULL_DESTS_4X_SCALED(resolve_host_color_full),
               XE_DHR_FULL_DESTS_4X_SCALED(resolve_host_color_full_uint)}},
+            {{XE_DHR_FULL_DESTS_2X2(resolve_host_color_full),
+              XE_DHR_FULL_DESTS_2X2(resolve_host_color_full_uint)},
+             {XE_DHR_FULL_DESTS_2X2_SCALED(resolve_host_color_full),
+              XE_DHR_FULL_DESTS_2X2_SCALED(resolve_host_color_full_uint)}},
 };
 
+#undef XE_DHR_FULL_DESTS_2X2_SCALED
+#undef XE_DHR_FULL_DESTS_2X2
 #undef XE_DHR_FULL_DESTS_4X_SCALED
 #undef XE_DHR_FULL_DESTS_4X
 #undef XE_DHR_FULL_DESTS_2X_SCALED
@@ -604,6 +704,8 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
              XE_DHR_SHADER(resolve_host_depth_32bpp_2xmsaa_scaled_cs)},
             {XE_DHR_SHADER(resolve_host_depth_32bpp_4xmsaa_cs),
              XE_DHR_SHADER(resolve_host_depth_32bpp_4xmsaa_scaled_cs)},
+            // No 2x2 depth variant: depth stays on the EDRAM dump path.
+            {{nullptr, 0, "none"}, {nullptr, 0, "none"}},
 };
 
 const VulkanRenderTargetCache::DirectHostResolveShaderCode
@@ -626,6 +728,11 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
              {XE_DHR_SHADER(resolve_host_color_32bpp_4xmsaa_scaled_4px_cs),
               XE_DHR_SHADER(
                   resolve_host_color_uint_32bpp_4xmsaa_scaled_4px_cs)}},
+            {{XE_DHR_SHADER(resolve_host_color_32bpp_4xmsaa_2x2_4px_cs),
+              XE_DHR_SHADER(resolve_host_color_uint_32bpp_4xmsaa_2x2_4px_cs)},
+             {XE_DHR_SHADER(resolve_host_color_32bpp_4xmsaa_scaled_2x2_4px_cs),
+              XE_DHR_SHADER(
+                  resolve_host_color_uint_32bpp_4xmsaa_scaled_2x2_4px_cs)}},
 };
 
 const VulkanRenderTargetCache::DirectHostResolveShaderCode
@@ -638,6 +745,7 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
              XE_DHR_SHADER(resolve_host_depth_32bpp_2xmsaa_scaled_4px_cs)},
             {XE_DHR_SHADER(resolve_host_depth_32bpp_4xmsaa_4px_cs),
              XE_DHR_SHADER(resolve_host_depth_32bpp_4xmsaa_scaled_4px_cs)},
+            {{nullptr, 0, "none"}, {nullptr, 0, "none"}},
 };
 
 const VulkanRenderTargetCache::DirectHostResolveShaderCode
@@ -651,7 +759,10 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
              {XE_DHR_SHADER(resolve_host_color_32bpp_2xmsaa_4px_tex_cs),
               XE_DHR_SHADER(resolve_host_color_uint_32bpp_2xmsaa_4px_tex_cs)},
              {XE_DHR_SHADER(resolve_host_color_32bpp_4xmsaa_4px_tex_cs),
-              XE_DHR_SHADER(resolve_host_color_uint_32bpp_4xmsaa_4px_tex_cs)}},
+              XE_DHR_SHADER(resolve_host_color_uint_32bpp_4xmsaa_4px_tex_cs)},
+             {XE_DHR_SHADER(resolve_host_color_32bpp_4xmsaa_2x2_4px_tex_cs),
+              XE_DHR_SHADER(
+                  resolve_host_color_uint_32bpp_4xmsaa_2x2_4px_tex_cs)}},
             // Full color to 32bpp.
             {{XE_DHR_SHADER(resolve_host_color_full_32bpp_1xmsaa_tex_cs),
               XE_DHR_SHADER(resolve_host_color_full_uint_32bpp_1xmsaa_tex_cs)},
@@ -659,14 +770,18 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
               XE_DHR_SHADER(resolve_host_color_full_uint_32bpp_2xmsaa_tex_cs)},
              {XE_DHR_SHADER(resolve_host_color_full_32bpp_4xmsaa_tex_cs),
               XE_DHR_SHADER(
-                  resolve_host_color_full_uint_32bpp_4xmsaa_tex_cs)}},
+                  resolve_host_color_full_uint_32bpp_4xmsaa_tex_cs)},
+             {XE_DHR_SHADER(resolve_host_color_full_32bpp_4xmsaa_2x2_tex_cs),
+              XE_DHR_SHADER(
+                  resolve_host_color_full_uint_32bpp_4xmsaa_2x2_tex_cs)}},
             // Depth, 4 pixels per thread (no uint variant).
             {{XE_DHR_SHADER(resolve_host_depth_32bpp_1xmsaa_4px_tex_cs),
               XE_DHR_SHADER(resolve_host_depth_32bpp_1xmsaa_4px_tex_cs)},
              {XE_DHR_SHADER(resolve_host_depth_32bpp_2xmsaa_4px_tex_cs),
               XE_DHR_SHADER(resolve_host_depth_32bpp_2xmsaa_4px_tex_cs)},
              {XE_DHR_SHADER(resolve_host_depth_32bpp_4xmsaa_4px_tex_cs),
-              XE_DHR_SHADER(resolve_host_depth_32bpp_4xmsaa_4px_tex_cs)}},
+              XE_DHR_SHADER(resolve_host_depth_32bpp_4xmsaa_4px_tex_cs)},
+             {{nullptr, 0, "none"}, {nullptr, 0, "none"}}},
             // Full color into k_10_11_11, expanded to 16 bits per component
             // (no uint variant - never picked for uint sources).
             {{XE_DHR_SHADER(resolve_host_color_full_32bpp_1xmsaa_tex_r11g11b10_cs),
@@ -675,17 +790,25 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
               XE_DHR_SHADER(resolve_host_color_full_32bpp_2xmsaa_tex_r11g11b10_cs)},
              {XE_DHR_SHADER(resolve_host_color_full_32bpp_4xmsaa_tex_r11g11b10_cs),
               XE_DHR_SHADER(
-                  resolve_host_color_full_32bpp_4xmsaa_tex_r11g11b10_cs)}},
+                  resolve_host_color_full_32bpp_4xmsaa_tex_r11g11b10_cs)},
+             {XE_DHR_SHADER(
+                  resolve_host_color_full_32bpp_4xmsaa_2x2_tex_r11g11b10_cs),
+              XE_DHR_SHADER(
+                  resolve_host_color_full_32bpp_4xmsaa_2x2_tex_r11g11b10_cs)}},
 };
 
 const VulkanRenderTargetCache::DirectHostResolveShaderCode
-    VulkanRenderTargetCache::kDirectHostResolveColorFull7e3Shaders[3][2] = {
-        {XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_1xmsaa_cs),
-         XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_1xmsaa_tex_cs)},
-        {XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_2xmsaa_cs),
-         XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_2xmsaa_tex_cs)},
-        {XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_4xmsaa_cs),
-         XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_4xmsaa_tex_cs)},
+    VulkanRenderTargetCache::kDirectHostResolveColorFull7e3Shaders
+        [VulkanRenderTargetCache::kDirectHostResolveMsaaCount][2] = {
+            {XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_1xmsaa_cs),
+             XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_1xmsaa_tex_cs)},
+            {XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_2xmsaa_cs),
+             XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_2xmsaa_tex_cs)},
+            {XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_4xmsaa_cs),
+             XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_4xmsaa_tex_cs)},
+            {XE_DHR_SHADER(resolve_host_color_full_7e3_32bpp_4xmsaa_2x2_cs),
+             XE_DHR_SHADER(
+                 resolve_host_color_full_7e3_32bpp_4xmsaa_2x2_tex_cs)},
 };
 
 #define XE_DHR_COLOR_FORMATS(msaa)                                        \
@@ -694,10 +817,12 @@ const VulkanRenderTargetCache::DirectHostResolveShaderCode
    {XE_DHR_SHADER(resolve_host_color_32bpp_##msaa##_4px_2101010_cs),      \
     XE_DHR_SHADER(resolve_host_color_32bpp_##msaa##_4px_2101010_tex_cs)}}
 const VulkanRenderTargetCache::DirectHostResolveShaderCode
-    VulkanRenderTargetCache::kDirectHostResolveColorFormatShaders[3][2][2] = {
-        XE_DHR_COLOR_FORMATS(1xmsaa),
-        XE_DHR_COLOR_FORMATS(2xmsaa),
-        XE_DHR_COLOR_FORMATS(4xmsaa),
+    VulkanRenderTargetCache::kDirectHostResolveColorFormatShaders
+        [VulkanRenderTargetCache::kDirectHostResolveMsaaCount][2][2] = {
+            XE_DHR_COLOR_FORMATS(1xmsaa),
+            XE_DHR_COLOR_FORMATS(2xmsaa),
+            XE_DHR_COLOR_FORMATS(4xmsaa),
+            XE_DHR_COLOR_FORMATS(4xmsaa_2x2),
 };
 #undef XE_DHR_COLOR_FORMATS
 
@@ -799,6 +924,58 @@ VulkanRenderTargetCache::VulkanRenderTargetCache(
 
 VulkanRenderTargetCache::~VulkanRenderTargetCache() { Shutdown(true); }
 
+VkPipelineCache VulkanRenderTargetCache::UseRtPipelineCache() {
+  if (rt_pipeline_cache_ == VK_NULL_HANDLE) {
+    return VK_NULL_HANDLE;
+  }
+  if (!rt_pipeline_cache_dirty_) {
+    rt_pipeline_cache_dirty_ = true;
+    rt_pipeline_cache_dirty_since_ms_ = xe::Clock::QueryHostUptimeMillis();
+  }
+  return rt_pipeline_cache_;
+}
+
+void VulkanRenderTargetCache::SaveRtPipelineCache(bool force) {
+  if (!rt_pipeline_cache_dirty_ || rt_pipeline_cache_ == VK_NULL_HANDLE ||
+      !rt_pipeline_cache_store_) {
+    return;
+  }
+  if (!force) {
+    const uint64_t now_ms = xe::Clock::QueryHostUptimeMillis();
+    if (now_ms < rt_pipeline_cache_dirty_since_ms_ + 10000) {
+      return;
+    }
+  }
+  rt_pipeline_cache_dirty_ = false;
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  size_t cache_size = 0;
+  if (dfn.vkGetPipelineCacheData(device, rt_pipeline_cache_, &cache_size,
+                                 nullptr) != VK_SUCCESS ||
+      cache_size < pipeline_cache_file::kVulkanHeaderSize) {
+    return;
+  }
+  if (!force && cache_size == rt_pipeline_cache_last_saved_bytes_) {
+    return;
+  }
+  std::vector<uint8_t> cache_bytes(cache_size);
+  VkResult get_res = dfn.vkGetPipelineCacheData(device, rt_pipeline_cache_,
+                                                &cache_size, cache_bytes.data());
+  if (get_res != VK_SUCCESS || cache_size < pipeline_cache_file::kVulkanHeaderSize) {
+    return;
+  }
+  cache_bytes.resize(cache_size);
+  std::string save_desc;
+  if (rt_pipeline_cache_store_->Save(cache_bytes.data(), cache_bytes.size(),
+                                     save_desc)) {
+    rt_pipeline_cache_last_saved_bytes_ = cache_bytes.size();
+    XELOGI("VulkanRenderTargetCache: render_targets.vk.bin ({} bytes): {}",
+           cache_bytes.size(), save_desc);
+  }
+}
+
 bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
@@ -816,6 +993,69 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
 
   use_dynamic_rendering_ =
       cvars::vulkan_dynamic_rendering && device_properties.dynamicRendering;
+  rasterization_order_color_access_ =
+      cvars::vulkan_rasterization_order_attachment_access &&
+      device_properties.rasterizationOrderColorAttachmentAccess;
+  mali_normalize_mixed_load_ops_ =
+      (device_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY ||
+       device_properties.vendorID == 0x13B5) &&
+      (device_properties.maliDriverMajorR <= 0 ||
+       device_properties.maliDriverMajorR * 100 +
+               device_properties.maliDriverMinorP <
+           3801);
+  if (mali_normalize_mixed_load_ops_) {
+    XELOGI("VulkanRenderTargetCache: normalizing mixed DONT_CARE/LOAD "
+           "attachments for Mali < r38p1");
+  }
+
+  // Load persistent global pipeline cache (shaders/local/render_targets.vk.bin).
+  rt_pipeline_cache_ = VK_NULL_HANDLE;
+  rt_pipeline_cache_store_.reset();
+  rt_pipeline_cache_dirty_ = false;
+  rt_pipeline_cache_last_saved_bytes_ = 0;
+  if (cvars::vulkan_render_target_pipeline_cache) {
+    std::filesystem::path cache_root;
+    if (auto* ks = kernel::KernelState::shared(); ks && ks->emulator()) {
+      cache_root = ks->emulator()->cache_root();
+    }
+    if (cache_root.empty() && !cvars::storage_root.empty()) {
+      cache_root = cvars::storage_root;
+    }
+    std::vector<uint8_t> initial_data;
+    if (!cache_root.empty()) {
+      std::error_code dir_ec;
+      const std::filesystem::path local_dir =
+          GetShaderStorageLocalRoot(cache_root);
+      std::filesystem::create_directories(local_dir, dir_ec);
+      if (!dir_ec) {
+        pipeline_cache_file::Identity identity;
+        identity.vendor_id = device_properties.vendorID;
+        identity.device_id = device_properties.deviceID;
+        std::memcpy(identity.uuid, device_properties.pipelineCacheUUID,
+                    pipeline_cache_file::kUuidSize);
+        rt_pipeline_cache_store_ = std::make_unique<pipeline_cache_file::Store>(
+            local_dir / "render_targets.vk.bin", identity);
+        std::string load_desc;
+        initial_data = rt_pipeline_cache_store_->LoadForCreate(load_desc);
+        rt_pipeline_cache_last_saved_bytes_ = initial_data.size();
+        XELOGI("VulkanRenderTargetCache: render_targets.vk.bin ({} bytes): {}",
+               initial_data.size(), load_desc);
+      }
+    }
+    VkPipelineCacheCreateInfo cache_ci = {};
+    cache_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    cache_ci.initialDataSize = initial_data.size();
+    cache_ci.pInitialData =
+        initial_data.empty() ? nullptr : initial_data.data();
+    if (dfn.vkCreatePipelineCache(device, &cache_ci, nullptr,
+                                  &rt_pipeline_cache_) != VK_SUCCESS &&
+        !initial_data.empty()) {
+      cache_ci.initialDataSize = 0;
+      cache_ci.pInitialData = nullptr;
+      dfn.vkCreatePipelineCache(device, &cache_ci, nullptr,
+                                &rt_pipeline_cache_);
+    }
+  }
   local_read_attachments_ =
       cvars::vulkan_in_pass_resolve && cvars::vulkan_dynamic_rendering &&
       device_properties.dynamicRendering &&
@@ -1025,6 +1265,29 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   } else {
     msaa_2x_attachments_supported_ = false;
     msaa_2x_no_attachments_supported_ = false;
+  }
+
+  msaa_single_sample_storage_ =
+      cvars::vulkan_msaa_single_sample_storage &&
+      path_ == Path::kHostRenderTargets;
+  const bool non_turnip_mobile_tiler =
+      device_properties.driverID != VK_DRIVER_ID_MESA_TURNIP &&
+      (device_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY ||
+       device_properties.driverID == VK_DRIVER_ID_MESA_PANVK ||
+       device_properties.vendorID == 0x13B5 ||
+       device_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY ||
+       device_properties.vendorID == 0x144D);
+  msaa_4x_as_2x2_ = cvars::vulkan_msaa_4x_as_2x2 &&
+                    path_ == Path::kHostRenderTargets &&
+                    !IsDrawResolutionScaled() && non_turnip_mobile_tiler;
+  SetMsaa4xClearsAs2x2(msaa_4x_as_2x2_);
+  if (msaa_4x_as_2x2_) {
+    XELOGI("VulkanRenderTargetCache: 4x MSAA kept as 2x2 1x surfaces "
+           "(AFBC preserved)");
+  }
+  if (msaa_single_sample_storage_) {
+    XELOGI("VulkanRenderTargetCache: multisampled guest render targets are "
+           "stored single-sampled");
   }
 
   // Descriptor set layouts.
@@ -1260,7 +1523,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
           ui::vulkan::util::CreateComputePipeline(
               vulkan_device, resolve_copy_native_pipeline_layout_,
               resolve_copy_shader_code.unscaled,
-              resolve_copy_shader_code.unscaled_size_bytes);
+              resolve_copy_shader_code.unscaled_size_bytes, nullptr, "main", 64,
+              UseRtPipelineCache());
       if (resolve_copy_native_pipeline == VK_NULL_HANDLE) {
         XELOGE(
             "VulkanRenderTargetCache: Failed to create the native resolve "
@@ -1286,7 +1550,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
                                : resolve_copy_shader_code.unscaled,
         draw_resolution_scaled ? resolve_copy_shader_code.scaled_size_bytes
                                : resolve_copy_shader_code.unscaled_size_bytes,
-        nullptr, "main", 64);
+        nullptr, "main", 64, UseRtPipelineCache());
     if (resolve_copy_pipeline == VK_NULL_HANDLE) {
       XELOGE(
           "VulkanRenderTargetCache: Failed to create the resolve copy "
@@ -1456,10 +1720,11 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       // Host depth store shaders use 8x8 = 64 threads per group. Request wave64
       // mode on RDNA GPUs to ensure one full wave per group.
       VkPipeline host_depth_store_pipeline =
-          ui::vulkan::util::CreateComputePipeline(
-              vulkan_device, host_depth_store_pipeline_layout_,
-              host_depth_store_shader.first, host_depth_store_shader.second,
-              nullptr, "main", 64);
+          CreateSourceReadingComputePipeline(
+              msaa_single_sample_storage_, vulkan_device,
+              host_depth_store_pipeline_layout_, host_depth_store_shader.first,
+              host_depth_store_shader.second, nullptr, "main", 64,
+              UseRtPipelineCache());
       if (host_depth_store_pipeline == VK_NULL_HANDLE) {
         XELOGE(
             "VulkanRenderTargetCache: Failed to create the {}-sample host "
@@ -1656,7 +1921,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
                                : shaders::resolve_clear_32bpp_cs,
         draw_resolution_scaled ? sizeof(shaders::resolve_clear_32bpp_scaled_cs)
                                : sizeof(shaders::resolve_clear_32bpp_cs),
-        nullptr, "main", 64);
+        nullptr, "main", 64, UseRtPipelineCache());
     if (resolve_fsi_clear_32bpp_pipeline_ == VK_NULL_HANDLE) {
       XELOGE(
           "VulkanRenderTargetCache: Failed to create the 32bpp resolve EDRAM "
@@ -1670,7 +1935,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
                                : shaders::resolve_clear_64bpp_cs,
         draw_resolution_scaled ? sizeof(shaders::resolve_clear_64bpp_scaled_cs)
                                : sizeof(shaders::resolve_clear_64bpp_cs),
-        nullptr, "main", 64);
+        nullptr, "main", 64, UseRtPipelineCache());
     if (resolve_fsi_clear_64bpp_pipeline_ == VK_NULL_HANDLE) {
       XELOGE(
           "VulkanRenderTargetCache: Failed to create the 64bpp resolve EDRAM "
@@ -1777,6 +2042,8 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+
+  SaveRtPipelineCache(true);
 
   // Destroy all render targets before the descriptor set pool is destroyed -
   // may happen if shutting down the VulkanRenderTargetCache by destroying it,
@@ -1992,6 +2259,10 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout,
                                          device,
                                          descriptor_set_layout_storage_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineCache, device,
+                                         rt_pipeline_cache_);
+  rt_pipeline_cache_store_.reset();
+  rt_pipeline_cache_dirty_ = false;
 
   if (!from_destructor) {
     ShutdownCommon();
@@ -2035,6 +2306,7 @@ void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
     direct_host_resolve_constants_pool_->Reclaim(
         command_processor_.GetCompletedSubmission());
   }
+  SaveRtPipelineCache(false);
 }
 
 void VulkanRenderTargetCache::EndSubmission() {
@@ -2055,7 +2327,7 @@ size_t DirectHostResolveMsaaIndex(xenos::MsaaSamples msaa_samples) {
     case xenos::MsaaSamples::k4X:
       return 2;
     default:
-      return 3;
+      return 4;
   }
 }
 
@@ -2137,8 +2409,9 @@ uint32_t DirectHostResolvePixelsPerThread(
 
 VkPipeline VulkanRenderTargetCache::GetDirectHostResolvePipeline(
     bool is_64bpp, xenos::MsaaSamples msaa_samples, bool scaled,
-    bool source_is_uint, bool four_pixels) {
-  size_t msaa_index = DirectHostResolveMsaaIndex(msaa_samples);
+    bool source_is_uint, bool four_pixels, bool source_2x2) {
+  size_t msaa_index = source_2x2 ? kDirectHostResolveMsaa2x2Index
+                                 : DirectHostResolveMsaaIndex(msaa_samples);
   if (msaa_index >= kDirectHostResolveMsaaCount) {
     return VK_NULL_HANDLE;
   }
@@ -2161,10 +2434,13 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostResolvePipeline(
           : kDirectHostResolveColorShaders[is_64bpp ? 1u : 0u][msaa_index]
                                           [scaled ? 1u : 0u]
                                           [source_is_uint ? 1u : 0u];
-  pipeline = ui::vulkan::util::CreateComputePipeline(
-      command_processor_.GetVulkanDevice(),
+  if (!shader.code) {
+    return VK_NULL_HANDLE;
+  }
+  pipeline = CreateSourceReadingComputePipeline(
+      msaa_single_sample_storage_, command_processor_.GetVulkanDevice(),
       direct_host_resolve_pipeline_layout_color_, shader.code,
-      shader.size_bytes, nullptr, "main", 64);
+      shader.size_bytes, nullptr, "main", 64, UseRtPipelineCache());
   if (pipeline == VK_NULL_HANDLE) {
     XELOGW(
         "VulkanRenderTargetCache: Failed to create optional direct host "
@@ -2179,8 +2455,9 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostResolvePipeline(
 
 VkPipeline VulkanRenderTargetCache::GetDirectHostColorFullResolvePipeline(
     xenos::MsaaSamples msaa_samples, bool scaled, bool source_is_uint,
-    draw_util::ResolveCopyShaderIndex copy_shader) {
-  size_t msaa_index = DirectHostResolveMsaaIndex(msaa_samples);
+    draw_util::ResolveCopyShaderIndex copy_shader, bool source_2x2) {
+  size_t msaa_index = source_2x2 ? kDirectHostResolveMsaa2x2Index
+                                 : DirectHostResolveMsaaIndex(msaa_samples);
   size_t dest_index = DirectHostResolveFullDestIndex(copy_shader);
   if (msaa_index >= kDirectHostResolveMsaaCount ||
       dest_index >= kDirectHostResolveFullDestCount) {
@@ -2196,10 +2473,13 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostColorFullResolvePipeline(
   const DirectHostResolveShaderCode& shader =
       kDirectHostResolveColorFullShaders[msaa_index][scaled ? 1u : 0u]
                                         [source_is_uint ? 1u : 0u][dest_index];
-  pipeline = ui::vulkan::util::CreateComputePipeline(
-      command_processor_.GetVulkanDevice(),
+  if (!shader.code) {
+    return VK_NULL_HANDLE;
+  }
+  pipeline = CreateSourceReadingComputePipeline(
+      msaa_single_sample_storage_, command_processor_.GetVulkanDevice(),
       direct_host_resolve_pipeline_layout_color_, shader.code,
-      shader.size_bytes, nullptr, "main", 64);
+      shader.size_bytes, nullptr, "main", 64, UseRtPipelineCache());
   if (pipeline == VK_NULL_HANDLE) {
     XELOGW(
         "VulkanRenderTargetCache: Failed to create optional direct host full "
@@ -2230,10 +2510,13 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostDepthResolvePipeline(
       four_pixels
           ? kDirectHostResolveDepthShaders4px[msaa_index][scaled ? 1u : 0u]
           : kDirectHostResolveDepthShaders[msaa_index][scaled ? 1u : 0u];
-  pipeline = ui::vulkan::util::CreateComputePipeline(
-      command_processor_.GetVulkanDevice(),
+  if (!shader.code) {
+    return VK_NULL_HANDLE;
+  }
+  pipeline = CreateSourceReadingComputePipeline(
+      msaa_single_sample_storage_, command_processor_.GetVulkanDevice(),
       direct_host_resolve_pipeline_layout_depth_, shader.code,
-      shader.size_bytes, nullptr, "main", 64);
+      shader.size_bytes, nullptr, "main", 64, UseRtPipelineCache());
   if (pipeline == VK_NULL_HANDLE) {
     XELOGW(
         "VulkanRenderTargetCache: Failed to create optional direct host depth "
@@ -2248,8 +2531,9 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostDepthResolvePipeline(
 
 VkPipeline VulkanRenderTargetCache::GetDirectHostResolveTexturePipeline(
     DirectHostResolveTextureKind kind, xenos::MsaaSamples msaa_samples,
-    bool source_is_uint) {
-  size_t msaa_index = DirectHostResolveMsaaIndex(msaa_samples);
+    bool source_is_uint, bool source_2x2) {
+  size_t msaa_index = source_2x2 ? kDirectHostResolveMsaa2x2Index
+                                 : DirectHostResolveMsaaIndex(msaa_samples);
   if (msaa_index >= kDirectHostResolveMsaaCount) {
     return VK_NULL_HANDLE;
   }
@@ -2262,12 +2546,16 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostResolveTexturePipeline(
   const DirectHostResolveShaderCode& shader =
       kDirectHostResolveTextureShaders[size_t(kind)][msaa_index]
                                       [source_is_uint ? 1u : 0u];
-  pipeline = ui::vulkan::util::CreateComputePipeline(
-      command_processor_.GetVulkanDevice(),
+  if (!shader.code) {
+    return VK_NULL_HANDLE;
+  }
+  pipeline = CreateSourceReadingComputePipeline(
+      msaa_single_sample_storage_, command_processor_.GetVulkanDevice(),
       kind == DirectHostResolveTextureKind::kDepth4px
           ? direct_host_resolve_pipeline_layout_depth_
           : direct_host_resolve_pipeline_layout_color_,
-      shader.code, shader.size_bytes, nullptr, "main", 64);
+      shader.code, shader.size_bytes, nullptr, "main", 64,
+      UseRtPipelineCache());
   if (pipeline == VK_NULL_HANDLE) {
     XELOGW(
         "VulkanRenderTargetCache: Failed to create optional direct host "
@@ -2281,8 +2569,9 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostResolveTexturePipeline(
 }
 
 VkPipeline VulkanRenderTargetCache::GetDirectHostColorFull7e3ResolvePipeline(
-    xenos::MsaaSamples msaa_samples, bool to_texture) {
-  size_t msaa_index = DirectHostResolveMsaaIndex(msaa_samples);
+    xenos::MsaaSamples msaa_samples, bool to_texture, bool source_2x2) {
+  size_t msaa_index = source_2x2 ? kDirectHostResolveMsaa2x2Index
+                                 : DirectHostResolveMsaaIndex(msaa_samples);
   if (msaa_index >= kDirectHostResolveMsaaCount) {
     return VK_NULL_HANDLE;
   }
@@ -2294,10 +2583,13 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostColorFull7e3ResolvePipeline(
   }
   const DirectHostResolveShaderCode& shader =
       kDirectHostResolveColorFull7e3Shaders[msaa_index][to_texture ? 1u : 0u];
-  pipeline = ui::vulkan::util::CreateComputePipeline(
-      command_processor_.GetVulkanDevice(),
+  if (!shader.code) {
+    return VK_NULL_HANDLE;
+  }
+  pipeline = CreateSourceReadingComputePipeline(
+      msaa_single_sample_storage_, command_processor_.GetVulkanDevice(),
       direct_host_resolve_pipeline_layout_color_, shader.code,
-      shader.size_bytes, nullptr, "main", 64);
+      shader.size_bytes, nullptr, "main", 64, UseRtPipelineCache());
   if (pipeline == VK_NULL_HANDLE) {
     XELOGW(
         "VulkanRenderTargetCache: Failed to create optional direct host 7e3 "
@@ -2312,8 +2604,8 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostColorFull7e3ResolvePipeline(
 
 VkPipeline VulkanRenderTargetCache::GetDirectHostFormatResolvePipeline(
     bool is_depth, size_t msaa_index, size_t format_index, size_t kind) {
-  if (msaa_index >= kDirectHostResolveMsaaCount || format_index >= 2 ||
-      kind >= (is_depth ? 3u : 2u)) {
+  if (msaa_index >= (is_depth ? 3u : kDirectHostResolveMsaaCount) ||
+      format_index >= 2 || kind >= (is_depth ? 3u : 2u)) {
     return VK_NULL_HANDLE;
   }
   VkPipeline& pipeline =
@@ -2333,11 +2625,12 @@ VkPipeline VulkanRenderTargetCache::GetDirectHostFormatResolvePipeline(
   if (!shader.code) {
     return VK_NULL_HANDLE;
   }
-  pipeline = ui::vulkan::util::CreateComputePipeline(
-      command_processor_.GetVulkanDevice(),
+  pipeline = CreateSourceReadingComputePipeline(
+      msaa_single_sample_storage_, command_processor_.GetVulkanDevice(),
       is_depth ? direct_host_resolve_pipeline_layout_depth_
                : direct_host_resolve_pipeline_layout_color_,
-      shader.code, shader.size_bytes, nullptr, "main", 64);
+      shader.code, shader.size_bytes, nullptr, "main", 64,
+      UseRtPipelineCache());
   if (pipeline == VK_NULL_HANDLE) {
     XELOGW(
         "VulkanRenderTargetCache: Failed to create optional direct host "
@@ -2879,15 +3172,19 @@ bool VulkanRenderTargetCache::TryInPassResolveCopy(
 
   // In-pass self-dependency, legal under dynamic rendering local read: order
   // previous draws' color output before the resolve's input attachment reads.
-  VkMemoryBarrier local_read_barrier;
-  local_read_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  local_read_barrier.pNext = nullptr;
-  local_read_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-  local_read_barrier.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-  command_buffer.CmdVkPipelineBarrier(
-      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1,
-      &local_read_barrier, 0, nullptr, 0, nullptr);
+  // Skipped when VK_EXT_rasterization_order_attachment_access guarantees
+  // hardware rasterization-order color reads without a tile barrier.
+  if (!rasterization_order_color_access_) {
+    VkMemoryBarrier local_read_barrier;
+    local_read_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    local_read_barrier.pNext = nullptr;
+    local_read_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    local_read_barrier.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+    command_buffer.CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1,
+        &local_read_barrier, 0, nullptr, 0, nullptr);
+  }
 
   VkDescriptorSet descriptor_set_texture = VK_NULL_HANDLE;
   if (writes_texture) {
@@ -3143,6 +3440,9 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
     uint32_t dispatch_count = 0;
     uint32_t flags = 0;
     uint32_t pixels_per_thread = 0;
+    // Guest MSAA of the surface: 4x for a 2x2-kept 1x key.
+    xenos::MsaaSamples msaa_samples = xenos::MsaaSamples::k1X;
+    bool source_is_2x2 = false;
     bool is_64bpp = false;
     bool is_depth = false;
     bool source_is_uint = false;
@@ -3272,6 +3572,8 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
     uint32_t source_flags = 0;
     bool is_64bpp = false;
     bool use_7e3_variant = false;
+    xenos::MsaaSamples source_msaa = key.msaa_samples;
+    bool source_is_2x2 = false;
     // The EDRAM format index of the variant knowing it, or SIZE_MAX.
     size_t format_variant = SIZE_MAX;
     if (resolve_is_depth) {
@@ -3300,17 +3602,29 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
             key.msaa_samples, IsDrawResolutionScaled(), four_pixels);
       }
     } else {
+      // A 1x owner of a 4x resolve - a 4x surface kept as a 1x image of twice
+      // the size (vulkan_msaa_4x_as_2x2 / samples as pixels): same pitch in
+      // tiles, its texels are the EDRAM samples.
+      source_is_2x2 =
+          cvars::vulkan_direct_host_resolve_2x2 &&
+          key.msaa_samples == xenos::MsaaSamples::k1X &&
+          resolve_info.color_edram_info.msaa_samples ==
+              xenos::MsaaSamples::k4X;
       // Render target keys have the storage format: the 10_10_10_10 and the
       // 16_16_16_16 variants of the 2_10_10_10 formats (only the blending
       // precision differs) are stored like the plain ones (gamma was rejected
       // above).
       const xenos::ColorRenderTargetFormat resolve_color_key_format =
-          cvars::vulkan_direct_host_resolve_storage_format
+          (cvars::vulkan_direct_host_resolve_storage_format || source_is_2x2)
               ? xenos::GetStorageColorFormat(resolve_color_format)
               : resolve_color_format;
       if (key.GetColorFormat() != resolve_color_key_format ||
-          key.msaa_samples != resolve_info.color_edram_info.msaa_samples) {
+          (key.msaa_samples != resolve_info.color_edram_info.msaa_samples &&
+           !source_is_2x2)) {
         return false;
+      }
+      if (source_is_2x2) {
+        source_msaa = xenos::MsaaSamples::k4X;
       }
       if (copy_shader_is_full_color &&
           !IsResolveDirectHostRTFullColorSourcePackable(resolve_color_format)) {
@@ -3319,11 +3633,14 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
       GetColorOwnershipTransferVulkanFormat(key.GetColorFormat(),
                                             &source_is_uint);
       is_64bpp = key.Is64bpp();
+      const size_t color_msaa_index =
+          source_is_2x2 ? kDirectHostResolveMsaa2x2Index
+                        : DirectHostResolveMsaaIndex(source_msaa);
       use_7e3_variant = full_color_7e3_variant && !source_is_uint &&
-                        (key.msaa_samples == xenos::MsaaSamples::k2X ||
-                         key.msaa_samples == xenos::MsaaSamples::k4X ||
+                        (source_msaa == xenos::MsaaSamples::k2X ||
+                         source_msaa == xenos::MsaaSamples::k4X ||
                          (format_variants &&
-                          key.msaa_samples == xenos::MsaaSamples::k1X));
+                          source_msaa == xenos::MsaaSamples::k1X));
       if (!use_7e3_variant && format_variants && !copy_shader_is_full_color &&
           !is_64bpp && !source_is_uint && four_pixels) {
         if (resolve_color_format ==
@@ -3337,25 +3654,23 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
         }
         if (format_variant != SIZE_MAX) {
           pipeline = GetDirectHostFormatResolvePipeline(
-              false, DirectHostResolveMsaaIndex(key.msaa_samples),
-              format_variant, 0);
+              false, color_msaa_index, format_variant, 0);
           if (pipeline == VK_NULL_HANDLE) {
             format_variant = SIZE_MAX;
           }
         }
       }
       if (use_7e3_variant) {
-        pipeline =
-            GetDirectHostColorFull7e3ResolvePipeline(key.msaa_samples, false);
+        pipeline = GetDirectHostColorFull7e3ResolvePipeline(source_msaa, false,
+                                                            source_is_2x2);
       } else if (pipeline == VK_NULL_HANDLE) {
         pipeline = copy_shader_is_full_color
                        ? GetDirectHostColorFullResolvePipeline(
-                             key.msaa_samples, IsDrawResolutionScaled(),
-                             source_is_uint, copy_shader)
+                             source_msaa, IsDrawResolutionScaled(),
+                             source_is_uint, copy_shader, source_is_2x2)
                        : GetDirectHostResolvePipeline(
-                             is_64bpp, key.msaa_samples,
-                             IsDrawResolutionScaled(), source_is_uint,
-                             four_pixels);
+                             is_64bpp, source_msaa, IsDrawResolutionScaled(),
+                             source_is_uint, four_pixels, source_is_2x2);
       }
     }
     if (pipeline == VK_NULL_HANDLE) {
@@ -3377,8 +3692,10 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
     source.flags = source_flags;
     source.pixels_per_thread =
         DirectHostResolvePixelsPerThread(copy_shader, is_64bpp,
-                                         resolve_is_depth, key.msaa_samples,
+                                         resolve_is_depth, source_msaa,
                                          four_pixels && !copy_shader_is_full_color);
+    source.msaa_samples = source_msaa;
+    source.source_is_2x2 = source_is_2x2;
     source.is_64bpp = is_64bpp;
     source.is_depth = resolve_is_depth;
     source.source_is_uint = source_is_uint;
@@ -3392,16 +3709,19 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
             !source_is_uint) {
           source.texture_pipeline = GetDirectHostResolveTexturePipeline(
               DirectHostResolveTextureKind::kFullColor32bppR11G11B10,
-              key.msaa_samples, false);
+              source_msaa, false, source_is_2x2);
         }
       } else if (use_7e3_variant) {
-        source.texture_pipeline =
-            GetDirectHostColorFull7e3ResolvePipeline(key.msaa_samples, true);
+        source.texture_pipeline = GetDirectHostColorFull7e3ResolvePipeline(
+            source_msaa, true, source_is_2x2);
       } else {
         if (format_variant != SIZE_MAX) {
+          const size_t tex_msaa_index =
+              source_is_2x2 ? kDirectHostResolveMsaa2x2Index
+                            : DirectHostResolveMsaaIndex(source_msaa);
           source.texture_pipeline = GetDirectHostFormatResolvePipeline(
-              resolve_is_depth, DirectHostResolveMsaaIndex(key.msaa_samples),
-              format_variant, resolve_is_depth ? 2 : 1);
+              resolve_is_depth, tex_msaa_index, format_variant,
+              resolve_is_depth ? 2 : 1);
         }
         if (source.texture_pipeline == VK_NULL_HANDLE) {
           source.texture_pipeline = GetDirectHostResolveTexturePipeline(
@@ -3410,7 +3730,7 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
                   : (copy_shader_is_full_color
                          ? DirectHostResolveTextureKind::kFullColor32bpp
                          : DirectHostResolveTextureKind::kFastColor4px),
-              key.msaa_samples, source_is_uint);
+              source_msaa, source_is_uint, source_is_2x2);
         }
       }
     }
@@ -3421,7 +3741,7 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
         (source.is_64bpp ? 40u : 80u) * draw_resolution_scale_x();
     const uint32_t tile_pixel_size_x =
         tile_size_x >>
-        uint32_t(source.key.msaa_samples >= xenos::MsaaSamples::k4X);
+        uint32_t(source.msaa_samples >= xenos::MsaaSamples::k4X);
     for (uint32_t i = 0; i < source.dispatch_count; ++i) {
       uint32_t dispatch_pixel_width =
           source.dispatches[i].width_tiles * tile_pixel_size_x;
@@ -3693,10 +4013,10 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
       const uint32_t tile_size_y = 16u * scale_y;
       const uint32_t tile_pixel_size_x =
           tile_size_x >>
-          uint32_t(source.key.msaa_samples >= xenos::MsaaSamples::k4X);
+          uint32_t(source.msaa_samples >= xenos::MsaaSamples::k4X);
       const uint32_t tile_pixel_size_y =
           tile_size_y >>
-          uint32_t(source.key.msaa_samples >= xenos::MsaaSamples::k2X);
+          uint32_t(source.msaa_samples >= xenos::MsaaSamples::k2X);
       constants.thread_count_x =
           dispatch.width_tiles * tile_pixel_size_x / source.pixels_per_thread;
       constants.thread_count_y = dispatch.height_tiles * tile_pixel_size_y;
@@ -3826,6 +4146,118 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
   if (to_texture) {
     texture_cache.EndResolveStoreRangeWrite();
   }
+
+  // Mip-chain direct resolve linking: copy 1x contiguous color render targets
+  // directly into resident mipmap levels via vkCmdCopyImage (preserving AFBC /
+  // UBWC with zero VK_IMAGE_USAGE_STORAGE_BIT and zero reloads on the next
+  // draw, including dest_base != 0 32x32 macro-tile offsets).
+  if (!resolve_is_depth && !IsDrawResolutionScaled() && copy_shader_is_fast &&
+      sources.size() == 1 && !sources[0].source_is_2x2 &&
+      sources[0].key.msaa_samples == xenos::MsaaSamples::k1X &&
+      !resolve_info.copy_dest_info.copy_dest_swap &&
+      !resolve_info.copy_dest_info.copy_dest_exp_bias &&
+      !resolve_info.copy_dest_info.copy_dest_array) {
+    const DirectHostResolveSource& link_src = sources[0];
+    const uint32_t resolve_w = uint32_t(resolve_info.coordinate_info.width_div_8)
+                               << xenos::kResolveAlignmentPixelsLog2;
+    const uint32_t resolve_h = uint32_t(resolve_info.height_div_8)
+                               << xenos::kResolveAlignmentPixelsLog2;
+    const uint32_t pixel_x0 =
+        uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) << 3;
+    const uint32_t pixel_y0 =
+        uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) << 3;
+    const uint32_t tile_w = link_src.is_64bpp ? 40u : 80u;
+    constexpr uint32_t kTileH = 16u;
+    const uint32_t src_base_tiles =
+        link_src.key.base_tiles - GetTilingBandSourceTileOffset(link_src.key);
+    const uint32_t src_pitch_tiles = link_src.key.GetPitchTiles();
+    bool mapping_affine = resolve_w > 0 && resolve_h > 0 && src_pitch_tiles > 0;
+    int64_t affine_dx = INT64_MAX;
+    int64_t affine_dy = INT64_MAX;
+    if (mapping_affine) {
+      const uint32_t tiles_x = (resolve_w + tile_w - 1) / tile_w;
+      const uint32_t tiles_y = (resolve_h + kTileH - 1) / kTileH;
+      for (uint32_t ty = 0; ty <= tiles_y && mapping_affine; ++ty) {
+        const uint32_t py = std::min(ty * kTileH, resolve_h - 1);
+        for (uint32_t tx = 0; tx <= tiles_x; ++tx) {
+          const uint32_t px = std::min(tx * tile_w, resolve_w - 1);
+          const uint32_t sx = px + pixel_x0;
+          const uint32_t sy = py + pixel_y0;
+          const uint32_t tile_x = sx / tile_w;
+          const uint32_t tile_y = sy / kTileH;
+          const uint32_t nonwrapped = dump_base + tile_y * dump_pitch + tile_x;
+          if (nonwrapped < src_base_tiles) {
+            mapping_affine = false;
+            break;
+          }
+          const uint32_t linear = nonwrapped - src_base_tiles;
+          const uint32_t rt_tile_y = linear / src_pitch_tiles;
+          const uint32_t rt_tile_x = linear - rt_tile_y * src_pitch_tiles;
+          const int64_t texel_x =
+              int64_t(rt_tile_x) * tile_w + (sx - tile_x * tile_w);
+          const int64_t texel_y =
+              int64_t(rt_tile_y) * kTileH + (sy - tile_y * kTileH);
+          const int64_t dx = texel_x - int64_t(px);
+          const int64_t dy = texel_y - int64_t(py);
+          if (affine_dx == INT64_MAX) {
+            affine_dx = dx;
+            affine_dy = dy;
+          } else if (dx != affine_dx || dy != affine_dy) {
+            mapping_affine = false;
+            break;
+          }
+        }
+      }
+    }
+    const uint32_t rt_w = link_src.key.GetWidth();
+    const uint32_t rt_h = GetRenderTargetHeight(
+        link_src.key.pitch_tiles_at_32bpp, link_src.key.msaa_samples);
+    if (mapping_affine && affine_dx >= 0 && affine_dy >= 0 &&
+        uint64_t(affine_dx) + resolve_w <= rt_w &&
+        uint64_t(affine_dy) + resolve_h <= rt_h &&
+        uint32_t(resolve_info.copy_dest_info.copy_dest_endian) < 4) {
+      std::vector<VulkanTextureCache::ResolveLinkTarget> link_targets;
+      texture_cache.BeginResolveLink(
+          dest_base_unadjusted,
+          resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32,
+          resolve_info.copy_dest_x0, resolve_info.copy_dest_y0, resolve_w,
+          resolve_h, resolve_info.copy_dest_info.copy_dest_format,
+          xenos::Endian(uint32_t(resolve_info.copy_dest_info.copy_dest_endian)),
+          to_texture ? texture_info.texture : nullptr, link_targets);
+      if (!link_targets.empty()) {
+        const VkFormat src_vk_format =
+            GetColorVulkanFormat(link_src.key.GetColorFormat());
+        std::vector<VulkanTextureCache::ResolveLinkTarget> matched_targets;
+        matched_targets.reserve(link_targets.size());
+        for (const auto& target : link_targets) {
+          if (target.format == src_vk_format) {
+            matched_targets.push_back(target);
+          }
+        }
+        if (!matched_targets.empty()) {
+          VulkanRenderTarget& src_rt = *link_src.render_target;
+          command_processor_.PushImageMemoryBarrier(
+              src_rt.image(),
+              ui::vulkan::util::InitializeSubresourceRange(
+                  VK_IMAGE_ASPECT_COLOR_BIT),
+              src_rt.current_stage_mask(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+              src_rt.current_access_mask(), VK_ACCESS_TRANSFER_READ_BIT,
+              src_rt.current_layout(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+          src_rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_ACCESS_TRANSFER_READ_BIT,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+          for (const auto& target : matched_targets) {
+            texture_cache.RecordResolveLinkCopy(
+                src_rt.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                uint32_t(affine_dx), uint32_t(affine_dy), resolve_w, resolve_h,
+                target);
+          }
+          texture_cache.EndResolveLink(matched_targets);
+        }
+      }
+    }
+  }
+
   written_address_out = resolve_info.copy_dest_extent_start;
   written_length_out = resolve_info.copy_dest_extent_length;
   return true;
@@ -5356,6 +5788,13 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     VkRenderingAttachmentInfo* depth_attachment,
     VkRenderingAttachmentInfo* stencil_attachment) const {
   RenderPassKey key = last_update_render_pass_key_;
+  if (mali_normalize_mixed_load_ops_) {
+    const uint32_t used = key.depth_and_color_used;
+    const uint32_t dont_care = key.depth_and_color_load_dont_care & used;
+    if (dont_care != 0 && dont_care != used) {
+      key.depth_and_color_load_dont_care = 0;
+    }
+  }
   const RenderTarget* const* rts = last_update_accumulated_render_targets();
 
   // Initialize depth/stencil attachments. Must match what pipeline creation
@@ -5435,6 +5874,18 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(
     default:
       return VK_NULL_HANDLE;
   }
+  if (msaa_single_sample_storage_) {
+    samples = VK_SAMPLE_COUNT_1_BIT;
+  }
+
+  uint32_t load_dont_care = key.depth_and_color_load_dont_care;
+  if (mali_normalize_mixed_load_ops_) {
+    const uint32_t used = key.depth_and_color_used;
+    const uint32_t dont_care_used = load_dont_care & used;
+    if (dont_care_used != 0 && dont_care_used != used) {
+      load_dont_care = 0;
+    }
+  }
 
   VkAttachmentDescription attachments[1 + xenos::kMaxColorRenderTargets];
   if (key.depth_and_color_used & 0b1) {
@@ -5442,7 +5893,7 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(
     attachment.flags = 0;
     attachment.format = GetDepthVulkanFormat(key.depth_format);
     attachment.samples = samples;
-    attachment.loadOp = (key.depth_and_color_load_dont_care & 0b1)
+    attachment.loadOp = (load_dont_care & 0b1)
                             ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
                             : VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -5477,7 +5928,7 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(
             ? GetColorOwnershipTransferVulkanFormat(color_format)
             : GetColorVulkanFormat(color_format);
     attachment.samples = samples;
-    attachment.loadOp = (key.depth_and_color_load_dont_care & attachment_bit)
+    attachment.loadOp = (load_dont_care & attachment_bit)
                             ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
                             : VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -5707,15 +6158,19 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
   image_create_info.arrayLayers = 1;
   // A 4x surface stored at 2x (host_2x) keeps the 4x pixel dimensions.
   const xenos::MsaaSamples host_msaa_samples = key.GetHostMsaaSamples();
-  if (host_msaa_samples == xenos::MsaaSamples::k2X &&
-      !msaa_2x_attachments_supported_) {
+  if (msaa_single_sample_storage_) {
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  } else if (host_msaa_samples == xenos::MsaaSamples::k2X &&
+             !msaa_2x_attachments_supported_) {
     image_create_info.samples = VK_SAMPLE_COUNT_4_BIT;
   } else {
     image_create_info.samples =
         VkSampleCountFlagBits(uint32_t(1) << uint32_t(host_msaa_samples));
   }
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -8484,12 +8939,24 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
   // Serialize the shader code.
   std::vector<unsigned int> shader_code;
   builder.dump(shader_code);
+  std::vector<uint32_t> patched_shader_code;
+  const uint32_t* shader_words =
+      reinterpret_cast<const uint32_t*>(shader_code.data());
+  size_t shader_size_bytes = sizeof(uint32_t) * shader_code.size();
+  if (msaa_single_sample_storage_) {
+    if (!PatchSpirvMultisampledFetchesToSingleSample(
+            shader_words, shader_size_bytes, patched_shader_code)) {
+      transfer_shaders_.emplace(key, VK_NULL_HANDLE);
+      return VK_NULL_HANDLE;
+    }
+    shader_words = patched_shader_code.data();
+    shader_size_bytes = sizeof(uint32_t) * patched_shader_code.size();
+  }
 
   // Create the shader module, and store the handle even if creation fails not
   // to try to create it again later.
   VkShaderModule shader_module = ui::vulkan::util::CreateShaderModule(
-      vulkan_device, reinterpret_cast<const uint32_t*>(shader_code.data()),
-      sizeof(uint32_t) * shader_code.size());
+      vulkan_device, shader_words, shader_size_bytes);
   if (shader_module == VK_NULL_HANDLE) {
     XELOGE(
         "VulkanRenderTargetCache: Failed to create the render target ownership "
@@ -8526,6 +8993,9 @@ VkPipeline VulkanRenderTargetCache::GetResolveInPassPipeline(
   shader_stages[0].pSpecializationInfo = nullptr;
   bool source_is_multisampled =
       render_pass_key.msaa_samples != xenos::MsaaSamples::k1X;
+  if (msaa_single_sample_storage_ && source_is_multisampled) {
+    return VK_NULL_HANDLE;
+  }
   shader_stages[1] = shader_stages[0];
   shader_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
   shader_stages[1].module =
@@ -8534,6 +9004,9 @@ VkPipeline VulkanRenderTargetCache::GetResolveInPassPipeline(
                                          (uint32_t(source_is_multisampled)
                                           << 1) |
                                          (uint32_t(writes_texture) << 2)];
+  if (shader_stages[1].module == VK_NULL_HANDLE) {
+    return VK_NULL_HANDLE;
+  }
 
   VkPipelineVertexInputStateCreateInfo vertex_input_state;
   vertex_input_state.sType =
@@ -8571,7 +9044,9 @@ VkPipeline VulkanRenderTargetCache::GetResolveInPassPipeline(
   rasterization_state.lineWidth = 1.0f;
 
   uint32_t pass_sample_count =
-      uint32_t(1) << uint32_t(render_pass_key.GetHostMsaaSamples());
+      msaa_single_sample_rasterization()
+          ? 1
+          : uint32_t(1) << uint32_t(render_pass_key.GetHostMsaaSamples());
   VkPipelineMultisampleStateCreateInfo multisample_state = {};
   multisample_state.sType =
       VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -8591,6 +9066,10 @@ VkPipeline VulkanRenderTargetCache::GetResolveInPassPipeline(
   VkPipelineColorBlendStateCreateInfo color_blend_state = {};
   color_blend_state.sType =
       VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  if (rasterization_order_color_access_) {
+    color_blend_state.flags |=
+        VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+  }
   color_blend_state.attachmentCount =
       32 - xe::lzcnt(render_pass_key.depth_and_color_used >> 1);
   color_blend_state.pAttachments = color_blend_attachments;
@@ -8674,7 +9153,7 @@ VkPipeline VulkanRenderTargetCache::GetResolveInPassPipeline(
   pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
   pipeline_create_info.basePipelineIndex = -1;
   VkPipeline pipeline = VK_NULL_HANDLE;
-  if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+  if (dfn.vkCreateGraphicsPipelines(device, UseRtPipelineCache(), 1,
                                     &pipeline_create_info, nullptr,
                                     &pipeline) != VK_SUCCESS) {
     XELOGE(
@@ -8724,9 +9203,11 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(
 
   // The host's (a 4x destination stored at 2x has 2 samples).
   uint32_t dest_sample_count =
-      key.shader_key.dest_host_2x
-          ? 2
-          : uint32_t(1) << uint32_t(key.shader_key.dest_msaa_samples);
+      msaa_single_sample_rasterization()
+          ? 1
+          : (key.shader_key.dest_host_2x
+                 ? 2
+                 : uint32_t(1) << uint32_t(key.shader_key.dest_msaa_samples));
   bool dest_is_masked_sample =
       dest_sample_count > 1 && !device_properties.sampleRateShading;
 
@@ -8969,7 +9450,8 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(
   pipeline_create_info.subpass = 0;
   pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
   pipeline_create_info.basePipelineIndex = -1;
-  if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+  VkPipelineCache rt_cache = UseRtPipelineCache();
+  if (dfn.vkCreateGraphicsPipelines(device, rt_cache, 1,
                                     &pipeline_create_info, nullptr,
                                     &pipelines[0]) != VK_SUCCESS) {
     XELOGE(
@@ -8994,7 +9476,7 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(
               : i;
       sample_id_specialization_constant = host_sample_index;
       sample_mask = uint32_t(1) << host_sample_index;
-      if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+      if (dfn.vkCreateGraphicsPipelines(device, rt_cache, 1,
                                         &pipeline_create_info, nullptr,
                                         &pipelines[i]) != VK_SUCCESS) {
         XELOGE(
@@ -10693,11 +11175,12 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
 
   // Create the pipeline, and store the handle even if creation fails not to try
   // to create it again later.
-  VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
-      command_processor_.GetVulkanDevice(),
+  VkPipeline pipeline = CreateSourceReadingComputePipeline(
+      msaa_single_sample_storage_, command_processor_.GetVulkanDevice(),
       key.is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_,
       reinterpret_cast<const uint32_t*>(shader_code.data()),
-      sizeof(uint32_t) * shader_code.size());
+      sizeof(uint32_t) * shader_code.size(), nullptr, "main", 0,
+      UseRtPipelineCache());
   if (pipeline == VK_NULL_HANDLE) {
     XELOGE(
         "VulkanRenderTargetCache: Failed to create a render target dumping "

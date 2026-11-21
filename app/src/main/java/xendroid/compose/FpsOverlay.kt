@@ -4,9 +4,12 @@ import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.BatteryState
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Process
 import android.os.SystemClock
+import android.view.InputDevice
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
@@ -96,23 +99,32 @@ private data class GpuSource(
 
 private fun findGpuSource(): GpuSource? {
     return runCatching {
-        val kgslPercent = File("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage")
-        if (kgslPercent.isFile) {
-            return GpuSource(directPercentFile = kgslPercent)
-        }
-
-        val kgslDevfreqLoad = File("/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load")
-        if (kgslDevfreqLoad.isFile) {
-            return GpuSource(directPercentFile = kgslDevfreqLoad)
+        val directCandidates = listOf(
+            "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+            "/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load",
+            "/sys/kernel/gpu/gpu_busy",
+            "/sys/class/misc/mali0/device/utilization",
+            "/sys/devices/platform/soc/mali0/utilization",
+            "/sys/module/ged/parameters/gpu_loading",
+        )
+        for (path in directCandidates) {
+            val f = File(path)
+            if (f.isFile && f.canRead()) {
+                return GpuSource(directPercentFile = f)
+            }
         }
 
         val devfreq = File("/sys/class/devfreq")
         devfreq.listFiles()?.forEach { node ->
             val name = node.name.lowercase(Locale.US)
-            if (name.contains("gpu") || name.contains("kgsl") || name.contains("3d")) {
-                val load = File(node, "load")
-                if (load.isFile) {
-                    return GpuSource(directPercentFile = load)
+            if (name.contains("gpu") || name.contains("kgsl") || name.contains("3d") ||
+                name.contains("mali") || name.contains("sgpu") || name.contains("xclipse")
+            ) {
+                for (leaf in listOf("load", "utilization", "cur_load")) {
+                    val load = File(node, leaf)
+                    if (load.isFile && load.canRead()) {
+                        return GpuSource(directPercentFile = load)
+                    }
                 }
             }
         }
@@ -126,14 +138,37 @@ private fun findGpuSource(): GpuSource? {
     }.getOrNull()
 }
 
-private fun readDirectGpuPercent(file: File): Int? {
+internal fun parseDirectGpuPercent(raw: String?): Int? {
+    if (raw.isNullOrBlank()) return null
+    val match = Regex("(\\d+(?:\\.\\d+)?)").find(raw.trim()) ?: return null
+    val value = match.groupValues[1].toFloatOrNull() ?: return null
+    if (!value.isFinite() || value < 0f) return null
+    return value.coerceIn(0f, 100f).roundToInt()
+}
+
+private fun readDirectGpuPercent(file: File): Int? =
+    runCatching { parseDirectGpuPercent(file.readText()) }.getOrNull()
+
+/** Reads the lowest connected physical Bluetooth/USB gamepad battery % on Android 12+ (API 31+). */
+internal fun readControllerBatteryPercent(): Int? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
     return runCatching {
-        file.readText()
-            .trim()
-            .removeSuffix("%")
-            .toFloatOrNull()
-            ?.coerceIn(0f, 100f)
-            ?.roundToInt()
+        var lowest: Int? = null
+        for (id in InputDevice.getDeviceIds()) {
+            val dev = InputDevice.getDevice(id) ?: continue
+            if (dev.isVirtual) continue
+            val src = dev.sources
+            val isPad = (src and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+                (src and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+            if (!isPad) continue
+            val bat = dev.batteryState
+            if (!bat.isPresent || bat.status == BatteryState.STATUS_UNKNOWN) continue
+            val cap = bat.capacity
+            if (!cap.isFinite() || cap !in 0f..1f) continue
+            val pct = (cap * 100f).roundToInt().coerceIn(0, 100)
+            lowest = if (lowest == null) pct else minOf(lowest, pct)
+        }
+        lowest
     }.getOrNull()
 }
 
@@ -249,6 +284,7 @@ internal data class HudSample(
     val socCelsius: Float? = null,
     val power: PowerReading? = null,
     val gpuMemory: Long? = null,
+    val controllerBattery: Int? = null,
     /** With frame generation on: the frames per second reaching the screen (the game's and the generated ones). */
     val fgFps: Double? = null,
     val zeroFg: ZeroFgHudReadout? = null,
@@ -333,6 +369,7 @@ fun FpsOverlay(
     var socTemp by remember { mutableStateOf<Float?>(null) }
     var power by remember { mutableStateOf<PowerReading?>(null) }
     var gpuMemory by remember { mutableStateOf<Long?>(null) }
+    var controllerBattery by remember { mutableStateOf<Int?>(null) }
     var fgFps by remember { mutableStateOf<Double?>(null) }
     var zeroFg by remember { mutableStateOf<ZeroFgHudReadout?>(null) }
     val batteryEstimate = remember { BatteryTimeEstimate() }
@@ -391,6 +428,7 @@ fun FpsOverlay(
 
             var nextPower = power
             var nextGpuMemory = gpuMemory
+            var nextControllerBattery = controllerBattery
             val stats = withContext(Dispatchers.IO) {
                 if (HudMetric.GPU in metrics && gpuSource == null) {
                     gpuSource = findGpuSource()
@@ -447,6 +485,9 @@ fun FpsOverlay(
                 if (HudMetric.GPU_MEMORY in metrics && tick % pollHz.coerceIn(1, 10) == 0L) {
                     nextGpuMemory = runCatching { KgslMemory.parse(File(KgslMemory.PATH).readText()) }.getOrNull()
                 }
+                if (HudMetric.CONTROLLER_BATTERY in metrics && tick % pollHz.coerceIn(1, 10) == 0L) {
+                    nextControllerBattery = readControllerBatteryPercent()
+                }
                 tick++
                 Triple(cpuUsage, gpuUsage, ram) to (bTemp to sTemp)
             }
@@ -461,12 +502,13 @@ fun FpsOverlay(
             socTemp = stats.second.second
             power = nextPower
             gpuMemory = nextGpuMemory
+            controllerBattery = nextControllerBattery
 
             delay(periodMs)
         }
     }
 
-    val sample = HudSample(fps, frameMs, presentSubmissionsPerSecond, cpu, gpu, ramUsed, ramTotal, batTemp, socTemp, power, gpuMemory, fgFps, zeroFg)
+    val sample = HudSample(fps, frameMs, presentSubmissionsPerSecond, cpu, gpu, ramUsed, ramTotal, batTemp, socTemp, power, gpuMemory, controllerBattery, fgFps, zeroFg)
     val graph = if (style.graph) history else null
     if (style.layout == HudLayout.HORIZONTAL) {
         // Round 2: a bar along the top or the bottom; a pinch sizes it, kept for this game.
@@ -579,6 +621,13 @@ private fun hudLines(sample: HudSample, metrics: Set<HudMetric>): List<HudLine> 
                 add(HudLine(stringResource(R.string.xd_hud_battery_time), AnnotatedString(it), metric = HudMetric.BATTERY_TIME))
             }
         }
+        if (HudMetric.CONTROLLER_BATTERY in metrics) sample.controllerBattery?.let { level ->
+            add(HudLine(stringResource(R.string.xd_hud_controller_battery), AnnotatedString("$level%"), when {
+                level <= 10 -> HudTone.BAD
+                level <= 20 -> HudTone.WARN
+                else -> HudTone.NORMAL
+            }, HudMetric.CONTROLLER_BATTERY))
+        }
     }
 }
 
@@ -594,6 +643,7 @@ private fun metricColor(metric: HudMetric?): Color = when (metric) {
     HudMetric.BATTERY_LEVEL -> Color(0xFF9BE37F)
     HudMetric.BATTERY_TIME -> Color(0xFFFFD58A)
     HudMetric.HOST_SUBMISSIONS -> Color(0xFFB8C4BD)
+    HudMetric.CONTROLLER_BATTERY -> Color(0xFF7FE3B2)
 }
 
 /** The label's colour: grey at no colour, the metric's own at full ([HudStyle.colors]). */

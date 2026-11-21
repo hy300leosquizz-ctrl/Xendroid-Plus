@@ -80,7 +80,7 @@
     <string name="xd_data_cover_reset">Usar o ícone</string>
     <string name="xd_data_edit">Editar</string>
     <string name="xd_data_compress">Comprimir…</string>
-    <string name="xd_data_compress_sub">O .iso fica intacto até o .zar ser criado e verificado</string>
+    <string name="xd_data_compress_sub">O disco ou pasta original fica intacto até o .zar ser criado e verificado</string>
     <string name="xd_data_create">Criar</string>
     <string name="xd_data_shortcut_sub">Atalho na tela inicial do Android</string>
     <string name="xd_data_open">Abrir</string>
@@ -182,4 +182,6 @@
     <string name="xd_game_patches_others_note">Não valem para a versão que você joga.</string>
     <string name="xd_game_patches_any">Sem versão indicada</string>
     <string name="xd_game_version_of">versão %1$s</string>
+    <string name="xd_launch_xex_pick">Escolher executável</string>
+    <string name="xd_launch_xex_pick_sub">Coletânea ou módulos na pasta</string>
 </resources>

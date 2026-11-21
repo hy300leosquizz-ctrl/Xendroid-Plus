@@ -18,6 +18,8 @@
 #include "xenia/gpu/shader_storage.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 
+DECLARE_bool(spirv_specialize_no_alpha);
+
 int main(int argc, char** argv) {
   if (argc < 4) {
     std::fprintf(stderr,
@@ -80,9 +82,10 @@ int main(int argc, char** argv) {
                   xe::gpu::xenos::kMaxShaderTempRegisters));
           mod.pixel.interpolator_mask = 0xFFFF;
           mod.pixel.color_targets_used = shader.writes_color_targets();
-          mod.pixel.depth_stencil_mode = shader.writes_color_target(0)
-                                             ? Mode::kNoAlphaTests
-                                             : Mode::kNoModifiers;
+          mod.pixel.depth_stencil_mode =
+              cvars::spirv_specialize_no_alpha && shader.writes_color_target(0)
+                  ? Mode::kNoAlphaTests
+                  : Mode::kNoModifiers;
         } else {
           mod = Translator::Modification(
               translator.GetDefaultVertexShaderModification(

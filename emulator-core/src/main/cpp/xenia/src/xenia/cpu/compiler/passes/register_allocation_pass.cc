@@ -12,9 +12,21 @@
 #include <cstring>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/cpu/backend/backend.h"
+#include "xenia/cpu/compiler/compiler.h"
+#include "xenia/cpu/processor.h"
+
+DEFINE_bool(
+    a64_call_aware_volatile_gprs, true,
+    "Allow the register allocator to assign caller-saved volatile GPRs "
+    "(x5-x13 on ARM64) to SSA values whose live intervals do not touch or "
+    "cross any helper/guest call, saving callee-saved registers (x22-x28) "
+    "for call-crossing values and reducing stack spills.",
+    "CPU");
 
 namespace xe {
 namespace cpu {
@@ -88,10 +100,36 @@ bool RegisterAllocationPass::Run(HIRBuilder* builder) {
     }
   }
 
+  const bool tracing_compiled =
+      processor_ && processor_->backend() &&
+      (processor_->backend()->trace_instr_available() ||
+       processor_->backend()->trace_data_available());
+  volatile_gprs_enabled_ =
+      cvars::a64_call_aware_volatile_gprs && !tracing_compiled &&
+      usage_sets_.int_set && usage_sets_.int_set->set->volatile_mask != 0;
+
   auto block = builder->first_block();
   while (block) {
     // Reset all state.
     PrepareBlockState();
+
+    block_base_ordinal_ = block->instr_head ? block->instr_head->ordinal : 0;
+    if (volatile_gprs_enabled_ && block->instr_head) {
+      const uint32_t block_instr_count =
+          block->instr_tail->ordinal - block_base_ordinal_ + 1;
+      clobber_prefix_.resize(block_instr_count + 1);
+      clobber_prefix_[0] = 0;
+      uint32_t clobbers = 0;
+      for (auto cur = block->instr_head; cur; cur = cur->next) {
+        const uint32_t idx = cur->ordinal - block_base_ordinal_;
+        if (ClobbersVolatileGprs(cur)) {
+          ++clobbers;
+        }
+        clobber_prefix_[idx + 1] = clobbers;
+      }
+    } else {
+      clobber_prefix_.clear();
+    }
 
     auto instr = block->instr_head;
     while (instr) {
@@ -145,7 +183,12 @@ bool RegisterAllocationPass::Run(HIRBuilder* builder) {
         if (!allocated) {
           // Failed to allocate register -- need to spill and try again.
           // We spill only those registers we aren't using.
-          if (!SpillOneRegister(builder, block, instr->dest->type)) {
+          const auto* dest_set = RegisterSetForValue(instr->dest);
+          const bool allow_volatile =
+              !dest_set || !dest_set->set->volatile_mask ||
+              CanUseVolatileRegister(instr->dest);
+          if (!SpillOneRegister(builder, block, instr->dest->type,
+                                allow_volatile)) {
             // Unable to spill anything - this shouldn't happen.
             XELOGE("Unable to spill any registers");
             assert_always();
@@ -290,13 +333,71 @@ RegisterAllocationPass::MarkRegAvailable(const hir::RegAssignment& reg) {
   return usage_set;
 }
 
+bool RegisterAllocationPass::ClobbersVolatileGprs(const Instr* instr) {
+  switch (instr->GetOpcodeNum()) {
+    case OPCODE_CALL:
+    case OPCODE_CALL_TRUE:
+    case OPCODE_CALL_INDIRECT:
+    case OPCODE_CALL_INDIRECT_TRUE:
+    case OPCODE_CALL_EXTERN:
+    case OPCODE_DEBUG_BREAK:
+    case OPCODE_DEBUG_BREAK_TRUE:
+    case OPCODE_TRAP:
+    case OPCODE_TRAP_TRUE:
+    case OPCODE_CHECK_PREEMPT:
+    case OPCODE_SPIN_BACKOFF:
+    case OPCODE_DELAY_EXECUTION:
+    case OPCODE_LOAD_CLOCK:
+    case OPCODE_LOAD_MMIO:
+    case OPCODE_STORE_MMIO:
+    case OPCODE_RESERVED_LOAD:
+    case OPCODE_RESERVED_STORE:
+    case OPCODE_POW2:
+    case OPCODE_LOG2:
+    case OPCODE_RSQRT:
+      return true;
+    case OPCODE_LOAD:
+    case OPCODE_LOAD_OFFSET:
+      // 32-bit guest loads can route through MMIOAwareLoad.
+      return instr->dest && instr->dest->type == INT32_TYPE;
+    case OPCODE_STORE:
+      // 32-bit guest stores can route through MMIOAwareStore.
+      return instr->src2.value && instr->src2.value->type == INT32_TYPE;
+    case OPCODE_STORE_OFFSET:
+      return instr->src3.value && instr->src3.value->type == INT32_TYPE;
+    default:
+      return false;
+  }
+}
+
+bool RegisterAllocationPass::CanUseVolatileRegister(const Value* value) const {
+  const auto* usage_set = RegisterSetForValue(value);
+  if (!usage_set || !usage_set->set->volatile_mask) {
+    return true;
+  }
+  if (!volatile_gprs_enabled_ || !value->def) {
+    return false;
+  }
+  const uint32_t def_idx = value->def->ordinal - block_base_ordinal_;
+  const Instr* last_instr =
+      (value->use_head && value->last_use) ? value->last_use : value->def;
+  const uint32_t last_idx = last_instr->ordinal - block_base_ordinal_;
+  if (last_idx < def_idx || last_idx + 1 >= clobber_prefix_.size()) {
+    return false;
+  }
+  return clobber_prefix_[last_idx + 1] == clobber_prefix_[def_idx];
+}
+
 bool RegisterAllocationPass::TryAllocateRegister(
     Value* value, const RegAssignment& preferred_reg) {
   // If the preferred register matches type and is available, use it.
   auto usage_set = RegisterSetForValue(value);
   if (usage_set->set == preferred_reg.set) {
-    // Check if available.
-    if (!IsRegInUse(preferred_reg)) {
+    const uint32_t vol_mask = usage_set->set->volatile_mask;
+    const bool reg_is_volatile =
+        vol_mask && (vol_mask & (1u << preferred_reg.index));
+    if ((!reg_is_volatile || CanUseVolatileRegister(value)) &&
+        !IsRegInUse(preferred_reg)) {
       // Mark as in-use and return. Best case.
       MarkRegUsed(preferred_reg, value, value->use_head);
       value->reg = preferred_reg;
@@ -312,13 +413,29 @@ bool RegisterAllocationPass::TryAllocateRegister(Value* value) {
   // Get the set this register is in.
   RegisterSetUsage* usage_set = RegisterSetForValue(value);
 
-  // Find the first free register, if any.
-  // We have to ensure it's a valid one (in our count).
+  const uint32_t valid_mask =
+      usage_set->count >= 32 ? ~0u : ((1u << usage_set->count) - 1u);
+  const uint32_t avail =
+      static_cast<uint32_t>(usage_set->availability.to_ulong()) & valid_mask;
+  const uint32_t vol_mask = usage_set->set->volatile_mask & valid_mask;
+  const bool allow_volatile = !vol_mask || CanUseVolatileRegister(value);
+
   uint32_t first_unused = 0;
-  bool none_used = xe::bit_scan_forward(
-      static_cast<uint32_t>(usage_set->availability.to_ulong()), &first_unused);
-  if (none_used && first_unused < usage_set->count) {
-    // Available! Use it!
+  if (vol_mask && allow_volatile) {
+    // Prefer caller-saved volatile GPRs for short non-call intervals so
+    // callee-saved GPRs remain available for call-crossing values.
+    if (xe::bit_scan_forward(avail & vol_mask, &first_unused) ||
+        xe::bit_scan_forward(avail & ~vol_mask, &first_unused)) {
+      value->reg.set = usage_set->set;
+      value->reg.index = first_unused;
+      MarkRegUsed(value->reg, value, value->use_head);
+      return true;
+    }
+    return false;
+  }
+
+  const uint32_t candidate_mask = allow_volatile ? avail : (avail & ~vol_mask);
+  if (xe::bit_scan_forward(candidate_mask, &first_unused)) {
     value->reg.set = usage_set->set;
     value->reg.index = first_unused;
     MarkRegUsed(value->reg, value, value->use_head);
@@ -376,7 +493,8 @@ bool FindContextResidence(const Value* value, const Value::Use* next_use,
 }  // namespace
 
 bool RegisterAllocationPass::SpillOneRegister(HIRBuilder* builder, Block* block,
-                                              TypeName required_type) {
+                                              TypeName required_type,
+                                              bool allow_volatile) {
   // Get the set that we will be picking from.
   RegisterSetUsage* usage_set;
   if (required_type <= INT64_TYPE) {
@@ -388,11 +506,25 @@ bool RegisterAllocationPass::SpillOneRegister(HIRBuilder* builder, Block* block,
   }
 
   DumpUsage("SpillOneRegister (pre)");
-  // Pick the one with the furthest next use.
+  // Pick the one with the furthest next use (restricted to non-volatile
+  // registers when the incoming value cannot live in a volatile register).
   assert_true(!usage_set->upcoming_uses.empty());
-  auto furthest_usage =
-      std::max_element(usage_set->upcoming_uses.begin(),
-                       usage_set->upcoming_uses.end(), &RegisterUsage::Compare);
+  const uint32_t vol_mask = usage_set->set->volatile_mask;
+  auto furthest_usage = usage_set->upcoming_uses.end();
+  for (auto it = usage_set->upcoming_uses.begin();
+       it != usage_set->upcoming_uses.end(); ++it) {
+    if (!allow_volatile && vol_mask &&
+        (vol_mask & (1u << it->value->reg.index))) {
+      continue;
+    }
+    if (furthest_usage == usage_set->upcoming_uses.end() ||
+        RegisterUsage::Compare(*furthest_usage, *it)) {
+      furthest_usage = it;
+    }
+  }
+  if (furthest_usage == usage_set->upcoming_uses.end()) {
+    return false;
+  }
   assert_true(furthest_usage->value->def->block == block);
   assert_true(furthest_usage->use->instr->block == block);
   auto spill_value = furthest_usage->value;
@@ -475,6 +607,7 @@ bool RegisterAllocationPass::SpillOneRegister(HIRBuilder* builder, Block* block,
   }
   auto spill_load = builder->last_instr();
   spill_load->MoveBefore(next_use->instr);
+  spill_load->ordinal = next_use->instr->ordinal;
   // Note: implicit first use added.
 
 #if ASSERT_NO_CYCLES
@@ -535,7 +668,7 @@ bool RegisterAllocationPass::SpillOneRegister(HIRBuilder* builder, Block* block,
 }
 
 RegisterAllocationPass::RegisterSetUsage*
-RegisterAllocationPass::RegisterSetForValue(const Value* value) {
+RegisterAllocationPass::RegisterSetForValue(const Value* value) const {
   if (value->type <= INT64_TYPE) {
     return usage_sets_.int_set;
   } else if (value->type <= FLOAT64_TYPE) {

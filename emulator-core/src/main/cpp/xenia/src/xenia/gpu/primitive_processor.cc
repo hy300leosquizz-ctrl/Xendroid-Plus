@@ -17,6 +17,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/xxhash.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/shader.h"
@@ -69,6 +70,21 @@ DEFINE_int32(
     "Setting this to a very high value may result in excessive CPU processing, "
     "while a very low value may result in excessive locking and lookups.\n"
     "Negative values disable caching.",
+    "GPU");
+
+DEFINE_bool(
+    preswap_16bit_indices, true,
+    "Pre-swap big-endian 16-bit guest index buffers on the CPU with an "
+    "8192-entry 4-way set-associative LRU cache so host GPUs fetch native "
+    "little-endian indices without per-vertex ALU byte-swapping or shared "
+    "memory uploads (adapted from DEGROUCHO/xendroid-mali, BSD-3-Clause).",
+    "GPU");
+
+DEFINE_bool(
+    preswap_volatile_validate, true,
+    "Re-hash volatile 16-bit index buffers that were repeatedly invalidated "
+    "(stale_streak >= 2) to guard against uncaptured guest ring-buffer "
+    "overwrites.",
     "GPU");
 
 namespace xe {
@@ -287,6 +303,8 @@ void PrimitiveProcessor::ShutdownCommon() {
                   sizeof(cache_buckets_non_empty_l1_));
       std::memset(cache_buckets_non_empty_l2_, 0,
                   sizeof(cache_buckets_non_empty_l2_));
+      preswap_entries_.clear();
+      preswap_non_empty_sets_.fill(0);
     }
     memory_.UnregisterPhysicalMemoryInvalidationCallback(
         memory_invalidation_callback_handle_);
@@ -301,6 +319,7 @@ void PrimitiveProcessor::ClearPerFrameCache() {
     return;
   }
   auto global_lock = global_critical_region_.Acquire();
+  ++preswap_frame_epoch_;
   for (const std::pair<CacheKey, size_t>& cache_map_entry : cache_map_) {
     cache_entry_pool_[cache_map_entry.second].free_next =
         cache_bucket_free_first_entry_;
@@ -351,6 +370,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
             // - 415607E1 - nets above barrels in the beginning of the first
             //   mission (turn right after the end of the intro) -
             //   kTriangleList.
+            // - 4D53085B - faces of the characters in the campaign cinematics -
+            //   indexed kTriangleStrip.
             host_vertex_shader_type =
                 Shader::HostVertexShaderType::kTriangleDomainCPIndexed;
             break;
@@ -1064,6 +1085,19 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
             cache_transaction.SetNewResult(cacheable);
           }
         }
+      }
+      if (cacheable.index_buffer_type == ProcessedIndexBufferType::kGuestDMA &&
+          guest_index_format == xenos::IndexFormat::kInt16 &&
+          guest_index_endian == xenos::Endian::k8in16 &&
+          (!guest_primitive_reset_enabled ||
+           guest_primitive_reset_index_guest_endian == UINT16_MAX) &&
+          cvars::preswap_16bit_indices && guest_draw_vertex_count > 0 &&
+          !shared_memory_.IsRangeGpuWritten(guest_index_base,
+                                            guest_index_buffer_needed_bytes)) {
+        trace_writer_.WriteMemoryRead(guest_index_base,
+                                      guest_index_buffer_needed_bytes);
+        TryPreswap16BitIndices(guest_index_base, guest_draw_vertex_count,
+                               cacheable);
       }
     }
   }
@@ -1785,10 +1819,229 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
       }
     }
   }
+  if (!preswap_entries_.empty()) {
+    for (size_t word_idx = 0; word_idx < preswap_non_empty_sets_.size();
+         ++word_idx) {
+      uint64_t word = preswap_non_empty_sets_[word_idx];
+      while (word) {
+        uint32_t bit = 0;
+        if (!xe::bit_scan_forward(word, &bit)) {
+          break;
+        }
+        word &= ~(uint64_t(1) << bit);
+        const uint32_t set_idx = uint32_t(word_idx * 64 + bit);
+        const size_t base_slot = size_t(set_idx) * kPreswapWays;
+        bool any_valid_in_set = false;
+        for (uint32_t way = 0; way < kPreswapWays; ++way) {
+          PreswapEntry& pentry = preswap_entries_[base_slot + way];
+          if (!pentry.valid) {
+            continue;
+          }
+          const uint32_t p_end =
+              pentry.guest_base + pentry.count * uint32_t(sizeof(uint16_t));
+          if (pentry.guest_base < physical_address_end &&
+              p_end > physical_address_start) {
+            pentry.valid = false;
+            pentry.frame_handle = SIZE_MAX;
+            if (pentry.stale_streak < UINT16_MAX) {
+              ++pentry.stale_streak;
+            }
+            any_invalidated = true;
+          } else {
+            any_valid_in_set = true;
+          }
+        }
+        if (!any_valid_in_set) {
+          preswap_non_empty_sets_[word_idx] &= ~(uint64_t(1) << bit);
+        }
+      }
+    }
+  }
   return any_invalidated
              ? std::make_pair(physical_address_start,
                               physical_address_end - physical_address_start)
              : std::make_pair(uint32_t(0), UINT32_MAX);
+}
+
+void PrimitiveProcessor::ByteSwap16Indices(uint16_t* dest,
+                                           const uint16_t* source,
+                                           uint32_t count) {
+#if XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE
+  while (count && (reinterpret_cast<uintptr_t>(source) &
+                   (XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE - 1))) {
+    --count;
+    *(dest++) = xe::byte_swap(*(source++));
+  }
+  if (count >= kSimdVectorU16Elements) {
+#if XE_ARCH_AMD64
+    const __m128i swap_mask =
+        _mm_set_epi8(14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1);
+#endif
+    while (count >= kSimdVectorU16Elements) {
+      count -= kSimdVectorU16Elements;
+      SimdVectorU16 vec = LoadAlignedVectorU16(source);
+      source += kSimdVectorU16Elements;
+#if XE_ARCH_AMD64
+      vec = _mm_shuffle_epi8(vec, swap_mask);
+#elif XE_ARCH_ARM64
+      vec = vreinterpretq_u16_u8(vrev16q_u8(vreinterpretq_u8_u16(vec)));
+#endif
+      StoreUnalignedVectorU16(dest, vec);
+      dest += kSimdVectorU16Elements;
+    }
+  }
+#endif
+  while (count--) {
+    *(dest++) = xe::byte_swap(*(source++));
+  }
+}
+
+bool PrimitiveProcessor::TryPreswap16BitIndices(uint32_t guest_index_base,
+                                                uint32_t count,
+                                                CachedResult& cacheable_io) {
+  const uint32_t byte_len = count * uint32_t(sizeof(uint16_t));
+  const uint16_t* guest_indices =
+      memory_.TranslatePhysical<const uint16_t*>(guest_index_base);
+  if (!guest_indices) {
+    return false;
+  }
+
+  // Tiny draws (< 64 indices): swap directly into the current frame's upload
+  // pool without page-protection overhead.
+  if (count < 64) {
+    size_t handle = SIZE_MAX;
+    auto* dst = reinterpret_cast<uint16_t*>(
+        RequestHostConvertedIndexBufferForCurrentFrame(
+            xenos::IndexFormat::kInt16, count, true, guest_index_base, handle));
+    if (!dst) {
+      return false;
+    }
+    ByteSwap16Indices(dst, guest_indices, count);
+    cacheable_io.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
+    cacheable_io.host_index_format = xenos::IndexFormat::kInt16;
+    cacheable_io.host_shader_index_endian = xenos::Endian::kNone;
+    cacheable_io.host_index_buffer_handle = handle;
+    return true;
+  }
+
+  if (!memory_invalidation_callback_handle_) {
+    memory_invalidation_callback_handle_ =
+        memory_.RegisterPhysicalMemoryInvalidationCallback(
+            MemoryInvalidationCallbackThunk, this);
+  }
+
+  const uint32_t set_idx =
+      ((guest_index_base >> 2) ^ (count * UINT32_C(0x9E3779B1))) &
+      (kPreswapSets - 1);
+  const size_t base_slot = size_t(set_idx) * kPreswapWays;
+
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (preswap_entries_.empty()) {
+      preswap_entries_.resize(kPreswapTotalEntries);
+    }
+    for (uint32_t way = 0; way < kPreswapWays; ++way) {
+      PreswapEntry& entry = preswap_entries_[base_slot + way];
+      if (!entry.valid || entry.guest_base != guest_index_base ||
+          entry.count != count) {
+        continue;
+      }
+      if (cvars::preswap_volatile_validate && entry.stale_streak >= 2) {
+        const uint64_t cur_hash = XXH3_64bits(guest_indices, byte_len);
+        if (cur_hash != entry.raw_hash) {
+          entry.valid = false;
+          entry.frame_handle = SIZE_MAX;
+          if (entry.stale_streak < UINT16_MAX) {
+            ++entry.stale_streak;
+          }
+          break;
+        }
+      }
+      entry.lru_tick = ++preswap_lru_clock_;
+      if (entry.frame_epoch == preswap_frame_epoch_ &&
+          entry.frame_handle != SIZE_MAX) {
+        cacheable_io.index_buffer_type =
+            ProcessedIndexBufferType::kHostConverted;
+        cacheable_io.host_index_format = xenos::IndexFormat::kInt16;
+        cacheable_io.host_shader_index_endian = xenos::Endian::kNone;
+        cacheable_io.host_index_buffer_handle = entry.frame_handle;
+        return true;
+      }
+      size_t handle = SIZE_MAX;
+      auto* dst = reinterpret_cast<uint16_t*>(
+          RequestHostConvertedIndexBufferForCurrentFrame(
+              xenos::IndexFormat::kInt16, count, false, guest_index_base,
+              handle));
+      if (!dst) {
+        return false;
+      }
+      std::memcpy(dst, entry.swapped_indices.data(), byte_len);
+      entry.frame_epoch = preswap_frame_epoch_;
+      entry.frame_handle = handle;
+      cacheable_io.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
+      cacheable_io.host_index_format = xenos::IndexFormat::kInt16;
+      cacheable_io.host_shader_index_endian = xenos::Endian::kNone;
+      cacheable_io.host_index_buffer_handle = handle;
+      return true;
+    }
+  }
+
+  // Cache miss: arm physical memory write callbacks, byte-swap, and populate
+  // the LRU way.
+  size_t handle = SIZE_MAX;
+  auto* dst = reinterpret_cast<uint16_t*>(
+      RequestHostConvertedIndexBufferForCurrentFrame(
+          xenos::IndexFormat::kInt16, count, true, guest_index_base, handle));
+  if (!dst) {
+    return false;
+  }
+
+  std::vector<uint16_t> swapped(count);
+  ByteSwap16Indices(swapped.data(), guest_indices, count);
+  std::memcpy(dst, swapped.data(), byte_len);
+  const uint64_t raw_hash =
+      cvars::preswap_volatile_validate ? XXH3_64bits(guest_indices, byte_len) : 0;
+
+  memory_.EnablePhysicalMemoryAccessCallbacks(guest_index_base, byte_len, true,
+                                              false);
+
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (preswap_entries_.empty()) {
+      preswap_entries_.resize(kPreswapTotalEntries);
+    }
+    uint32_t victim_way = 0;
+    for (uint32_t way = 0; way < kPreswapWays; ++way) {
+      const PreswapEntry& cand = preswap_entries_[base_slot + way];
+      if (!cand.valid ||
+          (cand.guest_base == guest_index_base && cand.count == count)) {
+        victim_way = way;
+        break;
+      }
+      if (cand.lru_tick < preswap_entries_[base_slot + victim_way].lru_tick) {
+        victim_way = way;
+      }
+    }
+    PreswapEntry& victim = preswap_entries_[base_slot + victim_way];
+    if (victim.guest_base != guest_index_base || victim.count != count) {
+      victim.stale_streak = 0;
+    }
+    victim.guest_base = guest_index_base;
+    victim.count = count;
+    victim.raw_hash = raw_hash;
+    victim.lru_tick = ++preswap_lru_clock_;
+    victim.valid = true;
+    victim.frame_epoch = preswap_frame_epoch_;
+    victim.frame_handle = handle;
+    victim.swapped_indices = std::move(swapped);
+    preswap_non_empty_sets_[set_idx >> 6] |= uint64_t(1) << (set_idx & 63);
+  }
+
+  cacheable_io.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
+  cacheable_io.host_index_format = xenos::IndexFormat::kInt16;
+  cacheable_io.host_shader_index_endian = xenos::Endian::kNone;
+  cacheable_io.host_index_buffer_handle = handle;
+  return true;
 }
 
 std::pair<uint32_t, uint32_t>

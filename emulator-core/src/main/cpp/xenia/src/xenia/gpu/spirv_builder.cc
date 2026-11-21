@@ -15,6 +15,28 @@
 namespace xe {
 namespace gpu {
 
+spv::Id SpirvBuilder::createTriOp(spv::Op op_code, spv::Id type_id,
+                                  spv::Id operand1, spv::Id operand2,
+                                  spv::Id operand3) {
+  if (op_code == spv::OpSelect && isVectorType(type_id) &&
+      isScalarType(getTypeId(operand1)) &&
+      (rewrite_scalar_vector_select_ || getSpvVersion() < spv::Spv_1_4)) {
+    int num_components = getNumTypeComponents(type_id);
+    spv::Id bool_vec_type = makeVectorType(makeBoolType(), num_components);
+    bool is_const = isConstant(operand1);
+    bool is_spec_const = isSpecConstant(operand1);
+    if (is_const || is_spec_const) {
+      std::vector<spv::Id> components(size_t(num_components), operand1);
+      operand1 =
+          makeCompositeConstant(bool_vec_type, components, is_spec_const);
+    } else {
+      operand1 = smearScalar(spv::NoPrecision, operand1, bool_vec_type);
+    }
+  }
+  return spv::Builder::createTriOp(op_code, type_id, operand1, operand2,
+                                   operand3);
+}
+
 spv::Id SpirvBuilder::createQuadOp(spv::Op op_code, spv::Id type_id,
                                    spv::Id operand1, spv::Id operand2,
                                    spv::Id operand3, spv::Id operand4) {

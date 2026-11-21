@@ -276,6 +276,18 @@ class ExceptionHandler {
   // Uninstalls a previously-installed exception handler.
   static void Uninstall(Handler fn, void* data);
 
+  // Fast-path handler for watched memory Data Aborts (POSIX ARM64).
+  // Invoked directly from the signal handler using ESR_EL1 (esr_context) before
+  // copying GPRs or 2x512 B of NEON fpsimd_context (v0-v31). Returns true when
+  // the fault was resolved in-place (e.g., watched page unprotected so the
+  // faulting instruction can retry), or false to fall through to the full
+  // HostThreadContext exception handler chain.
+  typedef bool (*FastAccessViolationHandler)(void* data, uint64_t fault_pc,
+                                             uint64_t fault_address,
+                                             bool is_write);
+  static void SetFastAccessViolationHandler(FastAccessViolationHandler fn,
+                                            void* data);
+
   // XenDroid (C01): called when no installed handler resolved a fault, right
   // before the handler that was there before ours runs (on Android, debuggerd:
   // the process dies). Runs inside the signal handler, so it must be

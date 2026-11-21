@@ -300,6 +300,76 @@ static void GenerationGpuTimesAreBucketedAndFailuresAreNotStale() {
   assert(timed == 3);
 }
 
+static void PresenterAdpfReportsPerFrameAndDeduplicatesTargets() {
+  struct FakeAdpf {
+    int creates = 0;
+    int closes = 0;
+    bool fail_create = false;
+    std::vector<int32_t> created_tids;
+    std::vector<int64_t> target_updates;
+    std::vector<int64_t> actual_reports;
+    int token = 1;
+  } fake;
+
+  PresenterAdpfApi api{
+      &fake,
+      [](void* ctx, int32_t tid, int64_t target_ns) -> void* {
+        auto* f = static_cast<FakeAdpf*>(ctx);
+        f->creates++;
+        if (f->fail_create) return nullptr;
+        f->created_tids.push_back(tid);
+        f->target_updates.push_back(target_ns);
+        return reinterpret_cast<void*>(intptr_t(f->token++));
+      },
+      [](void* ctx, void*, int64_t target_ns) {
+        static_cast<FakeAdpf*>(ctx)->target_updates.push_back(target_ns);
+      },
+      [](void* ctx, void*, int64_t actual_ns) {
+        static_cast<FakeAdpf*>(ctx)->actual_reports.push_back(actual_ns);
+      },
+      [](void* ctx, void*) { static_cast<FakeAdpf*>(ctx)->closes++; },
+  };
+
+  PresenterAdpfTracker tracker;
+  // Disabled (target_ns == 0): never opens a session.
+  assert(tracker.OnFrame(api, 101, 8 * kMs, 0) == 0);
+  assert(fake.creates == 0);
+
+  // Five frames at 60 FPS (16.67 ms): one create, zero redundant target updates, five frame reports.
+  for (int i = 1; i <= 5; ++i) {
+    assert(tracker.OnFrame(api, 101, i * kMs, 16666667) == 1);
+  }
+  assert(fake.creates == 1);
+  assert((fake.target_updates == std::vector<int64_t>{16666667}));
+  assert((fake.actual_reports == std::vector<int64_t>{1 * kMs, 2 * kMs, 3 * kMs, 4 * kMs, 5 * kMs}));
+
+  // Switching FPS limit to 40 FPS (25 ms) updates the target once and keeps reporting per frame.
+  assert(tracker.OnFrame(api, 101, 11 * kMs, 25000000) == 1);
+  assert(tracker.OnFrame(api, 101, 12 * kMs, 25000000) == 1);
+  assert(fake.creates == 1);
+  assert((fake.target_updates == std::vector<int64_t>{16666667, 25000000}));
+  assert(fake.actual_reports.size() == 7);
+
+  // Presenter thread handoff (e.g. FG worker thread): closes old session and opens a new one.
+  assert(tracker.OnFrame(api, 202, 6 * kMs, 25000000) == 1);
+  assert(fake.closes == 1 && fake.creates == 2);
+  assert((fake.created_tids == std::vector<int32_t>{101, 202}));
+
+  // Menu/background suspension closes immediately.
+  tracker.SyncTarget(api, 0);
+  assert(fake.closes == 2 && tracker.state() == 0);
+
+  // Unsupported device latches -1 without retrying createSession every frame until reset.
+  fake.fail_create = true;
+  assert(tracker.OnFrame(api, 202, 7 * kMs, 16666667) == -1);
+  assert(tracker.OnFrame(api, 202, 8 * kMs, 16666667) == -1);
+  assert(fake.creates == 3);
+  tracker.SyncTarget(api, 0);
+  fake.fail_create = false;
+  assert(tracker.OnFrame(api, 202, 9 * kMs, 16666667) == 1);
+  assert(fake.creates == 4);
+}
+
 int main() {
   OutputRectangles();
   Cadence();
@@ -311,6 +381,7 @@ int main() {
   MultiplierIsClampedAndLateSyntheticFramesAreSkipped();
   TimestampsHonourValidBitsAndWrap();
   GenerationGpuTimesAreBucketedAndFailuresAreNotStale();
+  PresenterAdpfReportsPerFrameAndDeduplicatesTargets();
   LoopPaintsSyntheticOutputsThenTheRealOne();
   LsfgMultiplierPaintsEveryGeneratedPhaseInOrder();
   NotificationsDuringAPaintAreReplacedNotQueued();

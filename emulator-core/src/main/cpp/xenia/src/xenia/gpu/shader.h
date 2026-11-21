@@ -536,9 +536,33 @@ struct ParsedTextureFetchInstruction {
   // is not always zero.
   uint32_t GetNonZeroResultComponents() const;
 
+  // Whether the fetch can return a single texel with no instruction override to
+  // linear/anisotropic filtering.
+  bool AllowsPointSampling(bool use_computed_lod) const {
+    return attributes.mag_filter != xenos::TextureFilter::kLinear &&
+           attributes.min_filter != xenos::TextureFilter::kLinear &&
+           attributes.mip_filter != xenos::TextureFilter::kLinear &&
+           (!use_computed_lod ||
+            attributes.aniso_filter == xenos::AnisoFilter::kDisabled ||
+            attributes.aniso_filter == xenos::AnisoFilter::kUseFetchConst);
+  }
+
+  // Whether a tfetch snaps its coordinates to the texel center instead of
+  // adding kTextureCoordEpsilon. Only point sampled 2D fetches with normalized
+  // coordinates snap. The fetch constant side is bit 26 in GetIntegerScaleBits.
+  bool CanSnapToTexelCenter(bool use_computed_lod) const {
+    return opcode == ucode::FetchOpcode::kTextureFetch &&
+           dimension == xenos::FetchOpDimension::k2D &&
+           !attributes.unnormalized_coordinates &&
+           AllowsPointSampling(use_computed_lod);
+  }
+
   // Disassembles the instruction into ucode assembly text.
   void Disassemble(StringBuffer* out) const;
 };
+
+// Fixed point texture coordinate ULP (see ProcessTextureFetchInstruction).
+constexpr float kTextureCoordEpsilon = 1.5f / 1024.0f;
 
 struct ParsedAluInstruction {
   // Opcode for the vector part of the instruction.
@@ -807,6 +831,13 @@ class Shader {
       return !translation_claimed_.test_and_set(std::memory_order_acq_rel);
     }
 
+    // Blocks until the claiming thread publishes the translation result (#123).
+    void WaitForTranslation() const {
+      while (!is_translated_.load(std::memory_order_acquire)) {
+        is_translated_.wait(false, std::memory_order_acquire);
+      }
+    }
+
     // Errors that occurred during translation.
     const std::vector<Error>& errors() const { return errors_; }
 
@@ -847,6 +878,12 @@ class Shader {
    private:
     friend class Shader;
     friend class ShaderTranslator;
+
+    void PublishTranslation(bool valid) {
+      is_valid_.store(valid, std::memory_order_relaxed);
+      is_translated_.store(true, std::memory_order_release);
+      is_translated_.notify_all();
+    }
 
     Shader& shader_;
     uint64_t modification_;
@@ -914,6 +951,11 @@ class Shader {
   // Whether the shader contains subroutine calls (cond_call).
   bool uses_subroutine_calls() const { return uses_subroutine_calls_; }
 
+  // Whether the control flow is structured: no calls, jmp only to later
+  // addresses, loops properly nested with the body right after loop and no jmp
+  // into a loop body from outside it. Translatable without a program counter.
+  bool has_only_forward_jumps() const;
+
   // c# registers used as the addend in MAD operations to eA.
   const std::set<uint32_t>& memexport_stream_constants() const {
     return memexport_stream_constants_;
@@ -921,17 +963,23 @@ class Shader {
 
   // Labels that jumps (explicit or from loops) can be done to.
   const std::set<uint32_t>& label_addresses() const { return label_addresses_; }
-  // Whether the result of the vector or the scalar operation of the ALU
-  // instruction at the address may reach a vertex fetch index, the address
-  // register, a memory export or a floor, trunc or frc operand, where rounding
-  // it differently may change the outcome by a whole unit. Vertex shaders only.
+  // Component mask (bits 0..3) of the vector operation or whether the scalar
+  // operation of the ALU instruction at the address may reach a vertex fetch
+  // index, the address register, a memory export or a floor, trunc or frc
+  // operand, where rounding it differently may change the outcome by a whole
+  // unit. Vertex shaders only.
+  uint32_t GetAluVectorResultRoundingSensitiveComponents(
+      uint32_t address) const {
+    return address < alu_rounding_sensitive_results_.size()
+               ? (alu_rounding_sensitive_results_[address] & 0b1111u)
+               : 0u;
+  }
   bool IsAluVectorResultRoundingSensitive(uint32_t address) const {
-    return address < alu_rounding_sensitive_results_.size() &&
-           (alu_rounding_sensitive_results_[address] & 0b01);
+    return GetAluVectorResultRoundingSensitiveComponents(address) != 0;
   }
   bool IsAluScalarResultRoundingSensitive(uint32_t address) const {
     return address < alu_rounding_sensitive_results_.size() &&
-           (alu_rounding_sensitive_results_[address] & 0b10);
+           (alu_rounding_sensitive_results_[address] & 0b10000u);
   }
 
   // Exclusive upper bound of the indexes of paired control flow instructions
@@ -1020,8 +1068,13 @@ class Shader {
     return translations_;
   }
   Translation* GetTranslation(uint64_t modification) const {
+    if (last_translation_ && last_translation_modification_ == modification) {
+      return last_translation_;
+    }
     auto it = translations_.find(modification);
     if (it != translations_.cend()) {
+      last_translation_modification_ = modification;
+      last_translation_ = it->second;
       return it->second;
     }
     return nullptr;
@@ -1095,8 +1148,9 @@ class Shader {
   std::vector<TextureBinding> texture_bindings_;
   ConstantRegisterMap constant_register_map_ = {0};
   std::set<uint32_t> label_addresses_;
-  // Per instruction address, bit 0 for the vector and bit 1 for the scalar
-  // operation (see IsAluVectorResultRoundingSensitive).
+  // Per instruction address, bits 0..3 for the vector result components and
+  // bit 4 for the scalar operation (see
+  // GetAluVectorResultRoundingSensitiveComponents).
   std::vector<uint8_t> alu_rounding_sensitive_results_;
   uint32_t cf_pair_index_bound_ = 0;
   uint32_t register_static_address_bound_ = 0;
@@ -1123,6 +1177,11 @@ class Shader {
 
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;
+  // Last GetOrCreateTranslation result: consecutive draws of a shader almost
+  // always use the same modification. Reset when a translation is destroyed.
+  mutable uint64_t last_translation_modification_ = 0;
+  mutable Translation* last_translation_ = nullptr;
+  mutable std::atomic<int8_t> has_only_forward_jumps_{-1};
 
   std::atomic<uint32_t> ucode_storage_index_{UINT32_MAX};
 

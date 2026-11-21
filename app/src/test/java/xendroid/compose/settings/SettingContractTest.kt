@@ -20,7 +20,7 @@ class SettingContractTest {
         val driver = SettingsSchema.allSettings.single { it.name == "vulkan_lib_path" }
         assertFalse(settingContract(driver, "globally", false).available)
         // U03: the reason names what is missing and what runs instead.
-        assertTrue(settingContract(driver, "globally", false).label.contains("only on Adreno GPUs"))
+        assertTrue(settingContract(driver, "globally", false).label.contains("only on Adreno, Mali or Xclipse GPUs"))
         assertTrue(settingContract(driver, "globally", false).reason.endsWith("Games run on the system driver."))
     }
 }

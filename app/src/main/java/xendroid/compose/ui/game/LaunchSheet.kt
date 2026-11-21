@@ -18,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import xendroid.compose.R
 import xendroid.compose.core.LaunchOptions
+import xendroid.compose.data.MultiXexScanner
 import xendroid.compose.data.PlayableProfile
 import xendroid.compose.driver.InstalledDriverPackage
 import xendroid.compose.driver.InstalledDrivers
@@ -62,8 +63,13 @@ class LaunchFormState {
     )
 }
 
-/** Profiles and installed drivers the form offers, read once off the main thread. */
-private class LaunchChoices(val profiles: List<PlayableProfile>, val p1: String?, val drivers: List<InstalledDriverPackage>)
+/** Profiles, installed drivers and discovered XEX modules the form offers, read once off the main thread. */
+private class LaunchChoices(
+    val profiles: List<PlayableProfile>,
+    val p1: String?,
+    val drivers: List<InstalledDriverPackage>,
+    val xexTargets: List<MultiXexScanner.XexTarget> = emptyList(),
+)
 
 /**
  * The options of "Start with…": profile, driver, executable, without patches, without this
@@ -77,15 +83,19 @@ fun LaunchForm(
     overrides: Map<String, String>,
     patchesOn: Int?,
     modifier: Modifier = Modifier,
+    gameLaunchUri: String? = null,
+    gameTitleId: String? = null,
 ) {
     val c = Xd.colors
     var choices by remember { mutableStateOf<LaunchChoices?>(null) }
-    LaunchedEffect(Unit) {
+    LaunchedEffect(gameLaunchUri, gameTitleId) {
         val (profiles, p1) = library.launchProfiles()
-        val drivers = withContext(Dispatchers.IO) {
-            runCatching { InstalledDrivers.list(xendroid.compose.Application.get_custom_driver_dir()) }.getOrDefault(emptyList())
+        val (drivers, xexTargets) = withContext(Dispatchers.IO) {
+            val drvs = runCatching { InstalledDrivers.list(xendroid.compose.Application.get_custom_driver_dir()) }.getOrDefault(emptyList())
+            val xexs = runCatching { MultiXexScanner.discover(gameLaunchUri, gameTitleId) }.getOrDefault(emptyList())
+            drvs to xexs
         }
-        choices = LaunchChoices(profiles, p1, drivers)
+        choices = LaunchChoices(profiles, p1, drivers, xexTargets)
     }
     val loaded = choices
     Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -113,6 +123,13 @@ fun LaunchForm(
                         else -> drivers.first { it.library.absolutePath == p }.let { d -> listOfNotNull(d.name, d.version).joinToString(" ") }
                     }
                 }, state.driver, { state.driver = it }, maxWidth = 220.dp)
+            }
+        }
+        val xexTargets = loaded?.xexTargets.orEmpty()
+        if (xexTargets.size > 1) {
+            XdSheetOption(stringResource(R.string.xd_launch_xex_pick), subtitle = stringResource(R.string.xd_launch_xex_pick_sub)) {
+                val options = xexTargets.map { it.modulePath to it.displayLabel }
+                XdSelect(options, state.module, { state.module = it }, maxWidth = 240.dp)
             }
         }
         XdSheetOption(stringResource(R.string.xd_launch_module), subtitle = stringResource(R.string.xd_launch_module_sub)) {
@@ -147,6 +164,8 @@ fun LaunchSheet(
     patchesOn: Int?,
     onPlay: (LaunchOptions) -> Unit,
     onDismiss: () -> Unit,
+    gameLaunchUri: String? = null,
+    gameTitleId: String? = null,
 ) {
     XdSheet(onDismiss = onDismiss, title = stringResource(R.string.xd_game_sec_launch),
         subtitle = stringResource(R.string.xd_launch_sub, gameName),
@@ -156,6 +175,6 @@ fun LaunchSheet(
                 onPlay(state.options(overrides) { key -> SettingsSchema.byKey[key]?.let { settings?.inheritedRaw(it) } })
             }, kind = XdButtonKind.PRIMARY, icon = XdIcons.play)
         }) {
-        LaunchForm(state, library, settings, overrides, patchesOn)
+        LaunchForm(state, library, settings, overrides, patchesOn, gameLaunchUri = gameLaunchUri, gameTitleId = gameTitleId)
     }
 }

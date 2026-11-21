@@ -549,6 +549,17 @@ class GameLibraryViewModel(
         }
     }
 
+    /** Replaces [oldPath] in place with [newPath] (readable directories only) + rescan. */
+    fun replaceFolder(oldPath: String, newPath: String, onReplaced: (() -> Unit)? = null) {
+        viewModelScope.launch {
+            if (repo.replaceGameDirPath(oldPath, newPath)) {
+                _folders.value = repo.gameDirPaths()
+                onReplaced?.invoke()
+                refresh()
+            }
+        }
+    }
+
     /** Stops scanning [path] (its files stay where they are) + rescan. */
     fun removeFolder(path: String) {
         viewModelScope.launch {

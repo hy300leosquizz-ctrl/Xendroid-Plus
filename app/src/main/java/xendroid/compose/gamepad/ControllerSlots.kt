@@ -87,9 +87,10 @@ class SlotInputRouter(
         if (pad.keys.put(identity, key) == null) send(slot, key, true, KEY_VALUE_UNUSED)
     }
 
-    /** Forgets a held key without releasing it: what it pressed is the trigger axis's now (#97). */
+    /** Forgets a held key without releasing it: what it pressed is the trigger axis's now (#97, #118). */
     fun forget(slot: Int, identity: Long) {
-        pads[slot]?.keys?.remove(identity)
+        val pad = pads[slot] ?: return
+        pad.keys.remove(identity)?.let { pad.triggers.adoptHeldKey(it) }
     }
 
     /** True when this slot held the key (the event is consumed). */

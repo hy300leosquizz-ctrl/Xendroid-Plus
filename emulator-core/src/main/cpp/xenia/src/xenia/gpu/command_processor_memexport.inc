@@ -34,6 +34,7 @@ void MarkMemexportPagesWritten(uint32_t base_bytes, uint32_t size_bytes) {
   }
   any_memexport_pages_written_ = true;
   memexport_await_pending_ = true;
+  memexport_fence_pending_ = true;
   memexport_last_submission_ = GetCurrentSubmission();
   memexport_written_page_min_ =
       std::min(memexport_written_page_min_, first_page);
@@ -53,6 +54,7 @@ void AwaitMemexportForFence(const char* reason) {
     return;
   }
   memexport_await_pending_ = false;
+  memexport_fence_pending_ = false;
   // Only as far as the last export, which is submitted first if it is still
   // only recorded: its submission ends with what makes the output visible, and
   // the readbacks of all exports are applied once it completes.
@@ -72,6 +74,7 @@ void AwaitMemexportForCoherency(uint32_t base_bytes, uint32_t size_bytes) {
     return;
   }
   memexport_await_pending_ = false;
+  memexport_fence_pending_ = false;
   // With the range for the memexport log (debug.xendroid.memexport_log).
   static thread_local char coherency_reason[] = "coherency 00000000+00000000";
   for (uint32_t i = 0; i < 8; ++i) {
@@ -97,6 +100,7 @@ bool AwaitMemexportReadbacks(const char* reason) {
     return false;
   }
   memexport_await_pending_ = false;
+  memexport_fence_pending_ = false;
   memexport_await_reason_ = reason;
   const bool awaited = AwaitMemexportSubmission(memexport_last_submission_);
   memexport_await_reason_ = nullptr;
@@ -173,6 +177,7 @@ void ResetMemexportPages() {
   memexport_written_pages_.fill(0);
   any_memexport_pages_written_ = false;
   memexport_await_pending_ = false;
+  memexport_fence_pending_ = false;
   memexport_readbacks_pending_ = false;
   memexport_last_submission_ = 0;
   memexport_written_page_min_ = kMemexportPageCount;
@@ -187,6 +192,9 @@ std::array<uint64_t, kMemexportPageCount / 64> memexport_written_pages_{};
 bool any_memexport_pages_written_ = false;
 // Export output has been recorded but not yet awaited for the guest to read.
 bool memexport_await_pending_ = false;
+// Export output has been recorded and not yet paired with a held guest fence /
+// interrupt signal (31a696a9a + 409ca81a3).
+bool memexport_fence_pending_ = false;
 // Export output the backend copies to guest memory once the submissions of all
 // of it complete (Vulkan's memexport_readback_deferred) is still pending,
 // wherever it went.

@@ -82,12 +82,19 @@ class VulkanZPDQueryPool {
   bool GenerationMatches(uint32_t query_index, uint32_t query_generation) const;
 
   void BeginQuery(DeferredCommandBuffer& deferred_command_buffer,
-                  uint32_t query_index) const;
+                  uint32_t query_index, bool precise = true) const;
   void EndQuery(DeferredCommandBuffer& deferred_command_buffer,
                 uint32_t query_index) const;
   void QueueQueryResolve(uint32_t query_index, bool uses_fsi_counter = false);
+  void MarkCounterDirty(uint32_t query_index);
+  bool IsCounterDirty(uint32_t query_index) const {
+    return query_index < counter_dirty_.size() &&
+           counter_dirty_[query_index] != 0;
+  }
+  bool has_dirty_counters() const { return !counter_dirty_indices_.empty(); }
+  void FlushCounterClears(DeferredCommandBuffer& deferred_command_buffer);
   void ClearFSICounter(DeferredCommandBuffer& deferred_command_buffer,
-                       uint32_t query_index) const;
+                       uint32_t query_index);
   void RecordResolveBatch(VkCommandBuffer command_buffer);
 
   void InvalidateReadback();
@@ -126,6 +133,12 @@ class VulkanZPDQueryPool {
   std::vector<uint32_t> resolve_batch_indices_;
   std::vector<uint8_t> fsi_counter_resolve_batch_pending_;
   std::vector<uint32_t> fsi_counter_resolve_batch_indices_;
+  // Dirty FSI counter slots queued for batched vkCmdFillBuffer clear before the
+  // next render pass (adapted from xenia-edge 3d233a5b2, BSD-3-Clause).
+  std::vector<uint8_t> counter_dirty_;
+  std::vector<uint32_t> counter_dirty_indices_;
+  std::vector<ResolveRange> counter_clear_ranges_;
+  std::vector<VkBufferMemoryBarrier> counter_clear_barriers_;
   // Reusable scratch for coalesced contiguous ranges during flush.
   std::vector<ResolveRange> resolve_batch_ranges_;
   // Reusable scratch for FSI counter resolve barriers and copy regions.

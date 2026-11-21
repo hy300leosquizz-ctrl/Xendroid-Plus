@@ -21,6 +21,7 @@
 #include "xenia/base/hash.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/render_target_cache.h"
+#include "xenia/gpu/vulkan/vulkan_pipeline_cache_file.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
 #include "xenia/gpu/xenos.h"
@@ -29,6 +30,9 @@
 
 DECLARE_bool(vulkan_depth_unorm24);
 DECLARE_bool(vulkan_normalize_dontcare_keys);
+DECLARE_bool(vulkan_msaa_4x_as_2x2);
+DECLARE_bool(vulkan_msaa_single_sample_storage);
+DECLARE_bool(vulkan_rasterization_order_attachment_access);
 
 namespace xe {
 namespace gpu {
@@ -310,6 +314,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool msaa_2x_no_attachments_supported() const {
     return msaa_2x_no_attachments_supported_;
   }
+  bool msaa_4x_as_2x2() const { return msaa_4x_as_2x2_; }
+  bool msaa_single_sample_storage() const {
+    return msaa_single_sample_storage_;
+  }
+  bool msaa_single_sample_rasterization() const {
+    return msaa_single_sample_storage_;
+  }
+  bool rasterization_order_color_access() const {
+    return rasterization_order_color_access_;
+  }
   bool IsMsaa2xSupported(bool subpass_has_attachments) const {
     return subpass_has_attachments ? msaa_2x_attachments_supported_
                                    : msaa_2x_no_attachments_supported_;
@@ -409,7 +423,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   };
 
   static constexpr size_t kDirectHostResolveBppCount = 2;     // 32, 64
-  static constexpr size_t kDirectHostResolveMsaaCount = 3;    // 1, 2, 4
+  // 1, 2, 4, and 4 kept as a 1x image of twice the size (samples as texels).
+  static constexpr size_t kDirectHostResolveMsaaCount = 4;
+  static constexpr size_t kDirectHostResolveMsaa2x2Index = 3;
   static constexpr size_t kDirectHostResolveScaledCount = 2;  // false, true
   static constexpr size_t kDirectHostResolveSourceUintCount = 2;
   static constexpr size_t kDirectHostResolveFullDestCount =
@@ -532,25 +548,28 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       [kDirectHostResolveSourceUintCount] = {};
   VkPipeline GetDirectHostResolveTexturePipeline(
       DirectHostResolveTextureKind kind, xenos::MsaaSamples msaa_samples,
-      bool source_is_uint);
+      bool source_is_uint, bool source_2x2 = false);
   // vulkan_direct_host_resolve_7e3_variant: full color resolves of 7e3 in the
   // EDRAM to 2_10_10_10 with both formats known to the shader - 1x (with
-  // vulkan_direct_host_resolve_format_variants), 2x and 4x sources, only to
-  // memory or also into the texture.
+  // vulkan_direct_host_resolve_format_variants), 2x, 4x and 2x2 sources, only
+  // to memory or also into the texture.
   static const DirectHostResolveShaderCode
-      kDirectHostResolveColorFull7e3Shaders[3][2];
-  VkPipeline direct_host_color_full_7e3_resolve_pipelines_[3][2] = {};
+      kDirectHostResolveColorFull7e3Shaders[kDirectHostResolveMsaaCount][2];
+  VkPipeline direct_host_color_full_7e3_resolve_pipelines_
+      [kDirectHostResolveMsaaCount][2] = {};
   VkPipeline GetDirectHostColorFull7e3ResolvePipeline(
-      xenos::MsaaSamples msaa_samples, bool to_texture);
+      xenos::MsaaSamples msaa_samples, bool to_texture,
+      bool source_2x2 = false);
   // vulkan_direct_host_resolve_format_variants: one EDRAM format known to the
   // shader - the 4-pixel 32bpp fast color of 8_8_8_8 and 2_10_10_10
   // ([MSAA][format][into the texture]), and depth of D24S8 and D24FS8
   // ([MSAA][format][8 pixels (1x only), 4 pixels, 4 pixels into the texture]).
   static const DirectHostResolveShaderCode
-      kDirectHostResolveColorFormatShaders[3][2][2];
+      kDirectHostResolveColorFormatShaders[kDirectHostResolveMsaaCount][2][2];
   static const DirectHostResolveShaderCode
       kDirectHostResolveDepthFormatShaders[3][2][3];
-  VkPipeline direct_host_color_format_resolve_pipelines_[3][2][2] = {};
+  VkPipeline direct_host_color_format_resolve_pipelines_
+      [kDirectHostResolveMsaaCount][2][2] = {};
   VkPipeline direct_host_depth_format_resolve_pipelines_[3][2][3] = {};
   VkPipeline GetDirectHostFormatResolvePipeline(bool is_depth,
                                                 size_t msaa_index,
@@ -1248,13 +1267,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
 
   // four_pixels: the 4-pixel-per-thread variant (32bpp only for color).
+  // source_2x2: a 4x resolve of a 1x image of twice the size.
   VkPipeline GetDirectHostResolvePipeline(bool is_64bpp,
                                           xenos::MsaaSamples msaa_samples,
                                           bool scaled, bool source_is_uint,
-                                          bool four_pixels);
+                                          bool four_pixels,
+                                          bool source_2x2 = false);
   VkPipeline GetDirectHostColorFullResolvePipeline(
       xenos::MsaaSamples msaa_samples, bool scaled, bool source_is_uint,
-      draw_util::ResolveCopyShaderIndex copy_shader);
+      draw_util::ResolveCopyShaderIndex copy_shader, bool source_2x2 = false);
   VkPipeline GetDirectHostDepthResolvePipeline(xenos::MsaaSamples msaa_samples,
                                                bool scaled, bool four_pixels);
   bool TryInPassResolveCopy(
@@ -1304,6 +1325,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   bool msaa_2x_attachments_supported_ = false;
   bool msaa_2x_no_attachments_supported_ = false;
+  bool msaa_4x_as_2x2_ = false;
+  bool msaa_single_sample_storage_ = false;
+  bool mali_normalize_mixed_load_ops_ = false;
+  bool rasterization_order_color_access_ = false;
+
+  VkPipelineCache UseRtPipelineCache();
+  void SaveRtPipelineCache(bool force);
+  std::unique_ptr<pipeline_cache_file::Store> rt_pipeline_cache_store_;
+  VkPipelineCache rt_pipeline_cache_ = VK_NULL_HANDLE;
+  bool rt_pipeline_cache_dirty_ = false;
+  uint64_t rt_pipeline_cache_dirty_since_ms_ = 0;
+  size_t rt_pipeline_cache_last_saved_bytes_ = 0;
 
   // VK_NULL_HANDLE if failed to create.
   std::unordered_map<RenderPassKey, VkRenderPass, RenderPassKey::Hasher>

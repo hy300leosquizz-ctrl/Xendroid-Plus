@@ -61,6 +61,11 @@ DEFINE_int32(scribble_heap_value, 0,
 DEFINE_uint32(mmap_address_high,8,
               "1-124",
               "Memory");
+DEFINE_bool(
+    shm_coalesce_writewatch_pages, true,
+    "Coalesce writewatch fault invalidations into 64 KB aligned blocks and "
+    "merge contiguous mprotect runs across guest-writable pages.",
+    "Memory");
 namespace xe {
 uint32_t get_page_count(uint32_t value, uint32_t page_size) {
   return xe::round_up(value, page_size) / page_size;
@@ -2512,7 +2517,9 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   for (uint32_t page_number = base_page_number; page_number <= end_page_number;
        ++page_number) {
     auto& page_entry = page_table_[page_number];
+    const uint32_t initialized = page_entry.initialized;
     page_entry.qword = 0;
+    page_entry.initialized = initialized;
     unreserved_page_count_++;
   }
 
@@ -2520,6 +2527,35 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   InsertFreeBlock(base_page_number, base_page_entry.region_page_count);
 
   return true;
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> BaseHeap::TakeUninitializedRuns(
+    uint32_t address, uint32_t size) {
+  std::vector<std::pair<uint32_t, uint32_t>> runs;
+  if (!size || address < heap_base_ || address - heap_base_ >= heap_size_) {
+    return runs;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t page_number = (address - heap_base_) >> page_size_shift_;
+  const uint32_t end_page_number =
+      std::min(uint32_t(page_table_.size()),
+               page_number + get_page_count(size, page_size_));
+  for (; page_number < end_page_number; ++page_number) {
+    auto& page_entry = page_table_[page_number];
+    if (page_entry.initialized) {
+      continue;
+    }
+    page_entry.initialized = 1;
+    const uint32_t page_address =
+        heap_base_ + (page_number << page_size_shift_);
+    if (!runs.empty() &&
+        runs.back().first + runs.back().second == page_address) {
+      runs.back().second += page_size_;
+    } else {
+      runs.emplace_back(page_address, page_size_);
+    }
+  }
+  return runs;
 }
 
 bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
@@ -3266,6 +3302,7 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
     xe::memory::PageAccess protect_access) XE_RESTRICT {
   uint8_t* protect_base = membase_ + heap_base_;
   uint32_t protect_system_page_first = UINT32_MAX;
+  const bool coalesce = cvars::shm_coalesce_writewatch_pages;
 
   SystemPageFlagsBlock* XE_RESTRICT sys_page_flags = system_page_flags_.data();
 
@@ -3359,6 +3396,17 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
           protect_system_page = true;
           page_flags_block.notify_on_read |= page_flags_bit;
         }
+      }
+    }
+    if constexpr (enable_invalidation_notifications && !enable_data_providers) {
+      // Extend the current run across a page already read-only for a write
+      // watch: one mprotect syscall instead of two, same final protection.
+      if (coalesce && !protect_system_page &&
+          protect_system_page_first != UINT32_MAX &&
+          current_page_access == xe::memory::PageAccess::kReadWrite &&
+          (page_flags_block.notify_on_invalidation & page_flags_bit) &&
+          !(page_flags_block.notify_on_read & page_flags_bit)) {
+        protect_system_page = true;
       }
     }
     if (protect_system_page) {
@@ -3592,43 +3640,76 @@ bool PhysicalHeap::TriggerCallbacks(
   // Unprotect ranges that need unprotection.
   if (unprotect) {
     uint8_t* protect_base = membase_ + heap_base_;
-    uint32_t unprotect_system_page_first = UINT32_MAX;
-    for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
-      // Check if need to allow writing to this page. Read-watched pages are
-      // unprotected here too so a write to one doesn't re-fault.
-      bool unprotect_page =
-          ((system_page_flags_[i >> 6].notify_on_invalidation |
-            system_page_flags_[i >> 6].notify_on_read) &
-           (uint64_t(1) << (i & 63))) != 0;
-      if (unprotect_page) {
+    const bool coalesce = cvars::shm_coalesce_writewatch_pages;
+    bool batch_unprotected = false;
+    // When coalescing is enabled on a writewatch fault and every page in the
+    // invalidated block permits guest writes, unprotect the entire block in a
+    // single mprotect syscall rather than splitting at unwatched gaps.
+    if (coalesce && !invalidate_unwatched) {
+      bool all_writable = true;
+      for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
         if (SystemPageGuestAccess(i) != xe::memory::PageAccess::kReadWrite) {
-          unprotect_page = false;
+          all_writable = false;
+          break;
         }
       }
-      if (unprotect_page) {
-        if (unprotect_system_page_first == UINT32_MAX) {
-          unprotect_system_page_first = i;
-        }
-      } else {
-        if (unprotect_system_page_first != UINT32_MAX) {
-          xe::memory::Protect(
-              protect_base +
-                  (unprotect_system_page_first << system_page_shift_),
-              (i - unprotect_system_page_first) << system_page_shift_,
-              xe::memory::PageAccess::kReadWrite);
-          CountAccessCallbackProtect(true, i - unprotect_system_page_first);
-          unprotect_system_page_first = UINT32_MAX;
+      if (all_writable) {
+        const uint32_t batch_pages = system_page_last + 1 - system_page_first;
+        batch_unprotected = xe::memory::Protect(
+            protect_base + (size_t(system_page_first) << system_page_shift_),
+            size_t(batch_pages) << system_page_shift_,
+            xe::memory::PageAccess::kReadWrite);
+        if (batch_unprotected) {
+          CountAccessCallbackProtect(true, batch_pages);
         }
       }
     }
-    if (unprotect_system_page_first != UINT32_MAX) {
-      xe::memory::Protect(
-          protect_base + (unprotect_system_page_first << system_page_shift_),
-          (system_page_last + 1 - unprotect_system_page_first)
-              << system_page_shift_,
-          xe::memory::PageAccess::kReadWrite);
-      CountAccessCallbackProtect(
-          true, system_page_last + 1 - unprotect_system_page_first);
+    if (!batch_unprotected) {
+      uint32_t unprotect_system_page_first = UINT32_MAX;
+      for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
+        // Check if need to allow writing to this page. Read-watched pages are
+        // unprotected here too so a write to one doesn't re-fault.
+        bool unprotect_page =
+            ((system_page_flags_[i >> 6].notify_on_invalidation |
+              system_page_flags_[i >> 6].notify_on_read) &
+             (uint64_t(1) << (i & 63))) != 0;
+        // Bridge across unwatched guest-writable gaps to avoid splitting runs.
+        if (!unprotect_page && coalesce &&
+            unprotect_system_page_first != UINT32_MAX &&
+            SystemPageGuestAccess(i) == xe::memory::PageAccess::kReadWrite) {
+          unprotect_page = true;
+        }
+        if (unprotect_page) {
+          if (SystemPageGuestAccess(i) != xe::memory::PageAccess::kReadWrite) {
+            unprotect_page = false;
+          }
+        }
+        if (unprotect_page) {
+          if (unprotect_system_page_first == UINT32_MAX) {
+            unprotect_system_page_first = i;
+          }
+        } else {
+          if (unprotect_system_page_first != UINT32_MAX) {
+            xe::memory::Protect(
+                protect_base +
+                    (size_t(unprotect_system_page_first) << system_page_shift_),
+                size_t(i - unprotect_system_page_first) << system_page_shift_,
+                xe::memory::PageAccess::kReadWrite);
+            CountAccessCallbackProtect(true, i - unprotect_system_page_first);
+            unprotect_system_page_first = UINT32_MAX;
+          }
+        }
+      }
+      if (unprotect_system_page_first != UINT32_MAX) {
+        xe::memory::Protect(
+            protect_base +
+                (size_t(unprotect_system_page_first) << system_page_shift_),
+            size_t(system_page_last + 1 - unprotect_system_page_first)
+                << system_page_shift_,
+            xe::memory::PageAccess::kReadWrite);
+        CountAccessCallbackProtect(
+            true, system_page_last + 1 - unprotect_system_page_first);
+      }
     }
   }
 

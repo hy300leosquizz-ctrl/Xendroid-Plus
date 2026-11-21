@@ -49,6 +49,10 @@ class VulkanShader : public SpirvShader {
                         const uint32_t* ucode_dwords, size_t ucode_dword_count,
                         std::endian ucode_source_endian = std::endian::big);
 
+  const ui::vulkan::VulkanDevice* vulkan_device() const {
+    return vulkan_device_;
+  }
+
   // For owning subsystem like the pipeline cache, accessors for unique
   // identifiers (used instead of hashes to make sure collisions can't happen)
   // of binding layouts used by the shader, for invalidation if a shader with an

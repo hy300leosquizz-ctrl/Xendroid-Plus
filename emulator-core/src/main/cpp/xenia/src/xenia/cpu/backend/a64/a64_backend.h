@@ -34,6 +34,11 @@ class A64CodeCache;
 typedef void* (*HostToGuestThunk)(void* target, void* arg0, void* arg1);
 typedef void* (*GuestToHostThunk)(void* target, void* arg0, void* arg1);
 typedef void (*ResolveFunctionThunk)();
+// Host entry to a stwcx. helper, returns 1 if the store landed. The value is
+// guest endian.
+typedef uint32_t (*ReservedStoreThunk)(uint32_t guest_address,
+                                       ppc::PPCContext* context, uint64_t value,
+                                       void* host_address);
 
 // Place guest trampolines in an address range that the HV normally occupies.
 static constexpr uint32_t GUEST_TRAMPOLINE_BASE = 0x80000000;
@@ -46,7 +51,9 @@ static constexpr uint32_t MAX_GUEST_TRAMPOLINES =
 static constexpr uint32_t A64_RESERVE_GRANULE_SHIFT = 7;
 // A generation counter per granule, hashed. stwcx. bumps its granule to kill
 // other threads' reservations. Colliding granules only cost a spurious failure.
-static constexpr uint32_t A64_RESERVE_NUM_ENTRIES = 1u << 20;
+static constexpr uint32_t A64_RESERVE_ENTRY_BITS = 20;
+static constexpr uint32_t A64_RESERVE_NUM_ENTRIES =
+    1u << A64_RESERVE_ENTRY_BITS;
 static constexpr uint32_t A64_RESERVE_ENTRY_MASK = A64_RESERVE_NUM_ENTRIES - 1;
 
 struct ReserveHelper {
@@ -140,6 +147,9 @@ struct A64BackendContext {
   // one ldr from here instead of building the address as an immediate.
   uint64_t guest_to_host_thunk_address;
   uint64_t guest_to_host_thunk_no_vec_address;
+  uint64_t try_acquire_reservation_helper_address;
+  uint64_t reserved_store_32_helper_address;
+  uint64_t reserved_store_64_helper_address;
   // The encoded indirection table (A64CodeCache), the same way: its bias,
   // the code cache base and the external side table.
   uint64_t indirection_table_base_bias;
@@ -221,6 +231,8 @@ class A64Backend : public Backend {
     return reinterpret_cast<A64BackendContext*>(
         reinterpret_cast<intptr_t>(ctx) - sizeof(A64BackendContext));
   }
+  // lwarx found the granule claimed, refreshes the generation it took.
+  static uint64_t AwaitReservation(void* raw_context, uint64_t guest_address);
 
   uint32_t CreateGuestTrampoline(GuestTrampolineProc proc, void* userdata1,
                                  void* userdata2, bool long_term) override;
@@ -250,6 +262,8 @@ class A64Backend : public Backend {
  private:
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
+  static uint64_t ReleaseFaultingReservedStore(void* data, Exception* ex);
+  static bool IsReservedStoreFaultPc(void* data, uint64_t pc);
 
   uintptr_t capstone_handle_ = 0;
 
@@ -270,6 +284,9 @@ class A64Backend : public Backend {
   void* vrsqrtefp_scalar_helper_ = nullptr;
   void* vrsqrtefp_vector_helper_ = nullptr;
   void* frsqrte_helper_ = nullptr;
+  ReservedStoreThunk reserved_store_32_thunk_ = nullptr;
+  ReservedStoreThunk reserved_store_64_thunk_ = nullptr;
+  ReservedStoreFaultSite reserved_store_fault_sites_[2] = {};
 
  public:
   void* try_acquire_reservation_helper_ = nullptr;

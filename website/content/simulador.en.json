@@ -1023,5 +1023,8 @@
  "Cancelado; o jogo recebe o texto de antes": "Canceled; the game gets the previous text",
  "@proto/ui.js|Formato": "Format",
  "@proto/screens/jogo.js|Formato": "Layout",
- "@proto/screens/sistema.js#upCard|Procurando…": "Checking…"
+ "@proto/screens/sistema.js#upCard|Procurando…": "Checking…",
+  "Controle": "Controller",
+  "Isto empacota o disco num .zar menor. O .iso original fica intacto até o .zar ser criado e verificado, e você é consultado antes de ele ser apagado. O jogo continua na biblioteca.": "This packs the disc into a smaller .zar. The original .iso stays untouched until the .zar is created and verified, and you are asked before it is deleted. The game stays in the library.",
+  "O .iso fica intacto até o .zar ser criado e verificado": "The .iso stays untouched until the .zar is created and verified"
 }

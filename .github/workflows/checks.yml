@@ -37,9 +37,13 @@ jobs:
           /emulator-core/src/main/java/
           /emulator-core/src/main/cpp/*.cpp
           /emulator-core/src/main/cpp/*.h
+          /emulator-core/src/main/cpp/xenia/src/xenia/base/cvar.h
 
     - name: Python syntax
       run: python3 -m py_compile tools/*.py tools/ir3_offline/*.py
+
+    - name: CVar update macros
+      run: python3 tools/check-cvar-updates.py
 
     - name: Release scripts
       run: |

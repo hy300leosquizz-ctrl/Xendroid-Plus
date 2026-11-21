@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -463,6 +464,22 @@ class DeferredCommandBuffer {
     args.depth_bias_slope_factor = depth_bias_slope_factor;
   }
 
+  void CmdVkSetDepthBias2EXT(
+      float depth_bias_constant_factor, float depth_bias_clamp,
+      float depth_bias_slope_factor, bool has_representation,
+      VkDepthBiasRepresentationEXT depth_bias_representation =
+          VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT,
+      VkBool32 depth_bias_exact = VK_FALSE) {
+    auto& args = *reinterpret_cast<ArgsVkSetDepthBias2EXT*>(WriteCommand(
+        Command::kVkSetDepthBias2EXT, sizeof(ArgsVkSetDepthBias2EXT)));
+    args.depth_bias_constant_factor = depth_bias_constant_factor;
+    args.depth_bias_clamp = depth_bias_clamp;
+    args.depth_bias_slope_factor = depth_bias_slope_factor;
+    args.has_representation = has_representation ? VK_TRUE : VK_FALSE;
+    args.depth_bias_representation = depth_bias_representation;
+    args.depth_bias_exact = depth_bias_exact;
+  }
+
   void CmdVkSetScissor(uint32_t first_scissor, uint32_t scissor_count,
                        const VkRect2D* scissors) {
     constexpr size_t header_size =
@@ -519,6 +536,10 @@ class DeferredCommandBuffer {
     args.viewport_count = viewport_count;
     std::memcpy(args_ptr + header_size, viewports,
                 sizeof(VkViewport) * viewport_count);
+    if (first_viewport == 0 && viewport_count) {
+      current_viewport_ = viewports[0];
+      has_current_viewport_ = true;
+    }
   }
 
   // Extended dynamic state (EDS1/EDS2, core in Vulkan 1.3). Each setter mirrors
@@ -680,6 +701,163 @@ class DeferredCommandBuffer {
                 label_len + 1);
   }
 
+  // Pre-pass splice segment support (adapted from XDroid360 6e54a1f6f,
+  // BSD-3-Clause): reserves an execution point before a render pass so safe
+  // mid-pass CPU->GPU uploads or barriers that do not conflict with prior GPU
+  // writes can execute right before the pass without ending it.
+  static constexpr size_t kNoSegmentPlaceholder = SIZE_MAX;
+  size_t CmdExecuteSegmentPlaceholder();
+  void BeginSegment(size_t placeholder_offset);
+  void EndSegment();
+  bool is_recording_segment() const { return in_segment_; }
+
+  // VK_EXT_shader_object commands and required dynamic state setters.
+  void CmdVkBindShadersEXT(uint32_t stage_count,
+                           const VkShaderStageFlagBits* stages,
+                           const VkShaderEXT* shaders) {
+    size_t arguments_size = xe::align(sizeof(ArgsVkBindShadersEXT),
+                                      alignof(VkShaderStageFlagBits));
+    size_t stages_offset = arguments_size;
+    arguments_size = xe::align(
+        arguments_size + sizeof(VkShaderStageFlagBits) * stage_count,
+        alignof(VkShaderEXT));
+    size_t shaders_offset = arguments_size;
+    arguments_size += sizeof(VkShaderEXT) * stage_count;
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkBindShadersEXT, arguments_size));
+    auto& args = *reinterpret_cast<ArgsVkBindShadersEXT*>(args_ptr);
+    args.stage_count = stage_count;
+    std::memcpy(args_ptr + stages_offset, stages,
+                sizeof(VkShaderStageFlagBits) * stage_count);
+    if (shaders) {
+      std::memcpy(args_ptr + shaders_offset, shaders,
+                  sizeof(VkShaderEXT) * stage_count);
+    } else {
+      std::memset(args_ptr + shaders_offset, 0,
+                  sizeof(VkShaderEXT) * stage_count);
+    }
+  }
+
+  void CmdVkSetVertexInputEXT(
+      uint32_t binding_count,
+      const VkVertexInputBindingDescription2EXT* bindings,
+      uint32_t attribute_count,
+      const VkVertexInputAttributeDescription2EXT* attributes) {
+    size_t arguments_size =
+        xe::align(sizeof(ArgsVkSetVertexInputEXT),
+                  alignof(VkVertexInputBindingDescription2EXT));
+    size_t bindings_offset = arguments_size;
+    arguments_size = xe::align(
+        arguments_size +
+            sizeof(VkVertexInputBindingDescription2EXT) * binding_count,
+        alignof(VkVertexInputAttributeDescription2EXT));
+    size_t attributes_offset = arguments_size;
+    arguments_size +=
+        sizeof(VkVertexInputAttributeDescription2EXT) * attribute_count;
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkSetVertexInputEXT, arguments_size));
+    auto& args = *reinterpret_cast<ArgsVkSetVertexInputEXT*>(args_ptr);
+    args.binding_count = binding_count;
+    args.attribute_count = attribute_count;
+    if (binding_count) {
+      std::memcpy(args_ptr + bindings_offset, bindings,
+                  sizeof(VkVertexInputBindingDescription2EXT) * binding_count);
+    }
+    if (attribute_count) {
+      std::memcpy(
+          args_ptr + attributes_offset, attributes,
+          sizeof(VkVertexInputAttributeDescription2EXT) * attribute_count);
+    }
+  }
+
+  void CmdVkSetViewportWithCount(uint32_t viewport_count,
+                                 const VkViewport* viewports) {
+    constexpr size_t header_size =
+        xe::align(sizeof(ArgsVkSetViewportWithCount), alignof(VkViewport));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkSetViewportWithCount,
+                     header_size + sizeof(VkViewport) * viewport_count));
+    auto& args = *reinterpret_cast<ArgsVkSetViewportWithCount*>(args_ptr);
+    args.viewport_count = viewport_count;
+    if (viewport_count) {
+      std::memcpy(args_ptr + header_size, viewports,
+                  sizeof(VkViewport) * viewport_count);
+      current_viewport_ = viewports[0];
+      has_current_viewport_ = true;
+    }
+  }
+
+  void CmdVkSetScissorWithCount(uint32_t scissor_count,
+                                const VkRect2D* scissors) {
+    constexpr size_t header_size =
+        xe::align(sizeof(ArgsVkSetScissorWithCount), alignof(VkRect2D));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkSetScissorWithCount,
+                     header_size + sizeof(VkRect2D) * scissor_count));
+    auto& args = *reinterpret_cast<ArgsVkSetScissorWithCount*>(args_ptr);
+    args.scissor_count = scissor_count;
+    if (scissor_count) {
+      std::memcpy(args_ptr + header_size, scissors,
+                  sizeof(VkRect2D) * scissor_count);
+      current_scissor_ = scissors[0];
+    }
+  }
+
+  void CmdVkSetRasterizerDiscardEnable(VkBool32 enable) {
+    auto& args = *reinterpret_cast<ArgsVkSetBool*>(WriteCommand(
+        Command::kVkSetRasterizerDiscardEnable, sizeof(ArgsVkSetBool)));
+    args.value = enable;
+  }
+
+  void CmdVkSetDepthBiasEnable(VkBool32 enable) {
+    auto& args = *reinterpret_cast<ArgsVkSetBool*>(
+        WriteCommand(Command::kVkSetDepthBiasEnable, sizeof(ArgsVkSetBool)));
+    args.value = enable;
+  }
+
+  void CmdVkSetRasterizationSamplesEXT(VkSampleCountFlagBits samples) {
+    auto& args = *reinterpret_cast<ArgsVkSetRasterizationSamplesEXT*>(
+        WriteCommand(Command::kVkSetRasterizationSamplesEXT,
+                     sizeof(ArgsVkSetRasterizationSamplesEXT)));
+    args.samples = samples;
+  }
+
+  void CmdVkSetSampleMaskEXT(VkSampleCountFlagBits samples,
+                             VkSampleMask sample_mask) {
+    auto& args = *reinterpret_cast<ArgsVkSetSampleMaskEXT*>(WriteCommand(
+        Command::kVkSetSampleMaskEXT, sizeof(ArgsVkSetSampleMaskEXT)));
+    args.samples = samples;
+    args.sample_mask = sample_mask;
+  }
+
+  void CmdVkSetAlphaToCoverageEnableEXT(VkBool32 enable) {
+    auto& args = *reinterpret_cast<ArgsVkSetBool*>(WriteCommand(
+        Command::kVkSetAlphaToCoverageEnableEXT, sizeof(ArgsVkSetBool)));
+    args.value = enable;
+  }
+
+  void CmdVkSetAlphaToOneEnableEXT(VkBool32 enable) {
+    auto& args = *reinterpret_cast<ArgsVkSetBool*>(
+        WriteCommand(Command::kVkSetAlphaToOneEnableEXT, sizeof(ArgsVkSetBool)));
+    args.value = enable;
+  }
+
+  void CmdVkSetLogicOpEnableEXT(VkBool32 enable) {
+    auto& args = *reinterpret_cast<ArgsVkSetBool*>(
+        WriteCommand(Command::kVkSetLogicOpEnableEXT, sizeof(ArgsVkSetBool)));
+    args.value = enable;
+  }
+
+  void CmdVkSetDepthBoundsTestEnable(VkBool32 enable) {
+    auto& args = *reinterpret_cast<ArgsVkSetBool*>(WriteCommand(
+        Command::kVkSetDepthBoundsTestEnable, sizeof(ArgsVkSetBool)));
+    args.value = enable;
+  }
+
+  void SetViewportClipEnabled(bool enabled) {
+    viewport_clip_enabled_ = enabled;
+  }
+
  private:
   enum class Command {
     kVkBeginRenderPass,
@@ -734,6 +912,20 @@ class DeferredCommandBuffer {
     kVkBeginDebugUtilsLabelEXT,
     kVkEndDebugUtilsLabelEXT,
     kVkInsertDebugUtilsLabelEXT,
+    kExecuteSegment,
+    kVkSetDepthBias2EXT,
+    kVkBindShadersEXT,
+    kVkSetVertexInputEXT,
+    kVkSetViewportWithCount,
+    kVkSetScissorWithCount,
+    kVkSetRasterizerDiscardEnable,
+    kVkSetDepthBiasEnable,
+    kVkSetRasterizationSamplesEXT,
+    kVkSetSampleMaskEXT,
+    kVkSetAlphaToCoverageEnableEXT,
+    kVkSetAlphaToOneEnableEXT,
+    kVkSetLogicOpEnableEXT,
+    kVkSetDepthBoundsTestEnable,
     kCount,
   };
 
@@ -961,6 +1153,15 @@ class DeferredCommandBuffer {
     float depth_bias_slope_factor;
   };
 
+  struct ArgsVkSetDepthBias2EXT {
+    float depth_bias_constant_factor;
+    float depth_bias_clamp;
+    float depth_bias_slope_factor;
+    VkBool32 has_representation;
+    VkDepthBiasRepresentationEXT depth_bias_representation;
+    VkBool32 depth_bias_exact;
+  };
+
   struct ArgsVkSetScissor {
     uint32_t first_scissor;
     uint32_t scissor_count;
@@ -1044,7 +1245,52 @@ class DeferredCommandBuffer {
     // Followed by null-terminated label string.
   };
 
+  struct ArgsExecuteSegment {
+    size_t start_elements;
+    size_t size_elements;
+  };
+
+  struct ArgsVkBindShadersEXT {
+    uint32_t stage_count;
+    // Followed by aligned VkShaderStageFlagBits[], VkShaderEXT[].
+    static_assert(alignof(VkShaderStageFlagBits) <= alignof(uintmax_t));
+    static_assert(alignof(VkShaderEXT) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkSetVertexInputEXT {
+    uint32_t binding_count;
+    uint32_t attribute_count;
+    // Followed by aligned VkVertexInputBindingDescription2EXT[],
+    // VkVertexInputAttributeDescription2EXT[].
+    static_assert(alignof(VkVertexInputBindingDescription2EXT) <=
+                  alignof(uintmax_t));
+    static_assert(alignof(VkVertexInputAttributeDescription2EXT) <=
+                  alignof(uintmax_t));
+  };
+
+  struct ArgsVkSetViewportWithCount {
+    uint32_t viewport_count;
+    static_assert(alignof(VkViewport) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkSetScissorWithCount {
+    uint32_t scissor_count;
+    static_assert(alignof(VkRect2D) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkSetRasterizationSamplesEXT {
+    VkSampleCountFlagBits samples;
+  };
+
+  struct ArgsVkSetSampleMaskEXT {
+    VkSampleCountFlagBits samples;
+    VkSampleMask sample_mask;
+  };
+
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+  void ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                     size_t stream_remaining,
+                     bool& guest_graphics_pipeline_unready);
 
  public:
   // Shrinks the last recorded begin-pass render area to the union of the
@@ -1057,7 +1303,7 @@ class DeferredCommandBuffer {
   // vulkan_replay_stats: what the replays sent to the driver, and how much of
   // it repeated the state already set in the same command buffer (the same
   // pipeline, descriptor sets, push constant bytes or dynamic state value).
-  static constexpr size_t kReplayStatCommandCount = 52;
+  static constexpr size_t kReplayStatCommandCount = 66;
   struct ReplayStats {
     uint64_t commands[kReplayStatCommandCount] = {};
     uint64_t redundant[kReplayStatCommandCount] = {};
@@ -1083,12 +1329,18 @@ class DeferredCommandBuffer {
   size_t render_area_patch_offset_ = kNoRenderAreaPatch;
   bool render_area_patch_dynamic_ = false;
   VkRect2D current_scissor_ = {};
+  VkViewport current_viewport_ = {};
+  bool has_current_viewport_ = false;
+  bool viewport_clip_enabled_ = false;
   uint32_t pass_drawn_width_ = 0;
   uint32_t pass_drawn_height_ = 0;
   uint32_t pass_recorded_draws_ = 0;
 
   void BeginRenderAreaTracking(size_t arguments_size_bytes,
                                bool dynamic_rendering) {
+    if (in_segment_) {
+      return;
+    }
     const size_t arguments_size_elements =
         (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
     render_area_patch_offset_ = command_stream_size_ - arguments_size_elements;
@@ -1099,7 +1351,7 @@ class DeferredCommandBuffer {
   }
 
   void AccumulateDrawnRect(const VkRect2D& rect) {
-    if (render_area_patch_offset_ == kNoRenderAreaPatch) {
+    if (in_segment_ || render_area_patch_offset_ == kNoRenderAreaPatch) {
       return;
     }
     pass_drawn_width_ =
@@ -1111,11 +1363,41 @@ class DeferredCommandBuffer {
   }
 
   void AccumulateDrawnScissor() {
-    if (render_area_patch_offset_ == kNoRenderAreaPatch) {
+    if (in_segment_ || render_area_patch_offset_ == kNoRenderAreaPatch) {
       return;
     }
     ++pass_recorded_draws_;
-    AccumulateDrawnRect(current_scissor_);
+    VkRect2D effective_rect = current_scissor_;
+    if (viewport_clip_enabled_ && has_current_viewport_ &&
+        current_viewport_.width != 0.0f && current_viewport_.height != 0.0f) {
+      float vp_x0 = std::min(current_viewport_.x,
+                             current_viewport_.x + current_viewport_.width);
+      float vp_x1 = std::max(current_viewport_.x,
+                             current_viewport_.x + current_viewport_.width);
+      float vp_y0 = std::min(current_viewport_.y,
+                             current_viewport_.y + current_viewport_.height);
+      float vp_y1 = std::max(current_viewport_.y,
+                             current_viewport_.y + current_viewport_.height);
+      int32_t sc_x0 = std::max<int32_t>(0, current_scissor_.offset.x);
+      int32_t sc_y0 = std::max<int32_t>(0, current_scissor_.offset.y);
+      int64_t sc_x1 = int64_t(sc_x0) + int64_t(current_scissor_.extent.width);
+      int64_t sc_y1 = int64_t(sc_y0) + int64_t(current_scissor_.extent.height);
+      int64_t ix0 = std::max<int64_t>(
+          sc_x0, static_cast<int64_t>(std::floor(std::max(0.0f, vp_x0))));
+      int64_t iy0 = std::max<int64_t>(
+          sc_y0, static_cast<int64_t>(std::floor(std::max(0.0f, vp_y0))));
+      int64_t ix1 = std::min<int64_t>(
+          sc_x1, static_cast<int64_t>(std::ceil(std::max(0.0f, vp_x1))));
+      int64_t iy1 = std::min<int64_t>(
+          sc_y1, static_cast<int64_t>(std::ceil(std::max(0.0f, vp_y1))));
+      effective_rect.offset.x = static_cast<int32_t>(ix0);
+      effective_rect.offset.y = static_cast<int32_t>(iy0);
+      effective_rect.extent.width =
+          ix1 > ix0 ? static_cast<uint32_t>(ix1 - ix0) : 0u;
+      effective_rect.extent.height =
+          iy1 > iy0 ? static_cast<uint32_t>(iy1 - iy0) : 0u;
+    }
+    AccumulateDrawnRect(effective_rect);
   }
 
 
@@ -1129,6 +1411,11 @@ class DeferredCommandBuffer {
   // zero-fill on every WriteCommand was ~2% of the GPU command processor
   // thread. Maintained correctly in both modes.
   size_t command_stream_size_ = 0;
+  // Side-buffer for pre-pass splice segments replayed at kExecuteSegment.
+  std::vector<uintmax_t> segment_stream_;
+  size_t segment_stream_size_ = 0;
+  bool in_segment_ = false;
+  size_t active_segment_placeholder_ = kNoSegmentPlaceholder;
   // Snapshot of cvars::vulkan_deferred_cmd_size_cursor at construction.
   bool use_size_cursor_;
 };

@@ -134,13 +134,9 @@ class MainActivity : ComponentActivity() {
 
     override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean {
         if (event.source and android.view.InputDevice.SOURCE_JOYSTICK == android.view.InputDevice.SOURCE_JOYSTICK) {
-            fun axis(a: Int) = event.getAxisValue(a)
+            val axes = xendroid.compose.gamepad.AnalogTriggers.readPadAxes(event)
             val plays = xendroid.compose.gamepad.PadPlay.plays(
-                axis(android.view.MotionEvent.AXIS_X), axis(android.view.MotionEvent.AXIS_Y),
-                axis(android.view.MotionEvent.AXIS_Z), axis(android.view.MotionEvent.AXIS_RZ),
-                maxOf(axis(android.view.MotionEvent.AXIS_LTRIGGER), axis(android.view.MotionEvent.AXIS_BRAKE)),
-                maxOf(axis(android.view.MotionEvent.AXIS_RTRIGGER), axis(android.view.MotionEvent.AXIS_GAS)),
-                axis(android.view.MotionEvent.AXIS_HAT_X), axis(android.view.MotionEvent.AXIS_HAT_Y))
+                axes.lx, axes.ly, axes.rx, axes.ry, axes.lt, axes.rt, axes.hatX, axes.hatY)
             if (plays) noteControllerUse(event)
         }
         if (xendroid.compose.gamepad.GamepadCapture.listener?.invoke(event) == true) return true

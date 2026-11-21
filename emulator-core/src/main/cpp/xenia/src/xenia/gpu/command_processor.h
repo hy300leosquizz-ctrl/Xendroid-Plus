@@ -11,6 +11,7 @@
 #define XENIA_GPU_COMMAND_PROCESSOR_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -69,6 +70,7 @@ enum class ZPDMode {
 
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
+ReadbackResolveMode GetReadbackResolveMode();
 
 // Shared pool capacity for D3D12 and Vulkan.
 constexpr uint32_t kZPDQueryPoolCapacity = 8192;
@@ -268,9 +270,12 @@ class CommandProcessor {
 
   TraceWriter& trace_writer() { return trace_writer_; }
 
-  // Get cached readback resolve mode (avoids string parsing every frame)
+  // Get cached readback resolve mode (avoids string parsing every frame; uses
+  // the shared atomic cache invalidated by InvalidateConfigModeCaches so
+  // per-game config and game_quirks overrides applied after CommandProcessor
+  // construction take effect immediately).
   ReadbackResolveMode GetReadbackResolveMode() const {
-    return cached_readback_resolve_mode_;
+    return xe::gpu::GetReadbackResolveMode();
   }
 
   // Set readback resolve mode (updates both cvar and cached value). With
@@ -597,10 +602,19 @@ class CommandProcessor {
 
   // One active guest report slot. May span multiple host query segments split
   // across submissions or render passes, final value is the normalized sum.
+  struct ZPDQueryCounts {
+    uint64_t total = 0;
+    uint64_t z_pass = 0;
+    uint64_t z_fail = 0;
+    uint64_t stencil_fail = 0;
+  };
+
   struct ZPDReport {
     // Guest sample count. Each segment is normalized by its own scale area
     // when it resolves.
     uint64_t accumulated_samples = 0;
+    ZPDQueryCounts accumulated_counts{};
+    bool has_full_counters = false;
     // Submission of the first closed segment.
     uint64_t first_segment_end_submission = 0;
     // Submission containing the most recently closed segment's resolve.
@@ -618,6 +632,58 @@ class CommandProcessor {
     // Distinguishes "we resolved to zero" from "we have no cached value yet".
     bool has_cached_delta = false;
     bool ended = false;
+  };
+
+  // VIZ_QUERY (64 visibility IDs, adapted from xenia-edge 692cd59cf).
+  static constexpr uint64_t kInvalidVIZGeneration = 0;
+  static constexpr uint32_t kVIZQueryCount = 64;
+  // 32-bit ReportHandles with bit 31 set encode (id in bits 25..30, non-zero
+  // 25-bit generation in bits 0..24) so VIZ segments can share backend query
+  // resolve plumbing without widening ReportHandle.
+  static constexpr ReportHandle kVIZReportHandleBit = UINT32_C(1) << 31;
+  static constexpr uint32_t kVIZGenerationMask = (UINT32_C(1) << 25) - 1;
+  static constexpr bool IsVIZReportHandle(ReportHandle handle) {
+    return (handle & kVIZReportHandleBit) != 0;
+  }
+  static constexpr ReportHandle MakeVIZReportHandle(uint32_t id,
+                                                    uint64_t generation) {
+    return kVIZReportHandleBit | ((id & 0x3Fu) << 25) |
+           (uint32_t(generation) & kVIZGenerationMask);
+  }
+  static constexpr uint32_t GetVIZIdFromHandle(ReportHandle handle) {
+    return (handle >> 25) & 0x3Fu;
+  }
+  static constexpr uint64_t GetVIZGenerationFromHandle(ReportHandle handle) {
+    return uint64_t(handle & kVIZGenerationMask);
+  }
+
+  struct VIZQuery {
+    uint64_t generation = kInvalidVIZGeneration;
+    uint64_t last_segment_end_submission = 0;
+    uint32_t pending_segments = 0;
+    bool active = false;
+    bool surveyed = false;
+    bool fallback = false;
+    bool accumulated_visible = false;
+    bool resolved = true;
+    bool visible = true;
+    bool predicate_armed = false;
+  };
+
+  struct VIZDrawPredicate {
+    uint32_t id = 0;
+    uint64_t generation = kInvalidVIZGeneration;
+  };
+
+  // Non-blocking guest fence / interrupt signal queue held behind in-flight
+  // vertex shader memexport submissions (adapted from xenia-edge 31a696a9a +
+  // 409ca81a3, BSD-3-Clause).
+  struct HeldGuestSignal {
+    uint8_t* destination = nullptr;
+    uint32_t physical_address = 0;
+    uint32_t value = 0;
+    uint64_t submission = 0;
+    std::chrono::steady_clock::time_point held_since{};
   };
 
   // TODO(boma): Replace with a map keyed by slot_base for concurrent slots.
@@ -703,12 +769,52 @@ class CommandProcessor {
   // report to guest memory.
   void OnZPDQueryResolved(ReportHandle report_handle, uint64_t raw_samples,
                           uint32_t scale_area);
+  void OnZPDQueryCountsResolved(ReportHandle report_handle,
+                                const ZPDQueryCounts& raw_counts,
+                                uint32_t scale_area);
+
+  // VIZ_QUERY lifecycle and conditional draw preparation.
+  void BeginVIZQuery(uint32_t id);
+  void EndVIZQuery(uint32_t id);
+  void RecordVIZQuerySegment(uint32_t id, uint64_t generation,
+                             uint64_t submission);
+  void OnVIZSurveyDraw(bool measured);
+  void OnVIZQueryResolved(uint32_t id, uint64_t generation, bool visible);
+  bool PrepareVIZDraw(uint32_t token);
+  void ResetVIZState() {
+    viz_queries_.fill({});
+    viz_draw_predicate_ = {};
+    viz_active_id_ = UINT32_MAX;
+    viz_active_generation_ = kInvalidVIZGeneration;
+    viz_pending_resolves_ = 0;
+  }
+  virtual void AwaitVIZQueryResolve(uint64_t submission) {}
+
+  // Held guest signal queue for non-blocking memexport fence/interrupt ordering.
+  void WriteGuestFence(uint8_t* destination, uint32_t physical_address,
+                       uint32_t value);
+  void DispatchGuestInterrupt(uint32_t cpu_mask);
+  void HoldOrPerformGuestSignal(const HeldGuestSignal& signal);
+  void PerformGuestSignal(const HeldGuestSignal& signal);
+  void PerformCompletedHeldSignals();
+  void SubmitHeldSignals();
+  void AwaitHeldSignalsWriting(uint32_t physical_address);
+  void AwaitHeldSignalsAndMemexport();
+  void PerformHeldSignals(size_t await_count);
+  bool has_held_guest_signals() const { return !held_guest_signals_.empty(); }
+  virtual uint64_t TakeMemexportSignalSubmission() { return 0; }
+  virtual void EndSubmissionForHeldSignals(uint64_t submission) {}
+  virtual void AwaitSubmissionForHeldSignals(uint64_t submission) {}
 
   // Writes guest report with begin_value read from guest memory.
   // Orphan END path only when no controller snapshot is available.
   void WriteZPDReport(uint32_t begin_record, uint32_t end_record,
                       uint32_t begin_value, uint32_t delta_value,
                       bool write_begin_record);
+  void WriteZPDReportCounts(uint32_t begin_record, uint32_t end_record,
+                            const ZPDQueryCounts& begin_counts,
+                            const ZPDQueryCounts& delta_counts,
+                            bool write_begin_record);
 
   // Called from PrepareForWait so strict mode can retire before guest loops
   // again. Gives up after kStrictZPDRetireMaxStalls.
@@ -730,6 +836,7 @@ class CommandProcessor {
     zpd_next_report_handle_ = 1;
     zpd_slot_sequences_.clear();
     zpd_slot_values_.clear();
+    zpd_slot_counts_.clear();
     logical_zpd_reports_.clear();
     fast_zpd_report_cached_values_.clear();
     fake_zpd_sample_count_ = 0;
@@ -784,8 +891,18 @@ class CommandProcessor {
   ReportHandle zpd_next_report_handle_ = 1;
   std::unordered_map<uint32_t, uint64_t> zpd_slot_sequences_;
   std::unordered_map<uint32_t, uint32_t> zpd_slot_values_;
+  std::unordered_map<uint32_t, ZPDQueryCounts> zpd_slot_counts_;
   std::unordered_map<ReportHandle, ZPDReport> logical_zpd_reports_;
   ActiveZPDSegment zpd_active_segment_{};
+
+  std::array<VIZQuery, kVIZQueryCount> viz_queries_{};
+  VIZDrawPredicate viz_draw_predicate_{};
+  uint32_t viz_active_id_ = UINT32_MAX;
+  uint64_t viz_active_generation_ = kInvalidVIZGeneration;
+  uint32_t viz_pending_resolves_ = 0;
+
+  std::deque<HeldGuestSignal> held_guest_signals_;
+  uint64_t held_guest_signals_submission_ = 0;
 
   // Cached delta per END.
   // Fast mode uses this for speculative writeback and orphaned END replay.
@@ -847,6 +964,9 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+
+  // XenDroid: the packets so far that a title could wait for the GPU with.
+  uint64_t guest_sync_count_ = 0;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

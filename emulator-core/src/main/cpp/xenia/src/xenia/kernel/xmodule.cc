@@ -52,6 +52,7 @@ void XModule::OnLoad() { kernel_state_->RegisterModule(this); }
 
 void XModule::OnUnload() {
   kernel_state_->processor()->RemoveModule(processor_module_);
+  processor_module_ = nullptr;
   kernel_state_->UnregisterModule(this);
 }
 

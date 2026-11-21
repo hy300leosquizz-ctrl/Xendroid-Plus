@@ -82,7 +82,7 @@ enum class InGameAction(val kind: RowKind) {
     EDIT_TOUCH_LAYOUT(RowKind.BUTTON),
     /** 15c: the game above and the touch controls clear of it: off, at a fold, always. */
     SPLIT_SCREEN(RowKind.CYCLE),
-    CONTROLLER_RUMBLE(RowKind.CYCLE), PHONE_CONTROLLERS(RowKind.BUTTON),
+    CONTROLLER_RUMBLE(RowKind.CYCLE), KEY_MAPPING(RowKind.BUTTON), PHONE_CONTROLLERS(RowKind.BUTTON),
     /** Controller input as it arrives instead of batched to the next frame (an A/B switch). */
     UNBUFFERED_INPUT(RowKind.TOGGLE),
     GYRO_CAMERA(RowKind.TOGGLE),
@@ -141,8 +141,8 @@ val inGamePageGroups: Map<InGamePage, List<MenuGroup>> = mapOf(
     InGamePage.CONTROLS to listOf(
         MenuGroup(R.string.menu_group_touch, listOf(InGameAction.TOUCH_CONTROLS, InGameAction.CONTROL_STYLE, InGameAction.ADAPTIVE_STICKS,
             InGameAction.TOUCH_CAMERA, InGameAction.EDIT_TOUCH_LAYOUT, InGameAction.SPLIT_SCREEN)),
-        MenuGroup(R.string.menu_group_controllers, listOf(InGameAction.CONTROLLER_RUMBLE, InGameAction.PHONE_CONTROLLERS,
-            InGameAction.UNBUFFERED_INPUT)),
+        MenuGroup(R.string.menu_group_controllers, listOf(InGameAction.CONTROLLER_RUMBLE, InGameAction.KEY_MAPPING,
+            InGameAction.PHONE_CONTROLLERS, InGameAction.UNBUFFERED_INPUT)),
         MenuGroup(R.string.menu_group_gyro, listOf(InGameAction.GYRO_CAMERA, InGameAction.GYRO_AIM, InGameAction.GYRO_SENSITIVITY,
             InGameAction.GYRO_CALIBRATE)),
     ),

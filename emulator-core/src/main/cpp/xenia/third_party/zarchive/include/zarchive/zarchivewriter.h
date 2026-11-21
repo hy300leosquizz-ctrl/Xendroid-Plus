@@ -1,18 +1,26 @@
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
-#include <vector>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "zarchivecommon.h"
+
+struct ZSTD_CCtx_s;
 
 class ZArchiveWriter
 {
 	struct PathNode
 	{
-		PathNode() : isFile(false), nameIndex(0xFFFFFFFF) {};
-		PathNode(bool isFile, uint32_t nameIndex) : isFile(isFile), nameIndex(nameIndex) {};
+		PathNode() : isFile(false), nameIndex(0xFFFFFFFF) {}
+		PathNode(bool isFile, uint32_t nameIndex) : isFile(isFile), nameIndex(nameIndex) {}
 
 		bool isFile;
 		uint32_t nameIndex; // index in m_nodeNames
@@ -27,6 +35,8 @@ class ZArchiveWriter
 	};
 
 public:
+	static constexpr size_t kBatchBlocks = 64; // 64 * 64 KiB = 4 MiB parallel batch
+
 	typedef void(*CB_NewOutputFile)(const int32_t partIndex, void* ctx);
 	typedef void(*CB_WriteOutputData)(const void* data, size_t length, void* ctx);
 
@@ -41,13 +51,19 @@ public:
 private:
 	PathNode* GetNodeByPath(PathNode* root, std::string_view path);
 	PathNode* FindSubnodeByName(PathNode* parent, std::string_view nodeName);
+	static void DestroySubtree(PathNode* node);
 
 	uint32_t CreateNameEntry(std::string_view name);
 
 	void OutputData(const void* data, size_t length);
 	uint64_t GetCurrentOutputOffset() const;
 
-	void StoreBlock(const uint8_t* uncompressedData);
+	void EnqueueBlock(const uint8_t* uncompressedData);
+	void FlushPendingBlocks();
+	void CompressBatchRange(ZSTD_CCtx_s* cctx, size_t batchCount);
+	void EmitCompressedBlock(const uint8_t* rawBlock, const uint8_t* compressedData, size_t compressedSize);
+	void WorkerLoop();
+	void ShutdownWorkers();
 
 	void WriteOffsetRecords();
 	void WriteNameTable();
@@ -68,9 +84,24 @@ private:
 	std::unordered_map<std::string, uint32_t> m_nodeNameLookup;
 	// footer
 	_ZARCHIVE::Footer m_footer;
-	// writes and compression
+	// writes and parallel block compression
 	std::vector<uint8_t> m_currentWriteBuffer;
-	std::vector<uint8_t> m_compressionBuffer;
+	std::vector<uint8_t> m_pendingRawBlocks;
+	std::array<std::vector<uint8_t>, kBatchBlocks> m_batchCompressed;
+	std::array<size_t, kBatchBlocks> m_batchSizes{};
+	size_t m_pendingBlockCount{ 0 };
+	ZSTD_CCtx_s* m_inlineCctx{ nullptr };
+
+	std::vector<std::thread> m_workers;
+	std::mutex m_batchMutex;
+	std::condition_variable m_batchStartCv;
+	std::condition_variable m_batchDoneCv;
+	uint64_t m_batchEpoch{ 0 };
+	size_t m_activeBatchCount{ 0 };
+	std::atomic<size_t> m_nextBlockIndex{ 0 };
+	std::atomic<size_t> m_completedBlocks{ 0 };
+	bool m_workersQuit{ false };
+
 	uint64_t m_currentCompressedWriteIndex{ 0 }; // output file write index
 	uint64_t m_currentInputOffset{ 0 }; // current offset within uncompressed file data
 	// uncompressed-to-compressed offset records

@@ -230,6 +230,9 @@ class XObject {
   void RetainHandle();
   bool ReleaseHandle();
   void Retain();
+  // Retains unless the last reference is already gone, for a lookup that can
+  // race the object's destruction.
+  bool TryRetain();
   void Release();
   X_STATUS Delete();
 

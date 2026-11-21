@@ -68,6 +68,7 @@ import xendroid.compose.ui.design.XdTwoColumns
 /** Where Settings leads: the Drivers area, a game's settings, diagnostics and tests, About. */
 class SettingsLinks(
     val onDrivers: (() -> Unit)? = null,
+    val onGameFolders: (() -> Unit)? = null,
     /** A game's sheet at its settings, by Title ID; null when the library is not at hand. */
     val onGameSettings: ((String) -> Unit)? = null,
     val onDiagnostics: () -> Unit = {},
@@ -182,6 +183,12 @@ fun SettingsScreen(vm: SettingsViewModel, onBack: () -> Unit, links: SettingsLin
         })
         add(XdSection(Ids.DATA, stringResource(R.string.xd_set_data), XdIcons.save) {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (links.onGameFolders != null && xendroid.compose.core.AllFilesAccess.isSupported) {
+                    XdCard(title = stringResource(R.string.lib_menu_folders), icon = XdIcons.folder) {
+                        Text(stringResource(R.string.xd_fd_settings_note), style = XdText.note, color = Xd.colors.fg3)
+                        XdButton(stringResource(R.string.xd_data_open), links.onGameFolders, size = XdButtonSize.SM, icon = XdIcons.folder)
+                    }
+                }
                 XdDataBundleCard(beforeImport = vm::flush, afterImport = { vm.onResume() })
                 XdUserDataCard()
             }

@@ -9,6 +9,10 @@
 
 #include "xenia/vfs/devices/host_path_device.h"
 
+#include <algorithm>
+#include <limits>
+#include <system_error>
+
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -127,7 +131,43 @@ uint64_t StfsSingleFileContainerSize(uint64_t payload_size) {
   return kHeaderSize + block * kBlockSize;
 }
 
+// A failed space() reports all ones, which would read as unlimited space.
+std::filesystem::space_info QueryHostSpace(const std::filesystem::path& path) {
+  std::error_code ec;
+  std::filesystem::path probe = path;
+  while (!probe.empty() && !std::filesystem::exists(probe, ec)) {
+    const auto parent = probe.parent_path();
+    if (parent == probe) {
+      break;
+    }
+    probe = parent;
+  }
+  auto space = std::filesystem::space(probe.empty() ? path : probe, ec);
+  if (ec) {
+    XELOGW("HostPathDevice: unable to query the space of {}: {}",
+           xe::path_to_utf8(path), ec.message());
+    constexpr uintmax_t kFallbackBytes = 128ull * 1024 * 0x200;
+    return {kFallbackBytes, kFallbackBytes, kFallbackBytes};
+  }
+  return space;
+}
+
+uint32_t BytesToUnits(uintmax_t bytes, const Device& device) {
+  uintmax_t unit_size = uintmax_t(device.sectors_per_allocation_unit()) *
+                        device.bytes_per_sector();
+  return uint32_t(std::min<uintmax_t>(bytes / unit_size,
+                                      std::numeric_limits<uint32_t>::max()));
+}
+
 }  // namespace
+
+uint32_t HostPathDevice::total_allocation_units() const {
+  return BytesToUnits(QueryHostSpace(host_path_).capacity, *this);
+}
+
+uint32_t HostPathDevice::available_allocation_units() const {
+  return BytesToUnits(QueryHostSpace(host_path_).available, *this);
+}
 
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
   std::vector<std::filesystem::path> ancestors;

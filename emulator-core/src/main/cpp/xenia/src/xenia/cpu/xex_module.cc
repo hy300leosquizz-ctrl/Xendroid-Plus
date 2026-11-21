@@ -191,6 +191,46 @@ uint32_t XexModule::GetProcAddress(const std::string_view name) const {
   return 0;
 }
 
+bool XexModule::PageDigestsMatch() const {
+  // Only the XEX2 layout is checked.
+  if (xex_format_ != kFormatXex2) {
+    return true;
+  }
+  const auto* security =
+      static_cast<const xex2_security_info*>(GetSecurityInfo(xex_header()));
+  const uint32_t page_size = memory()->LookupHeap(base_address_)->page_size();
+  const uint8_t* image = memory()->TranslateVirtual<uint8_t*>(base_address_);
+  // The image was allocated by this size, which the regions mustn't run past.
+  const size_t total = image_size();
+  const char* expected = security->section_digest;
+  size_t offset = 0;
+  for (uint32_t i = 0; i < security->page_descriptor_count; ++i) {
+    const xex2_page_descriptor& entry = security->page_descriptors[i];
+    // Byteswap the bitfield manually.
+    xex2_page_descriptor descriptor;
+    descriptor.value = xe::byte_swap(entry.value);
+    const size_t length = size_t(descriptor.page_count) * page_size;
+    if (length > total - offset) {
+      return false;
+    }
+    uint8_t digest[0x14];
+    mbedtls_sha1_context context;
+    mbedtls_sha1_init(&context);
+    mbedtls_sha1_starts(&context);
+    mbedtls_sha1_update(&context, image + offset, length);
+    mbedtls_sha1_update(&context, reinterpret_cast<const uint8_t*>(&entry),
+                        sizeof(entry));
+    mbedtls_sha1_finish(&context, digest);
+    mbedtls_sha1_free(&context);
+    if (std::memcmp(digest, expected, sizeof(digest))) {
+      return false;
+    }
+    expected = entry.data_digest;
+    offset += length;
+  }
+  return true;
+}
+
 int XexModule::ApplyPatch(XexModule* module) {
   if (!is_patch()) {
     // This isn't a XEX2 patch.
@@ -347,6 +387,15 @@ int XexModule::ApplyPatch(XexModule* module) {
     return 11;
   }
 
+  // Unload releases only the allocation at the base, not the range the image
+  // grew into.
+  uint32_t grown_address = 0;
+  auto release_growth = [&]() {
+    if (grown_address) {
+      memory()->LookupHeap(grown_address)->Release(grown_address);
+    }
+  };
+
   // Check if we need to alloc new memory for the patched xex
   if (base_moved || new_image_size > original_image_size) {
     uint32_t addr_new_mem;
@@ -378,6 +427,9 @@ int XexModule::ApplyPatch(XexModule* module) {
              size_delta);
       assert_always();
       return 6;
+    }
+    if (!base_moved) {
+      grown_address = addr_new_mem;
     }
 
     // Move the image to its new base and free the old allocation.
@@ -414,6 +466,7 @@ int XexModule::ApplyPatch(XexModule* module) {
 
   if (memcmp(test_delta_key, orig_session_key, 0x10) != 0) {
     XELOGE("XEX patch image key doesn't match original XEX!");
+    release_growth();
     return 7;
   }
 
@@ -437,6 +490,7 @@ int XexModule::ApplyPatch(XexModule* module) {
       break;
     default:
       assert_always();
+      release_growth();
       return 8;
   }
 
@@ -510,6 +564,13 @@ int XexModule::ApplyPatch(XexModule* module) {
     cur_block = next_block;
   }
 
+  // A patch made for other code can apply without an error and still build an
+  // image other than the one it was made to build.
+  if (!result_code && !module->PageDigestsMatch()) {
+    XELOGE("XEX patch built an image its headers don't describe");
+    result_code = 10;
+  }
+
   if (!result_code) {
     // Decommit unused pages if new image size is smaller than original
     if (original_image_size > new_image_size) {
@@ -537,6 +598,7 @@ int XexModule::ApplyPatch(XexModule* module) {
         target_ver.major, target_ver.minor, target_ver.build, target_ver.qfe);
   } else {
     XELOGE("XEX patch application failed, error code {}", result_code);
+    release_growth();
   }
 
   if (free_input) {
@@ -1566,39 +1628,56 @@ void XexModule::PrecompileDiscoveredFunctions() {
   if (!cvars::enable_early_precompilation) {
     return;
   }
-  auto others = PreanalyzeCode();
-
-  for (auto&& other : others) {
-    if (other < low_address_ || other >= high_address_) {
+  const auto t0 = std::chrono::steady_clock::now();
+  auto candidates = PreanalyzeCode();
+  std::vector<uint32_t> to_compile;
+  to_compile.reserve(candidates.size());
+  for (uint32_t addr : candidates) {
+    if (addr < low_address_ || addr >= high_address_) {
       continue;
     }
-    auto sym = processor_->LookupFunction(other);
-
+    auto sym = processor_->LookupFunction(addr);
     if (!sym || sym->status() != Symbol::Status::kDefined) {
-      processor_->ResolveFunction(other);
+      to_compile.push_back(addr);
     }
+  }
+  if (!to_compile.empty()) {
+    const size_t compiled = processor_->ResolveFunctionsInParallel(to_compile);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count();
+    XELOGI("Precompiled {} discovered functions in {} ms", compiled,
+           elapsed_ms);
   }
 }
 void XexModule::PrecompileKnownFunctions() {
   if (!cvars::enable_early_precompilation) {
     return;
   }
-  uint32_t start = 0;
+  const auto t0 = std::chrono::steady_clock::now();
   uint32_t end = (high_address_ - low_address_) / 4;
   auto flags = info_cache_.LookupFlags(0);
   if (!flags) {
     return;
   }
-  // maybe should pre-acquire global crit?
+  std::vector<uint32_t> to_compile;
   for (uint32_t i = 0; i < end; i++) {
     if (flags[i].was_resolved) {
       uint32_t addr = low_address_ + (i * 4);
       auto sym = processor_->LookupFunction(addr);
-
       if (!sym || sym->status() != Symbol::Status::kDefined) {
-        processor_->ResolveFunction(addr);
+        to_compile.push_back(addr);
       }
     }
+  }
+  if (!to_compile.empty()) {
+    const size_t compiled = processor_->ResolveFunctionsInParallel(to_compile);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count();
+    XELOGI("Precompiled {} known functions in {} ms", compiled, elapsed_ms);
   }
 }
 

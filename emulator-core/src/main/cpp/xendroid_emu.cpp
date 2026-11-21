@@ -588,22 +588,6 @@ void EmulatorApp::emu_thr_main() {
                 fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
             }
         }
-
-        // Some (older?) games try accessing cache:\ too
-        // NOTE: this must be registered _after_ the cache0/cache1 devices, due to
-        // substring/start_with logic inside VirtualFileSystem::ResolvePath, else
-        // accesses to those devices will go here instead
-        auto cache_device = std::make_unique<xe::vfs::HostPathDevice>(
-                "\\CACHE", emu->storage_root() / "cache", false);
-        if (!cache_device->Initialize()) {
-            XELOGE("Unable to scan cache path");
-        } else {
-            if (!fs->RegisterDevice(std::move(cache_device))) {
-                XELOGE("Unable to register cache path");
-            } else {
-                fs->RegisterSymbolicLink("cache:", "\\CACHE");
-            }
-        }
     }
 
     if (cvars::force_mount_devkit) {

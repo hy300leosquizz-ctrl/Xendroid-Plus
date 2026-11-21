@@ -174,6 +174,10 @@ class VulkanDevice {
     bool shaderStorageImageExtendedFormats = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;
+    bool textureCompressionETC2 = false;
+    bool textureCompressionASTC_LDR = false;
+    bool textureCompressionBC = false;
+    uint32_t maxDrawIndirectCount = 1;
 
     // VK_KHR_sampler_mirror_clamp_to_edge (#15, promoted to 1.2)
 
@@ -307,6 +311,34 @@ class VulkanDevice {
     bool pipelineExecutablePropertiesAdvertised = false;
     bool pipelineExecutableInfoSupported = false;
     bool pipelineExecutableInfo = false;
+
+    // VK_KHR_buffer_device_address (#245, promoted to 1.2)
+    bool bufferDeviceAddress = false;
+
+    // VK_EXT_rasterization_order_attachment_access (#464) /
+    // VK_ARM_rasterization_order_attachment_access (#343)
+    bool rasterizationOrderColorAttachmentAccess = false;
+    bool rasterizationOrderDepthAttachmentAccess = false;
+    bool rasterizationOrderStencilAttachmentAccess = false;
+
+    // VK_EXT_depth_bias_control (#284)
+    bool depthBiasControl = false;
+    bool leastRepresentableValueForceUnormRepresentation = false;
+    bool depthBiasExact = false;
+
+    // VK_EXT_shader_object (#483)
+    bool shaderObject = false;
+
+    // VK_EXT_graphics_pipeline_library (#321)
+    bool graphicsPipelineLibrary = false;
+    bool graphicsPipelineLibraryFastLinking = false;
+    bool graphicsPipelineLibraryIndependentInterpolationDecoration = false;
+
+    // Arm Mali driver version (r<M>p<N>) & errata flags (SDEN-3735689)
+    int32_t maliDriverMajorR = 0;
+    int32_t maliDriverMinorP = 0;
+    bool maliCapSpirv13 = false;
+    bool maliRewriteScalarSelect = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -365,6 +397,20 @@ class VulkanDevice {
     // VK_KHR_fragment_shading_rate (#227), only requested with
     // vulkan_fragment_shading_rate.
     bool ext_KHR_fragment_shading_rate = false;
+    // VK_KHR_buffer_device_address (#245, promoted to 1.2)
+    bool ext_1_2_KHR_buffer_device_address = false;
+    bool ext_KHR_buffer_device_address = false;
+    // VK_EXT_rasterization_order_attachment_access (#464) /
+    // VK_ARM_rasterization_order_attachment_access (#343)
+    bool ext_EXT_rasterization_order_attachment_access = false;
+    bool ext_ARM_rasterization_order_attachment_access = false;
+    // VK_EXT_depth_bias_control (#284)
+    bool ext_EXT_depth_bias_control = false;
+    // VK_EXT_shader_object (#483)
+    bool ext_EXT_shader_object = false;
+    // VK_KHR_pipeline_library (#291) & VK_EXT_graphics_pipeline_library (#321)
+    bool ext_KHR_pipeline_library = false;
+    bool ext_EXT_graphics_pipeline_library = false;
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
     // ZeroFG independent Android presenter support. These are enabled only
     // when a ZeroFG session requests them and remain optional capability gates.
@@ -465,6 +511,28 @@ class VulkanDevice {
     // EXT name and only when the extension is present (optional, non-fatal).
 #include "xenia/ui/vulkan/functions/device_ext_extended_dynamic_state3.inc"
 #undef XE_UI_VULKAN_FUNCTION
+    // Stage 0 optional extension entry points (loaded by VulkanDevice when enabled).
+    PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress = nullptr;
+    PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHR = nullptr;
+    PFN_vkCmdSetDepthBias2EXT vkCmdSetDepthBias2EXT = nullptr;
+    PFN_vkCreateShadersEXT vkCreateShadersEXT = nullptr;
+    PFN_vkDestroyShaderEXT vkDestroyShaderEXT = nullptr;
+    PFN_vkGetShaderBinaryDataEXT vkGetShaderBinaryDataEXT = nullptr;
+    PFN_vkCmdBindShadersEXT vkCmdBindShadersEXT = nullptr;
+    PFN_vkCmdSetVertexInputEXT vkCmdSetVertexInputEXT = nullptr;
+    PFN_vkCmdSetViewportWithCount vkCmdSetViewportWithCount = nullptr;
+    PFN_vkCmdSetScissorWithCount vkCmdSetScissorWithCount = nullptr;
+    PFN_vkCmdSetRasterizerDiscardEnable vkCmdSetRasterizerDiscardEnable =
+        nullptr;
+    PFN_vkCmdSetDepthBiasEnable vkCmdSetDepthBiasEnable = nullptr;
+    PFN_vkCmdSetRasterizationSamplesEXT vkCmdSetRasterizationSamplesEXT =
+        nullptr;
+    PFN_vkCmdSetSampleMaskEXT vkCmdSetSampleMaskEXT = nullptr;
+    PFN_vkCmdSetAlphaToCoverageEnableEXT vkCmdSetAlphaToCoverageEnableEXT =
+        nullptr;
+    PFN_vkCmdSetAlphaToOneEnableEXT vkCmdSetAlphaToOneEnableEXT = nullptr;
+    PFN_vkCmdSetLogicOpEnableEXT vkCmdSetLogicOpEnableEXT = nullptr;
+    PFN_vkCmdSetDepthBoundsTestEnable vkCmdSetDepthBoundsTestEnable = nullptr;
   };
 
   const Functions& functions() const { return functions_; }

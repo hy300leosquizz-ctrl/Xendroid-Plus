@@ -66,6 +66,13 @@ def direct_host_resolve_variants():
                     ident += "_cs"
                     variants.append(
                         (ident, "resolve_host_color_entry.xesli", defines))
+                    if msaa == 4:
+                        # 4x kept as a 1x image of twice the size
+                        # (vulkan_msaa_4x_as_2x2).
+                        variants.append(
+                            (ident[:-3] + "_2x2_cs",
+                             "resolve_host_color_entry.xesli",
+                             defines + ["XE_RESOLVE_HOST_COLOR_SOURCE_2X2=1"]))
         for bpp in (8, 16, 32, 64, 128):
             for msaa in (1, 2, 4):
                 for scaled in (0, 1):
@@ -84,6 +91,13 @@ def direct_host_resolve_variants():
                     ident += "_cs"
                     variants.append(
                         (ident, "resolve_host_color_full_entry.xesli", defines))
+                    if msaa == 4:
+                        # 4x kept as a 1x image of twice the size
+                        # (vulkan_msaa_4x_as_2x2).
+                        variants.append(
+                            (ident[:-3] + "_2x2_cs",
+                             "resolve_host_color_full_entry.xesli",
+                             defines + ["XE_RESOLVE_HOST_COLOR_SOURCE_2X2=1"]))
     for bpp in (32, 64):
         for ms in (0, 1):
             for tex in (0, 1):
@@ -131,11 +145,20 @@ def direct_host_resolve_variants():
             for source_uint in (0, 1):
                 ident = ("resolve_host_color" + ("_uint" if source_uint else "") +
                          suffix + "_4px_cs")
-                variants.append((ident, "resolve_host_color_entry.xesli", [
+                color_4px_defines = [
                     "XE_RESOLVE_HOST_COLOR_BPP=32",
                     f"XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES={msaa}",
                     f"XE_RESOLVE_HOST_COLOR_SOURCE_UINT={source_uint}",
-                    "XE_RESOLVE_HOST_4PX=1"] + scaled_defines))
+                    "XE_RESOLVE_HOST_4PX=1"] + scaled_defines
+                variants.append((ident, "resolve_host_color_entry.xesli",
+                                 color_4px_defines))
+                if msaa == 4:
+                    variants.append(
+                        ("resolve_host_color" + ("_uint" if source_uint else "") +
+                         suffix + "_2x2_4px_cs",
+                         "resolve_host_color_entry.xesli",
+                         color_4px_defines +
+                         ["XE_RESOLVE_HOST_COLOR_SOURCE_2X2=1"]))
             variants.append(("resolve_host_depth" + suffix + "_4px_cs",
                              "resolve_host_depth_entry.xesli", [
                                  f"XE_RESOLVE_HOST_DEPTH_MSAA_SAMPLES={msaa}",
@@ -157,6 +180,18 @@ def direct_host_resolve_variants():
                              "resolve_host_color_full_entry.xesli",
                              ["XE_RESOLVE_HOST_COLOR_FULL_DEST_BPP=32"] +
                              color_defines))
+            if msaa == 4:
+                variants.append(
+                    (f"resolve_host_color{uint}_32bpp_4xmsaa_2x2_4px_tex_cs",
+                     "resolve_host_color_entry.xesli",
+                     ["XE_RESOLVE_HOST_COLOR_BPP=32",
+                      "XE_RESOLVE_HOST_4PX=1",
+                      "XE_RESOLVE_HOST_COLOR_SOURCE_2X2=1"] + color_defines))
+                variants.append(
+                    (f"resolve_host_color_full{uint}_32bpp_4xmsaa_2x2_tex_cs",
+                     "resolve_host_color_full_entry.xesli",
+                     ["XE_RESOLVE_HOST_COLOR_FULL_DEST_BPP=32",
+                      "XE_RESOLVE_HOST_COLOR_SOURCE_2X2=1"] + color_defines))
         variants.append((f"resolve_host_depth_32bpp_{msaa}xmsaa_4px_tex_cs",
                          "resolve_host_depth_entry.xesli",
                          [f"XE_RESOLVE_HOST_DEPTH_MSAA_SAMPLES={msaa}",
@@ -170,6 +205,16 @@ def direct_host_resolve_variants():
                           "XE_RESOLVE_HOST_COLOR_SOURCE_UINT=0",
                           "XE_RESOLVE_HOST_TEXTURE=1",
                           "XE_RESOLVE_HOST_TEXTURE_R11G11B10=1"]))
+        if msaa == 4:
+            variants.append(
+                ("resolve_host_color_full_32bpp_4xmsaa_2x2_tex_r11g11b10_cs",
+                 "resolve_host_color_full_entry.xesli",
+                 ["XE_RESOLVE_HOST_COLOR_FULL_DEST_BPP=32",
+                  "XE_RESOLVE_HOST_COLOR_MSAA_SAMPLES=4",
+                  "XE_RESOLVE_HOST_COLOR_SOURCE_UINT=0",
+                  "XE_RESOLVE_HOST_COLOR_SOURCE_2X2=1",
+                  "XE_RESOLVE_HOST_TEXTURE=1",
+                  "XE_RESOLVE_HOST_TEXTURE_R11G11B10=1"]))
     # Full color of 7e3 in the EDRAM to 2_10_10_10, unscaled, also storing into
     # the texture (vulkan_direct_host_resolve_7e3_variant; 1x with
     # vulkan_direct_host_resolve_format_variants).
@@ -185,6 +230,12 @@ def direct_host_resolve_variants():
                 (f"resolve_host_color_full_7e3_32bpp_{msaa}xmsaa" +
                  ("_tex" if tex else "") + "_cs",
                  "resolve_host_color_full_entry.xesli", defines))
+            if msaa == 4:
+                variants.append(
+                    ("resolve_host_color_full_7e3_32bpp_4xmsaa_2x2" +
+                     ("_tex" if tex else "") + "_cs",
+                     "resolve_host_color_full_entry.xesli",
+                     defines + ["XE_RESOLVE_HOST_COLOR_SOURCE_2X2=1"]))
     # One EDRAM format known when compiled, unscaled
     # (vulkan_direct_host_resolve_format_variants): the 4-pixel 32bpp fast color
     # (8_8_8_8 and 2_10_10_10, also storing into the texture) and depth (D24S8
@@ -207,6 +258,12 @@ def direct_host_resolve_variants():
                     (f"resolve_host_color_32bpp_{msaa}xmsaa_4px_{fmt}" +
                      ("_tex" if tex else "") + "_cs",
                      "resolve_host_color_entry.xesli", defines))
+                if msaa == 4:
+                    variants.append(
+                        (f"resolve_host_color_32bpp_4xmsaa_2x2_4px_{fmt}" +
+                         ("_tex" if tex else "") + "_cs",
+                         "resolve_host_color_entry.xesli",
+                         defines + ["XE_RESOLVE_HOST_COLOR_SOURCE_2X2=1"]))
         for fmt, macro in depth_formats:
             for tex in (0, 1):
                 defines = [f"XE_RESOLVE_HOST_DEPTH_MSAA_SAMPLES={msaa}",

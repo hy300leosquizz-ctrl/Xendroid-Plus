@@ -120,6 +120,7 @@ fun LibraryController(
     onFavorite: (Game) -> Unit,
     gamertag: String?,
     preparing: Boolean,
+    onMenu: (() -> Unit)? = null,
 ) {
     val tabs = controllerTabs(data)
     val current = tabs.firstOrNull { it == tab } ?: LibraryFilter.All
@@ -175,6 +176,7 @@ fun LibraryController(
                         }
                         ButtonGlyph("RB")
                         XdIconButton(XdIcons.search, stringResource(R.string.lib_search), { searching = true })
+                        if (onMenu != null) XdIconButton(XdIcons.more, stringResource(R.string.lib_more), onMenu)
                         Row(
                             Modifier.clip(RoundedCornerShape(50)).clickable { openGuide() }.padding(horizontal = 4.dp, vertical = 2.dp),
                             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),

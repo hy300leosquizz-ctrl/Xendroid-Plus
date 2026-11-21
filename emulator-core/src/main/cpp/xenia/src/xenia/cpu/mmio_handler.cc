@@ -54,6 +54,8 @@ std::unique_ptr<MMIOHandler> MMIOHandler::Install(
 
   // Install the exception handler directed at the MMIOHandler.
   ExceptionHandler::Install(ExceptionCallbackThunk, handler.get());
+  ExceptionHandler::SetFastAccessViolationHandler(FastAccessViolationThunk,
+                                                  handler.get());
 
   global_handler_ = handler.get();
   return handler;
@@ -78,6 +80,7 @@ MMIOHandler::MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase,
       record_mmio_context_(record_mmio_context) {}
 
 MMIOHandler::~MMIOHandler() {
+  ExceptionHandler::SetFastAccessViolationHandler(nullptr, nullptr);
   ExceptionHandler::Uninstall(ExceptionCallbackThunk, this);
 
   assert_true(global_handler_ == this);
@@ -405,11 +408,77 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p,
 #endif  // XE_ARCH
 }
 
+bool MMIOHandler::FastAccessViolationThunk(void* data, uint64_t fault_pc,
+                                           uint64_t fault_address,
+                                           bool is_write) {
+  return reinterpret_cast<MMIOHandler*>(data)->FastAccessViolation(
+      fault_pc, fault_address, is_write);
+}
+
+bool MMIOHandler::FastAccessViolation(uint64_t fault_pc, uint64_t fault_address,
+                                      bool is_write) {
+  if (!access_violation_callback_) {
+    return false;
+  }
+  // Faulting stwcx. helpers hold an odd granule claim and need resume_pc
+  // redirected to their fail label, so they must use the full handler.
+  if (reserved_store_fault_pc_check_ &&
+      reserved_store_fault_pc_check_(reserved_store_fault_context_, fault_pc)) {
+    return false;
+  }
+  // Only handle watched guest virtual views of physical RAM outside user-mode
+  // views and outside MMIO (0x7FC00000..0x7FFFFFFF / mapped_ranges_).
+  if (fault_address < uint64_t(virtual_membase_) ||
+      fault_address >= uint64_t(physical_membase_)) {
+    return false;
+  }
+  void* fault_host_address = reinterpret_cast<void*>(fault_address);
+  const uint32_t fault_guest_va =
+      host_to_guest_virtual_(host_to_guest_virtual_context_, fault_host_address);
+  if (fault_guest_va >= 0x7FC00000u && fault_guest_va <= 0x7FFFFFFFu) {
+    return false;
+  }
+  // Watched guest physical views reside in 0xA0000000..0xFFD00000.
+  if (fault_guest_va < 0xA0000000u || fault_guest_va >= 0xFFD00000u) {
+    return false;
+  }
+  for (const auto& test_range : mapped_ranges_) {
+    if ((fault_guest_va & test_range.mask) == test_range.address) {
+      return false;
+    }
+  }
+  auto lock = global_critical_region_.Acquire();
+  last_fault_host_pc_.store(fault_pc, std::memory_order_relaxed);
+  last_fault_thread_id_.store(xe::threading::current_thread_id(),
+                              std::memory_order_relaxed);
+  return access_violation_callback_(std::move(lock),
+                                    access_violation_callback_context_,
+                                    fault_host_address, is_write, nullptr);
+}
+
 bool MMIOHandler::ExceptionCallbackThunk(Exception* ex, void* data) {
   return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
 }
 
 bool MMIOHandler::ExceptionCallback(Exception* ex) {
+  // Before anything here can wait on the global lock, which a thread retrying a
+  // stwcx. on the claimed granule may hold.
+  uint64_t reserved_store_fail_pc = 0;
+  if (reserved_store_fault_callback_ &&
+      ex->code() == Exception::Code::kAccessViolation) {
+    reserved_store_fail_pc =
+        reserved_store_fault_callback_(reserved_store_fault_context_, ex);
+  }
+  if (!HandleAccessViolation(ex)) {
+    return false;
+  }
+  if (reserved_store_fail_pc) {
+    ex->set_resume_pc(reserved_store_fail_pc);
+  }
+  return true;
+}
+
+bool MMIOHandler::HandleAccessViolation(Exception* ex) {
   if (ex->code() != Exception::Code::kAccessViolation) {
     return false;
   }

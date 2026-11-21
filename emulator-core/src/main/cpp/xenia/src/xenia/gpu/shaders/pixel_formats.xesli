@@ -693,6 +693,39 @@ uint4_xe XeRG16SNormToRG16Float(uint4_xe packed_texels) {
                   pack_half_2x16_xe(float2_xe(r.w, g.w)));
 }
 
+// Xenos 16-bit extended-range float of the k_16*_EXPAND texture formats
+// (s1e5m10, pre-3.04 DirectXMath half / vpkd3d128): no infinity or NaN -
+// exponent 31 is a finite normal number up to 131008.0, which an IEEE host
+// float16 view would misinterpret as Inf/NaN. Converted bit-exactly to IEEE
+// float32 without relying on fp16 subnormal preservation.
+uint XeXenosHalfToFloat32(uint half_value) {
+  half_value &= 0xFFFFu;
+  uint sign = (half_value & 0x8000u) << 16u;
+  uint exponent = (half_value >> 10u) & 0x1Fu;
+  uint mantissa = half_value & 0x3FFu;
+  if (exponent != 0u) {
+    return sign | ((exponent + 112u) << 23u) | (mantissa << 13u);
+  }
+  if (mantissa == 0u) {
+    return sign;
+  }
+  return sign | float_bits_to_uint_xe(float(mantissa) * (1.0f / 16777216.0f));
+}
+
+// 8 packed Xenos halves (in memory order) -> 8 IEEE float32 words.
+void XeXenosHalf8ToFloat32(uint4_xe packed_halves,
+                           out_param_xe(uint4_xe, out_0123),
+                           out_param_xe(uint4_xe, out_4567)) {
+  out_0123 = uint4_xe(XeXenosHalfToFloat32(packed_halves.x),
+                      XeXenosHalfToFloat32(packed_halves.x >> 16u),
+                      XeXenosHalfToFloat32(packed_halves.y),
+                      XeXenosHalfToFloat32(packed_halves.y >> 16u));
+  out_4567 = uint4_xe(XeXenosHalfToFloat32(packed_halves.z),
+                      XeXenosHalfToFloat32(packed_halves.z >> 16u),
+                      XeXenosHalfToFloat32(packed_halves.w),
+                      XeXenosHalfToFloat32(packed_halves.w >> 16u));
+}
+
 // Based on CFloat24 from d3dref9.dll and the 6e4 code from:
 // https://github.com/Microsoft/DirectXTex/blob/master/DirectXTex/DirectXTexConvert.cpp
 // 6e4 has a different exponent bias allowing [0,512) values, 20e4 allows [0,2).

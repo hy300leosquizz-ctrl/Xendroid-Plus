@@ -45,6 +45,7 @@ vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator);
 
 #if XE_PLATFORM_xendroid||XE_PLATFORM_ANDROID
 #include <sys/system_properties.h>
+#include <unistd.h>
 
 #include "third_party/libadrenotools/include/adrenotools/priv.h"
 #include "third_party/libadrenotools/include/adrenotools/driver.h"
@@ -53,6 +54,8 @@ extern std::string g_native_lib_dir;
 // Turnip quirks are keyed off the GPU generation and the vendor OS, both of which have
 // to be known before the driver library loads.
 namespace {
+
+bool HasKgslDevice() { return access("/dev/kgsl-3d0", F_OK) == 0; }
 
 // Adreno generation (6 for a6xx), 0 when the KGSL model node is unreadable.
 int AdrenoGeneration() {
@@ -180,6 +183,13 @@ DEFINE_bool(
     "the APK; attach from qrenderdoc with 'Attach to Running Instance'.",
     "Vulkan");
 
+DEFINE_bool(
+    vulkan_adreno_bcenabler, true,
+    "Patch older stock Qualcomm Adreno 6xx Vulkan drivers (512.<514) via "
+    "libadrenotools bcenabler to expose hardware BCn texture decompression "
+    "that the hardware supports in silicon.",
+    "Vulkan");
+
 namespace xe {
 namespace ui {
 namespace vulkan {
@@ -191,7 +201,8 @@ std::atomic<bool> gpu_power_control_in_use{false};
 }  // namespace
 
 bool RequestGpuPowerControl(const char* reason) {
-  if (!gpu_power_control_in_use.load(std::memory_order_relaxed)) {
+  if (!gpu_power_control_in_use.load(std::memory_order_relaxed) ||
+      !HasKgslDevice()) {
     return false;
   }
   // Made either way: KGSL power control is device-wide state, which a request
@@ -211,8 +222,29 @@ bool RequestGpuPowerControl(const char* reason) {
          reason ? reason : "periodic", std::strerror(errno));
   return false;
 }
+
+bool ReleaseGpuPowerControl(const char* reason) {
+  if (!HasKgslDevice()) {
+    return false;
+  }
+  const bool was_in_use =
+      gpu_power_control_in_use.load(std::memory_order_relaxed);
+  if (adrenotools_set_turbo(false)) {
+    if (was_in_use && reason) {
+      XELOGI("GPU clocks: KGSL power control returned to the kernel governor ({})",
+             reason);
+    }
+    return true;
+  }
+  if (was_in_use) {
+    XELOGW("GPU clocks: KGSL power control release ({}) failed: {}",
+           reason ? reason : "release", std::strerror(errno));
+  }
+  return false;
+}
 #else
 bool RequestGpuPowerControl(const char* reason) { return false; }
+bool ReleaseGpuPowerControl(const char* reason) { return false; }
 #endif
 
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(
@@ -285,48 +317,72 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
              cvars::turnip_perf_sampler,
              cvars::turnip_perf_sampler_period_ms);
     }
-    std::string custom_lib_path=cvars::vulkan_lib_path;
+    std::string custom_lib_path = cvars::vulkan_lib_path;
+    const bool has_kgsl = HasKgslDevice();
     bool custom_lib_exists =
         !custom_lib_path.empty() && std::filesystem::exists(custom_lib_path);
-    if(custom_lib_exists){
+    if (custom_lib_exists) {
+      std::string hook_dir = g_native_lib_dir + '/';
+      const size_t slash_pos = custom_lib_path.find_last_of('/');
+      std::string custom_lib_dir =
+          slash_pos != std::string::npos
+              ? custom_lib_path.substr(0, slash_pos + 1)
+              : std::string();
+      std::string custom_lib_name =
+          slash_pos != std::string::npos
+              ? custom_lib_path.substr(slash_pos + 1)
+              : custom_lib_path;
 
-        std::string hook_dir=g_native_lib_dir+'/';
+      // Support custom .zip/.so Vulkan drivers across all mobile GPU vendors
+      // (Adreno Turnip, Mali PanVK, Samsung Xclipse). Only enable KGSL context
+      // priority and KGSL turbo power control when /dev/kgsl-3d0 is present.
+      int driver_flags = ADRENOTOOLS_DRIVER_CUSTOM;
+      if (has_kgsl) {
+        driver_flags |= ADRENOTOOLS_DRIVER_CONTEXT_PRIORITY;
+      }
+      XELOGI("Loading custom Vulkan driver: {} (kgsl={})", custom_lib_path,
+             has_kgsl);
 
-        std::string custom_lib_dir=custom_lib_path.substr(0,custom_lib_path.find_last_of('/')+1);
-        std::string custom_lib_name=custom_lib_path.substr(custom_lib_path.find_last_of('/')+1);
+      vulkan_instance->loader_ = adrenotools_open_libvulkan(
+          RTLD_NOW, driver_flags, nullptr, hook_dir.c_str(),
+          custom_lib_dir.c_str(), custom_lib_name.c_str(), nullptr, nullptr);
 
-        XELOGI("Loading custom Vulkan driver: {}", custom_lib_path);
-
-        // CONTEXT_PRIORITY: ZeroFG's device asks KGSL for a higher priority
-        // than the game's (VulkanDevice::CreateIfSupported).
-        vulkan_instance->loader_= adrenotools_open_libvulkan(RTLD_NOW,
-                ADRENOTOOLS_DRIVER_CUSTOM | ADRENOTOOLS_DRIVER_CONTEXT_PRIORITY,nullptr
-                ,hook_dir.c_str()
-                ,custom_lib_dir.c_str()
-                ,custom_lib_name.c_str()
-                ,nullptr,nullptr);
-
-        if (!vulkan_instance->loader_) {
-          XELOGE("adrenotools failed to load custom Vulkan driver '{}': {}",
-                 custom_lib_path, dlerror());
-        } else {
-          vulkan_instance->custom_driver_path_ = custom_lib_path;
+      if (!vulkan_instance->loader_) {
+        XELOGE(
+            "adrenotools failed to load custom Vulkan driver '{}': {}; "
+            "falling back to system Vulkan driver",
+            custom_lib_path, dlerror());
+        vulkan_instance->loader_ =
+            dlopen(loader_library_name, RTLD_NOW | RTLD_LOCAL);
+        if (has_kgsl) {
+          gpu_power_control_in_use.store(false, std::memory_order_relaxed);
+          ReleaseGpuPowerControl("custom_driver_fallback");
         }
-
-        gpu_power_control_in_use.store(true, std::memory_order_relaxed);
-        RequestGpuPowerControl("startup");
-    }
-    else {
-        if (!custom_lib_path.empty()) {
-          XELOGW(
-              "Custom Vulkan driver path '{}' was set but the file does not "
-              "exist; using the system Vulkan driver instead.",
-              custom_lib_path);
+      } else {
+        vulkan_instance->custom_driver_path_ = custom_lib_path;
+        if (has_kgsl) {
+          gpu_power_control_in_use.store(true, std::memory_order_relaxed);
+          RequestGpuPowerControl("startup");
         }
+      }
+    } else {
+      if (!custom_lib_path.empty()) {
+        XELOGW(
+            "Custom Vulkan driver path '{}' was set but the file does not "
+            "exist; using the system Vulkan driver instead.",
+            custom_lib_path);
+      }
+      if (has_kgsl) {
+        // Recover from any crashed or force-stopped custom-driver session that
+        // left KGSL forced clocks active on the device.
+        gpu_power_control_in_use.store(false, std::memory_order_relaxed);
+        adrenotools_set_turbo(false);
+      }
 #endif
 
-  // http://developer.download.nvidia.com/mobile/shield/assets/Vulkan/UsingtheVulkanAPI.pdf
-  vulkan_instance->loader_ = dlopen(loader_library_name, RTLD_NOW | RTLD_LOCAL);
+      // http://developer.download.nvidia.com/mobile/shield/assets/Vulkan/UsingtheVulkanAPI.pdf
+      vulkan_instance->loader_ =
+          dlopen(loader_library_name, RTLD_NOW | RTLD_LOCAL);
 
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
     }
@@ -913,6 +969,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
 }
 
 VulkanInstance::~VulkanInstance() {
+  ReleaseGpuPowerControl("instance_destroy");
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  gpu_power_control_in_use.store(false, std::memory_order_relaxed);
+#endif
   if (instance_) {
     if (debug_utils_messenger_ != VK_NULL_HANDLE) {
       functions_.vkDestroyDebugUtilsMessengerEXT(

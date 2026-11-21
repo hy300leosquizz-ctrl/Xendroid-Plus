@@ -52,9 +52,13 @@ DeferredCommandBuffer::DeferredCommandBuffer(
 
 void DeferredCommandBuffer::Reset() {
   command_stream_size_ = 0;
+  segment_stream_size_ = 0;
   if (!use_size_cursor_) {
     command_stream_.clear();
+    segment_stream_.clear();
   }
+  in_segment_ = false;
+  active_segment_placeholder_ = kNoSegmentPlaceholder;
   // The recorded arguments are gone; a stale patch handle would write into a
   // future command's storage.
   render_area_patch_offset_ = kNoRenderAreaPatch;
@@ -62,27 +66,67 @@ void DeferredCommandBuffer::Reset() {
   pass_drawn_height_ = 0;
   pass_recorded_draws_ = 0;
   current_scissor_ = {};
+  current_viewport_ = {};
+  has_current_viewport_ = false;
+  viewport_clip_enabled_ = false;
+}
+
+size_t DeferredCommandBuffer::CmdExecuteSegmentPlaceholder() {
+  assert_false(in_segment_);
+  auto* args = reinterpret_cast<ArgsExecuteSegment*>(
+      WriteCommand(Command::kExecuteSegment, sizeof(ArgsExecuteSegment)));
+  args->start_elements = 0;
+  args->size_elements = 0;
+  return static_cast<size_t>(reinterpret_cast<uintmax_t*>(args) -
+                             command_stream_.data());
+}
+
+void DeferredCommandBuffer::BeginSegment(size_t placeholder_offset) {
+  assert_false(in_segment_);
+  assert_true(placeholder_offset != kNoSegmentPlaceholder &&
+              placeholder_offset < command_stream_size_);
+  auto& args = *reinterpret_cast<ArgsExecuteSegment*>(command_stream_.data() +
+                                                      placeholder_offset);
+  if (args.size_elements == 0) {
+    args.start_elements = segment_stream_size_;
+  } else {
+    assert_true(args.start_elements + args.size_elements ==
+                segment_stream_size_);
+  }
+  in_segment_ = true;
+  active_segment_placeholder_ = placeholder_offset;
+}
+
+void DeferredCommandBuffer::EndSegment() {
+  assert_true(in_segment_);
+  assert_true(active_segment_placeholder_ != kNoSegmentPlaceholder &&
+              active_segment_placeholder_ < command_stream_size_);
+  auto& args = *reinterpret_cast<ArgsExecuteSegment*>(
+      command_stream_.data() + active_segment_placeholder_);
+  args.size_elements = segment_stream_size_ - args.start_elements;
+  in_segment_ = false;
+  active_segment_placeholder_ = kNoSegmentPlaceholder;
 }
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-
-  const ui::vulkan::VulkanDevice::Functions& dfn =
-      command_processor_.GetVulkanDevice()->functions();
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_size_;
-  // True while the last guest graphics pipeline bind in the stream resolved to
-  // a slot whose asynchronous creation hasn't finished (or failed) - binding
-  // VK_NULL_HANDLE is undefined behavior, and drawing with the previously
-  // bound pipeline would use mismatched state, so draws are dropped until the
-  // next successful graphics pipeline bind.
-  bool guest_graphics_pipeline_unready = false;
-  const bool count_replay = cvars::vulkan_replay_stats;
-  if (count_replay) {
+  assert_false(in_segment_);
+  if (cvars::vulkan_replay_stats) {
     replay_last_args_.clear();
   }
+  bool guest_graphics_pipeline_unready = false;
+  ExecuteStream(command_buffer, command_stream_.data(), command_stream_size_,
+                guest_graphics_pipeline_unready);
+}
+
+void DeferredCommandBuffer::ExecuteStream(
+    VkCommandBuffer command_buffer, const uintmax_t* stream,
+    size_t stream_remaining, bool& guest_graphics_pipeline_unready) {
+  const ui::vulkan::VulkanDevice::Functions& dfn =
+      command_processor_.GetVulkanDevice()->functions();
+  const bool count_replay = cvars::vulkan_replay_stats;
   while (stream_remaining) {
     const CommandHeader& header =
         *reinterpret_cast<const CommandHeader*>(stream);
@@ -648,6 +692,183 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         }
       } break;
 
+      case Command::kExecuteSegment: {
+        auto& args = *reinterpret_cast<const ArgsExecuteSegment*>(stream);
+        if (args.size_elements != 0) {
+          assert_true(args.start_elements + args.size_elements <=
+                      segment_stream_size_);
+          ExecuteStream(command_buffer,
+                        segment_stream_.data() + args.start_elements,
+                        args.size_elements, guest_graphics_pipeline_unready);
+        }
+      } break;
+
+      case Command::kVkSetDepthBias2EXT: {
+        auto& args = *reinterpret_cast<const ArgsVkSetDepthBias2EXT*>(stream);
+        if (dfn.vkCmdSetDepthBias2EXT) {
+          VkDepthBiasRepresentationInfoEXT rep_info = {};
+          rep_info.sType =
+              VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT;
+          rep_info.depthBiasRepresentation = args.depth_bias_representation;
+          rep_info.depthBiasExact = args.depth_bias_exact;
+          VkDepthBiasInfoEXT bias_info = {};
+          bias_info.sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT;
+          bias_info.pNext = args.has_representation ? &rep_info : nullptr;
+          bias_info.depthBiasConstantFactor = args.depth_bias_constant_factor;
+          bias_info.depthBiasClamp = args.depth_bias_clamp;
+          bias_info.depthBiasSlopeFactor = args.depth_bias_slope_factor;
+          dfn.vkCmdSetDepthBias2EXT(command_buffer, &bias_info);
+        } else {
+          dfn.vkCmdSetDepthBias(command_buffer, args.depth_bias_constant_factor,
+                                args.depth_bias_clamp,
+                                args.depth_bias_slope_factor);
+        }
+      } break;
+
+      case Command::kVkBindShadersEXT: {
+        auto& args = *reinterpret_cast<const ArgsVkBindShadersEXT*>(stream);
+        if (dfn.vkCmdBindShadersEXT && args.stage_count != 0) {
+          size_t offset_bytes = xe::align(sizeof(ArgsVkBindShadersEXT),
+                                          alignof(VkShaderStageFlagBits));
+          const VkShaderStageFlagBits* stages =
+              reinterpret_cast<const VkShaderStageFlagBits*>(
+                  reinterpret_cast<const uint8_t*>(stream) + offset_bytes);
+          offset_bytes = xe::align(
+              offset_bytes +
+                  sizeof(VkShaderStageFlagBits) * args.stage_count,
+              alignof(VkShaderEXT));
+          const VkShaderEXT* shaders = reinterpret_cast<const VkShaderEXT*>(
+              reinterpret_cast<const uint8_t*>(stream) + offset_bytes);
+          dfn.vkCmdBindShadersEXT(command_buffer, args.stage_count, stages,
+                                  shaders);
+          for (uint32_t i = 0; i < args.stage_count; ++i) {
+            if (stages[i] == VK_SHADER_STAGE_VERTEX_BIT &&
+                shaders[i] != VK_NULL_HANDLE) {
+              guest_graphics_pipeline_unready = false;
+              break;
+            }
+          }
+        }
+      } break;
+
+      case Command::kVkSetVertexInputEXT: {
+        auto& args = *reinterpret_cast<const ArgsVkSetVertexInputEXT*>(stream);
+        if (dfn.vkCmdSetVertexInputEXT) {
+          size_t offset_bytes =
+              xe::align(sizeof(ArgsVkSetVertexInputEXT),
+                        alignof(VkVertexInputBindingDescription2EXT));
+          const VkVertexInputBindingDescription2EXT* bindings =
+              args.binding_count
+                  ? reinterpret_cast<
+                        const VkVertexInputBindingDescription2EXT*>(
+                        reinterpret_cast<const uint8_t*>(stream) + offset_bytes)
+                  : nullptr;
+          offset_bytes = xe::align(
+              offset_bytes + sizeof(VkVertexInputBindingDescription2EXT) *
+                                 args.binding_count,
+              alignof(VkVertexInputAttributeDescription2EXT));
+          const VkVertexInputAttributeDescription2EXT* attributes =
+              args.attribute_count
+                  ? reinterpret_cast<
+                        const VkVertexInputAttributeDescription2EXT*>(
+                        reinterpret_cast<const uint8_t*>(stream) + offset_bytes)
+                  : nullptr;
+          dfn.vkCmdSetVertexInputEXT(command_buffer, args.binding_count,
+                                     bindings, args.attribute_count,
+                                     attributes);
+        }
+      } break;
+
+      case Command::kVkSetViewportWithCount: {
+        auto& args =
+            *reinterpret_cast<const ArgsVkSetViewportWithCount*>(stream);
+        if (dfn.vkCmdSetViewportWithCount) {
+          const VkViewport* viewports =
+              args.viewport_count
+                  ? reinterpret_cast<const VkViewport*>(
+                        reinterpret_cast<const uint8_t*>(stream) +
+                        xe::align(sizeof(ArgsVkSetViewportWithCount),
+                                  alignof(VkViewport)))
+                  : nullptr;
+          dfn.vkCmdSetViewportWithCount(command_buffer, args.viewport_count,
+                                        viewports);
+        }
+      } break;
+
+      case Command::kVkSetScissorWithCount: {
+        auto& args =
+            *reinterpret_cast<const ArgsVkSetScissorWithCount*>(stream);
+        if (dfn.vkCmdSetScissorWithCount) {
+          const VkRect2D* scissors =
+              args.scissor_count
+                  ? reinterpret_cast<const VkRect2D*>(
+                        reinterpret_cast<const uint8_t*>(stream) +
+                        xe::align(sizeof(ArgsVkSetScissorWithCount),
+                                  alignof(VkRect2D)))
+                  : nullptr;
+          dfn.vkCmdSetScissorWithCount(command_buffer, args.scissor_count,
+                                       scissors);
+        }
+      } break;
+
+      case Command::kVkSetRasterizerDiscardEnable: {
+        auto& args = *reinterpret_cast<const ArgsVkSetBool*>(stream);
+        if (dfn.vkCmdSetRasterizerDiscardEnable) {
+          dfn.vkCmdSetRasterizerDiscardEnable(command_buffer, args.value);
+        }
+      } break;
+
+      case Command::kVkSetDepthBiasEnable: {
+        auto& args = *reinterpret_cast<const ArgsVkSetBool*>(stream);
+        if (dfn.vkCmdSetDepthBiasEnable) {
+          dfn.vkCmdSetDepthBiasEnable(command_buffer, args.value);
+        }
+      } break;
+
+      case Command::kVkSetRasterizationSamplesEXT: {
+        auto& args =
+            *reinterpret_cast<const ArgsVkSetRasterizationSamplesEXT*>(stream);
+        if (dfn.vkCmdSetRasterizationSamplesEXT) {
+          dfn.vkCmdSetRasterizationSamplesEXT(command_buffer, args.samples);
+        }
+      } break;
+
+      case Command::kVkSetSampleMaskEXT: {
+        auto& args = *reinterpret_cast<const ArgsVkSetSampleMaskEXT*>(stream);
+        if (dfn.vkCmdSetSampleMaskEXT) {
+          dfn.vkCmdSetSampleMaskEXT(command_buffer, args.samples,
+                                    &args.sample_mask);
+        }
+      } break;
+
+      case Command::kVkSetAlphaToCoverageEnableEXT: {
+        auto& args = *reinterpret_cast<const ArgsVkSetBool*>(stream);
+        if (dfn.vkCmdSetAlphaToCoverageEnableEXT) {
+          dfn.vkCmdSetAlphaToCoverageEnableEXT(command_buffer, args.value);
+        }
+      } break;
+
+      case Command::kVkSetAlphaToOneEnableEXT: {
+        auto& args = *reinterpret_cast<const ArgsVkSetBool*>(stream);
+        if (dfn.vkCmdSetAlphaToOneEnableEXT) {
+          dfn.vkCmdSetAlphaToOneEnableEXT(command_buffer, args.value);
+        }
+      } break;
+
+      case Command::kVkSetLogicOpEnableEXT: {
+        auto& args = *reinterpret_cast<const ArgsVkSetBool*>(stream);
+        if (dfn.vkCmdSetLogicOpEnableEXT) {
+          dfn.vkCmdSetLogicOpEnableEXT(command_buffer, args.value);
+        }
+      } break;
+
+      case Command::kVkSetDepthBoundsTestEnable: {
+        auto& args = *reinterpret_cast<const ArgsVkSetBool*>(stream);
+        if (dfn.vkCmdSetDepthBoundsTestEnable) {
+          dfn.vkCmdSetDepthBoundsTestEnable(command_buffer, args.value);
+        }
+      } break;
+
       default:
         assert_unhandled_case(header.command);
         break;
@@ -815,28 +1036,32 @@ void DeferredCommandBuffer::ShrinkRenderAreaToDrawn(
 
 void* DeferredCommandBuffer::WriteCommand(Command command,
                                           size_t arguments_size_bytes) {
+  std::vector<uintmax_t>& target_stream =
+      in_segment_ ? segment_stream_ : command_stream_;
+  size_t& target_size =
+      in_segment_ ? segment_stream_size_ : command_stream_size_;
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
-  size_t offset = command_stream_size_;
+  size_t offset = target_size;
   size_t new_size = offset + kCommandHeaderSizeElements + arguments_size_elements;
   if (use_size_cursor_) {
     // Grow geometrically and keep the arena allocated across Reset() — the
     // bytes past the cursor are dead, so resize()'s zero-fill per command is
     // pure waste. std::max ordering matters: size() * 2 is 0 right after
     // construction (the constructor only reserves).
-    if (new_size > command_stream_.size()) {
-      command_stream_.resize(std::max(new_size, command_stream_.size() * 2));
+    if (new_size > target_stream.size()) {
+      target_stream.resize(std::max(new_size, target_stream.size() * 2));
     }
   } else {
-    command_stream_.resize(new_size);
+    target_stream.resize(new_size);
   }
-  command_stream_size_ = new_size;
+  target_size = new_size;
   CommandHeader& header =
-      *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
+      *reinterpret_cast<CommandHeader*>(target_stream.data() + offset);
   header.command = command;
   header.arguments_size_elements = uint32_t(arguments_size_elements);
   uintmax_t* arguments =
-      command_stream_.data() + (offset + kCommandHeaderSizeElements);
+      target_stream.data() + (offset + kCommandHeaderSizeElements);
   if (cvars::vulkan_replay_stats) {
     // The replay statistics compare whole argument blocks, padding included.
     std::memset(arguments, 0, arguments_size_elements * sizeof(uintmax_t));
@@ -860,6 +1085,7 @@ void DeferredCommandBuffer::CountReplayedCommand(uint32_t command,
     case Command::kVkPushConstants:
     case Command::kVkSetBlendConstants:
     case Command::kVkSetDepthBias:
+    case Command::kVkSetDepthBias2EXT:
     case Command::kVkSetScissor:
     case Command::kVkSetStencilCompareMask:
     case Command::kVkSetStencilReference:
@@ -879,6 +1105,18 @@ void DeferredCommandBuffer::CountReplayedCommand(uint32_t command,
     case Command::kVkSetColorBlendEnableEXT:
     case Command::kVkSetColorBlendEquationEXT:
     case Command::kVkSetColorWriteMaskEXT:
+    case Command::kVkBindShadersEXT:
+    case Command::kVkSetVertexInputEXT:
+    case Command::kVkSetViewportWithCount:
+    case Command::kVkSetScissorWithCount:
+    case Command::kVkSetRasterizerDiscardEnable:
+    case Command::kVkSetDepthBiasEnable:
+    case Command::kVkSetRasterizationSamplesEXT:
+    case Command::kVkSetSampleMaskEXT:
+    case Command::kVkSetAlphaToCoverageEnableEXT:
+    case Command::kVkSetAlphaToOneEnableEXT:
+    case Command::kVkSetLogicOpEnableEXT:
+    case Command::kVkSetDepthBoundsTestEnable:
       break;
     default:
       return;
@@ -921,6 +1159,12 @@ const char* DeferredCommandBuffer::GetReplayStatCommandName(size_t index) {
       "SetDepthClampEnable", "SetPolygonMode", "SetColorBlendEnable",
       "SetColorBlendEquation", "SetColorWriteMask", "SetFragmentShadingRate",
       "BeginDebugUtilsLabel", "EndDebugUtilsLabel", "InsertDebugUtilsLabel",
+      "ExecuteSegment", "SetDepthBias2EXT", "BindShadersEXT",
+      "SetVertexInputEXT", "SetViewportWithCount", "SetScissorWithCount",
+      "SetRasterizerDiscardEnable", "SetDepthBiasEnable",
+      "SetRasterizationSamplesEXT", "SetSampleMaskEXT",
+      "SetAlphaToCoverageEnableEXT", "SetAlphaToOneEnableEXT",
+      "SetLogicOpEnableEXT", "SetDepthBoundsTestEnable",
   };
   static_assert(xe::countof(kNames) == kReplayStatCommandCount);
   return index < kReplayStatCommandCount ? kNames[index] : "?";

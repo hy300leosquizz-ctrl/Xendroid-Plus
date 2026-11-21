@@ -55,6 +55,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlin.math.abs
 import kotlin.math.hypot
 import xendroid.compose.R
+import xendroid.compose.gamepad.AnalogTriggers
 import xendroid.compose.gamepad.ControlOptions
 import xendroid.compose.gamepad.ControlOptionsStore
 import xendroid.compose.gamepad.ControllerTestModel
@@ -111,6 +112,7 @@ fun ControllerTestScreen(
     global: SettingsViewModel? = null,
     model: ControllerTestModel = remember { ControllerTestModel() },
     listen: Boolean = true,
+    onKeymap: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     var devices by remember { mutableStateOf(model.all) }
@@ -186,6 +188,17 @@ fun ControllerTestScreen(
         subtitle = if (connected > 0) pluralStringResource(R.plurals.xd_ct_count, connected, connected) else null,
         onBack = onBack,
         headIcon = XdIcons.gamepad,
+        actions = {
+            if (onKeymap != null) {
+                XdButton(
+                    stringResource(R.string.xd_pad_keymap),
+                    onKeymap,
+                    kind = XdButtonKind.GHOST,
+                    size = XdButtonSize.SM,
+                    icon = XdIcons.keyboard,
+                )
+            }
+        },
         hints = listOf(XdHint(if (swap) "A" else "B", stringResource(R.string.xd_ct_hold_b), onBack)),
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -216,12 +229,9 @@ private fun handle(event: InputEvent, model: ControllerTestModel, onBack: () -> 
             }
             if (event.repeatCount == 0) model.key(event.deviceId, event.keyCode, event.action == KeyEvent.ACTION_DOWN)
         }
-        is MotionEvent -> if (event.action == MotionEvent.ACTION_MOVE) model.motion(event.deviceId, PadAxes(
-            event.getAxisValue(MotionEvent.AXIS_X), event.getAxisValue(MotionEvent.AXIS_Y),
-            event.getAxisValue(MotionEvent.AXIS_Z), event.getAxisValue(MotionEvent.AXIS_RZ),
-            maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE)),
-            maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS)),
-            event.getAxisValue(MotionEvent.AXIS_HAT_X), event.getAxisValue(MotionEvent.AXIS_HAT_Y)))
+        is MotionEvent -> if (event.action == MotionEvent.ACTION_MOVE) {
+            model.motion(event.deviceId, AnalogTriggers.readPadAxes(event))
+        }
     }
     return true
 }

@@ -102,15 +102,18 @@ bool VulkanSharedMemory::Initialize() {
   const uint32_t concurrent_queue_families[2] = {
       vulkan_device->queue_family_graphics_compute(), transfer_family};
 
+  const VkBufferUsageFlags base_buffer_usage =
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+  const bool device_has_bda = vulkan_device->properties().bufferDeviceAddress;
+
   // Try to create a sparse buffer.
   VkBufferCreateInfo buffer_create_info;
   buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   buffer_create_info.pNext = nullptr;
   buffer_create_info.flags = sparse_flags;
   buffer_create_info.size = kBufferSize;
-  buffer_create_info.usage =
-      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+  buffer_create_info.usage = base_buffer_usage;
   if (transfer_family != UINT32_MAX) {
     buffer_create_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
     buffer_create_info.queueFamilyIndexCount = 2;
@@ -120,53 +123,82 @@ bool VulkanSharedMemory::Initialize() {
     buffer_create_info.queueFamilyIndexCount = 0;
     buffer_create_info.pQueueFamilyIndices = nullptr;
   }
-  // readback_resolve=uma reads guest RAM through this buffer's host mapping,
-  // and only the dense buffer below can be mapped, so uma overrides sparse.
-  const bool needs_host_mapping = cvars::readback_resolve == "uma";
+  // Second (host-imported) buffer for memexport and kFast/kAll resolve
+  // readbacks when VK_EXT_external_memory_host is available. Probed before the
+  // sparse/dense choice below so unified-memory GPUs without host-memory import
+  // (Adreno) fall back to a dense host-mapped buffer whenever readback or
+  // memexport needs CPU visibility.
+  TryInitializeHostBuffer();
+
+  const ReadbackResolveMode readback_mode = GetReadbackResolveMode();
+  const bool needs_host_mapping =
+      readback_mode == ReadbackResolveMode::kUma ||
+      (host_buffer_ == VK_NULL_HANDLE &&
+       (readback_mode != ReadbackResolveMode::kDisabled ||
+        cvars::memexport_enable));
   if (needs_host_mapping && cvars::vulkan_sparse_shared_memory) {
     XELOGI(
         "Shared memory: sparse binding disabled so the buffer can be "
-        "host-mapped for readback_resolve=uma");
+        "host-mapped for resolve/memexport readback");
   }
   if (cvars::vulkan_sparse_shared_memory && !needs_host_mapping &&
       vulkan_device->properties().sparseResidencyBuffer) {
-    if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) ==
-        VK_SUCCESS) {
-      VkMemoryRequirements buffer_memory_requirements;
-      dfn.vkGetBufferMemoryRequirements(device, buffer_,
-                                        &buffer_memory_requirements);
-      if (xe::bit_scan_forward(buffer_memory_requirements.memoryTypeBits &
-                                   vulkan_device->memory_types().device_local,
-                               &buffer_memory_type_)) {
-        uint32_t allocation_size_log2;
-        xe::bit_scan_forward(
-            std::max(uint64_t(buffer_memory_requirements.alignment),
-                     uint64_t(1)),
-            &allocation_size_log2);
-        if (allocation_size_log2 < kBufferSizeLog2) {
-          // Maximum of 1024 allocations in the worst case for all of the
-          // buffer because of the overall 4096 allocation count limit on
-          // Windows drivers.
-          InitializeSparseHostGpuMemory(
-              std::max(allocation_size_log2,
-                       std::max(kHostGpuMemoryOptimalSparseAllocationLog2,
-                                kBufferSizeLog2 - uint32_t(10))));
+    for (int bda_attempt = 0;
+         bda_attempt < (device_has_bda ? 2 : 1) && buffer_ == VK_NULL_HANDLE;
+         ++bda_attempt) {
+      const bool try_bda = device_has_bda && (bda_attempt == 0);
+      buffer_create_info.usage =
+          base_buffer_usage |
+          (try_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
+      if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) ==
+          VK_SUCCESS) {
+        VkMemoryRequirements buffer_memory_requirements;
+        dfn.vkGetBufferMemoryRequirements(device, buffer_,
+                                          &buffer_memory_requirements);
+        if (xe::bit_scan_forward(buffer_memory_requirements.memoryTypeBits &
+                                     vulkan_device->memory_types().device_local,
+                                 &buffer_memory_type_)) {
+          uint32_t allocation_size_log2;
+          xe::bit_scan_forward(
+              std::max(uint64_t(buffer_memory_requirements.alignment),
+                       uint64_t(1)),
+              &allocation_size_log2);
+          if (allocation_size_log2 < kBufferSizeLog2) {
+            // Maximum of 1024 allocations in the worst case for all of the
+            // buffer because of the overall 4096 allocation count limit on
+            // Windows drivers.
+            InitializeSparseHostGpuMemory(
+                std::max(allocation_size_log2,
+                         std::max(kHostGpuMemoryOptimalSparseAllocationLog2,
+                                  kBufferSizeLog2 - uint32_t(10))));
+          } else {
+            // Shouldn't happen on any real platform, but no point allocating
+            // the buffer sparsely.
+            dfn.vkDestroyBuffer(device, buffer_, nullptr);
+            buffer_ = VK_NULL_HANDLE;
+            break;
+          }
         } else {
-          // Shouldn't happen on any real platform, but no point allocating the
-          // buffer sparsely.
+          if (try_bda) {
+            XELOGW(
+                "Shared memory: No device-local memory type for sparse buffer "
+                "with BDA; retrying without SHADER_DEVICE_ADDRESS_BIT");
+          } else {
+            XELOGE(
+                "Shared memory: Failed to get a device-local Vulkan memory "
+                "type for the sparse buffer");
+          }
           dfn.vkDestroyBuffer(device, buffer_, nullptr);
           buffer_ = VK_NULL_HANDLE;
         }
+      } else if (try_bda) {
+        XELOGW(
+            "Shared memory: Sparse buffer creation with BDA failed; retrying "
+            "without SHADER_DEVICE_ADDRESS_BIT");
       } else {
-        XELOGE(
-            "Shared memory: Failed to get a device-local Vulkan memory type "
-            "for the sparse buffer");
-        dfn.vkDestroyBuffer(device, buffer_, nullptr);
-        buffer_ = VK_NULL_HANDLE;
+        XELOGE("Shared memory: Failed to create the {} MB Vulkan sparse buffer",
+               kBufferSize >> 20);
       }
-    } else {
-      XELOGE("Shared memory: Failed to create the {} MB Vulkan sparse buffer",
-             kBufferSize >> 20);
     }
   }
 
@@ -178,104 +210,158 @@ bool VulkanSharedMemory::Initialize() {
         "will be created",
         kBufferSize >> 20);
     buffer_create_info.flags &= ~sparse_flags;
-    if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) !=
-        VK_SUCCESS) {
-      XELOGE("Shared memory: Failed to create the {} MB Vulkan buffer",
-             kBufferSize >> 20);
-      Shutdown();
-      return false;
-    }
-    VkMemoryRequirements buffer_memory_requirements;
-    dfn.vkGetBufferMemoryRequirements(device, buffer_,
-                                      &buffer_memory_requirements);
-    const ui::vulkan::VulkanDevice::MemoryTypes& memory_types =
-        vulkan_device->memory_types();
-    const uint32_t buffer_memory_type_bits =
-        buffer_memory_requirements.memoryTypeBits;
-    // Map for direct CPU readback when a host-visible type is available, so
-    // resolve readback needs no staging copy. Prefer cached-coherent, accept
-    // cached non-coherent; never map uncached (CPU reads are slower than
-    // staging). Test this buffer's own candidate types - a whole-device test
-    // fails on Adreno, whose LAZILY_ALLOCATED type is not host-visible.
-    const bool is_uma =
-        memory_types.device_local &&
-        (memory_types.device_local & memory_types.host_visible) ==
-            memory_types.device_local;
     bool buffer_host_visible = false;
     bool buffer_host_coherent = false;
-    if (cvars::vulkan_shared_memory_host_visible) {
-      const uint32_t cached_coherent = buffer_memory_type_bits &
-                                       memory_types.device_local &
-                                       memory_types.host_visible &
-                                       memory_types.host_cached &
-                                       memory_types.host_coherent;
-      const uint32_t cached = buffer_memory_type_bits &
-                              memory_types.device_local &
-                              memory_types.host_visible &
-                              memory_types.host_cached;
-      if (xe::bit_scan_forward(cached_coherent, &buffer_memory_type_)) {
-        buffer_host_visible = true;
-        buffer_host_coherent = true;
-      } else if (xe::bit_scan_forward(cached, &buffer_memory_type_)) {
-        buffer_host_visible = true;
+    VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
+    for (int bda_attempt = 0; bda_attempt < (device_has_bda ? 2 : 1);
+         ++bda_attempt) {
+      const bool try_bda = device_has_bda && (bda_attempt == 0);
+      buffer_create_info.usage =
+          base_buffer_usage |
+          (try_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
+      if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) !=
+          VK_SUCCESS) {
+        buffer_ = VK_NULL_HANDLE;
+        if (try_bda) {
+          XELOGW(
+              "Shared memory: Dense buffer creation with BDA failed; retrying "
+              "without SHADER_DEVICE_ADDRESS_BIT");
+          continue;
+        }
+        XELOGE("Shared memory: Failed to create the {} MB Vulkan buffer",
+               kBufferSize >> 20);
+        Shutdown();
+        return false;
       }
-    }
-    XELOGI(
-        "Shared memory: host-map decision: cvar={} is_uma={} "
-        "type_bits={:#x} device_local={:#x} host_visible={:#x} "
-        "host_cached={:#x} host_coherent={:#x} -> host_visible={} coherent={}",
-        cvars::vulkan_shared_memory_host_visible, is_uma,
-        buffer_memory_type_bits, memory_types.device_local,
-        memory_types.host_visible, memory_types.host_cached,
-        memory_types.host_coherent, buffer_host_visible, buffer_host_coherent);
+      VkMemoryRequirements buffer_memory_requirements;
+      dfn.vkGetBufferMemoryRequirements(device, buffer_,
+                                        &buffer_memory_requirements);
+      const ui::vulkan::VulkanDevice::MemoryTypes& memory_types =
+          vulkan_device->memory_types();
+      const uint32_t buffer_memory_type_bits =
+          buffer_memory_requirements.memoryTypeBits;
+      // Map for direct CPU readback when a host-visible type is available, so
+      // resolve readback needs no staging copy. Prefer cached-coherent, accept
+      // cached non-coherent; never map uncached (CPU reads are slower than
+      // staging). Test this buffer's own candidate types - a whole-device test
+      // fails on Adreno, whose LAZILY_ALLOCATED type is not host-visible.
+      const bool is_uma =
+          memory_types.device_local &&
+          (memory_types.device_local & memory_types.host_visible) ==
+              memory_types.device_local;
+      buffer_host_visible = false;
+      buffer_host_coherent = false;
+      if (cvars::vulkan_shared_memory_host_visible) {
+        const uint32_t cached_coherent = buffer_memory_type_bits &
+                                         memory_types.device_local &
+                                         memory_types.host_visible &
+                                         memory_types.host_cached &
+                                         memory_types.host_coherent;
+        const uint32_t cached = buffer_memory_type_bits &
+                                memory_types.device_local &
+                                memory_types.host_visible &
+                                memory_types.host_cached;
+        if (xe::bit_scan_forward(cached_coherent, &buffer_memory_type_)) {
+          buffer_host_visible = true;
+          buffer_host_coherent = true;
+        } else if (xe::bit_scan_forward(cached, &buffer_memory_type_)) {
+          buffer_host_visible = true;
+        }
+      }
+      XELOGI(
+          "Shared memory: host-map decision: cvar={} is_uma={} bda={} "
+          "type_bits={:#x} device_local={:#x} host_visible={:#x} "
+          "host_cached={:#x} host_coherent={:#x} -> host_visible={} "
+          "coherent={}",
+          cvars::vulkan_shared_memory_host_visible, is_uma, try_bda,
+          buffer_memory_type_bits, memory_types.device_local,
+          memory_types.host_visible, memory_types.host_cached,
+          memory_types.host_coherent, buffer_host_visible,
+          buffer_host_coherent);
 
-    if (!buffer_host_visible &&
-        !xe::bit_scan_forward(
-            buffer_memory_type_bits & memory_types.device_local,
-            &buffer_memory_type_)) {
-      XELOGE(
-          "Shared memory: Failed to get a device-local Vulkan memory type for "
-          "the buffer");
-      Shutdown();
-      return false;
-    }
-    VkMemoryAllocateInfo buffer_memory_allocate_info;
-    VkMemoryAllocateInfo* buffer_memory_allocate_info_last =
-        &buffer_memory_allocate_info;
-    buffer_memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    buffer_memory_allocate_info.pNext = nullptr;
-    buffer_memory_allocate_info.allocationSize =
-        buffer_memory_requirements.size;
-    buffer_memory_allocate_info.memoryTypeIndex = buffer_memory_type_;
-    VkMemoryDedicatedAllocateInfo buffer_memory_dedicated_allocate_info;
-    if (vulkan_device->extensions().ext_1_1_KHR_dedicated_allocation) {
-      buffer_memory_allocate_info_last->pNext =
-          &buffer_memory_dedicated_allocate_info;
-      buffer_memory_allocate_info_last =
-          reinterpret_cast<VkMemoryAllocateInfo*>(
-              &buffer_memory_dedicated_allocate_info);
-      buffer_memory_dedicated_allocate_info.sType =
-          VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-      buffer_memory_dedicated_allocate_info.pNext = nullptr;
-      buffer_memory_dedicated_allocate_info.image = VK_NULL_HANDLE;
-      buffer_memory_dedicated_allocate_info.buffer = buffer_;
-    }
-    VkDeviceMemory buffer_memory;
-    if (dfn.vkAllocateMemory(device, &buffer_memory_allocate_info, nullptr,
-                             &buffer_memory) != VK_SUCCESS) {
-      XELOGE(
-          "Shared memory: Failed to allocate {} MB of memory for the Vulkan "
-          "buffer",
-          kBufferSize >> 20);
-      Shutdown();
-      return false;
-    }
-    buffer_memory_.push_back(buffer_memory);
-    if (dfn.vkBindBufferMemory(device, buffer_, buffer_memory, 0) !=
-        VK_SUCCESS) {
-      XELOGE("Shared memory: Failed to bind memory to the Vulkan buffer");
-      Shutdown();
-      return false;
+      if (!buffer_host_visible &&
+          !xe::bit_scan_forward(
+              buffer_memory_type_bits & memory_types.device_local,
+              &buffer_memory_type_)) {
+        dfn.vkDestroyBuffer(device, buffer_, nullptr);
+        buffer_ = VK_NULL_HANDLE;
+        if (try_bda) {
+          XELOGW(
+              "Shared memory: No device-local memory type for dense buffer "
+              "with BDA; retrying without SHADER_DEVICE_ADDRESS_BIT");
+          continue;
+        }
+        XELOGE(
+            "Shared memory: Failed to get a device-local Vulkan memory type "
+            "for the buffer");
+        Shutdown();
+        return false;
+      }
+      VkMemoryAllocateInfo buffer_memory_allocate_info;
+      buffer_memory_allocate_info.sType =
+          VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      buffer_memory_allocate_info.pNext = nullptr;
+      buffer_memory_allocate_info.allocationSize =
+          buffer_memory_requirements.size;
+      buffer_memory_allocate_info.memoryTypeIndex = buffer_memory_type_;
+      VkMemoryDedicatedAllocateInfo buffer_memory_dedicated_allocate_info;
+      if (vulkan_device->extensions().ext_1_1_KHR_dedicated_allocation) {
+        buffer_memory_dedicated_allocate_info.sType =
+            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        buffer_memory_dedicated_allocate_info.pNext =
+            buffer_memory_allocate_info.pNext;
+        buffer_memory_dedicated_allocate_info.image = VK_NULL_HANDLE;
+        buffer_memory_dedicated_allocate_info.buffer = buffer_;
+        buffer_memory_allocate_info.pNext =
+            &buffer_memory_dedicated_allocate_info;
+      }
+      VkMemoryAllocateFlagsInfo buffer_memory_allocate_flags_info = {};
+      if (try_bda) {
+        buffer_memory_allocate_flags_info.sType =
+            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+        buffer_memory_allocate_flags_info.pNext =
+            buffer_memory_allocate_info.pNext;
+        buffer_memory_allocate_flags_info.flags =
+            VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        buffer_memory_allocate_flags_info.deviceMask = 0;
+        buffer_memory_allocate_info.pNext = &buffer_memory_allocate_flags_info;
+      }
+      if (dfn.vkAllocateMemory(device, &buffer_memory_allocate_info, nullptr,
+                               &buffer_memory) != VK_SUCCESS) {
+        dfn.vkDestroyBuffer(device, buffer_, nullptr);
+        buffer_ = VK_NULL_HANDLE;
+        buffer_memory = VK_NULL_HANDLE;
+        if (try_bda) {
+          XELOGW(
+              "Shared memory: vkAllocateMemory with DEVICE_ADDRESS_BIT failed; "
+              "retrying without SHADER_DEVICE_ADDRESS_BIT");
+          continue;
+        }
+        XELOGE(
+            "Shared memory: Failed to allocate {} MB of memory for the Vulkan "
+            "buffer",
+            kBufferSize >> 20);
+        Shutdown();
+        return false;
+      }
+      if (dfn.vkBindBufferMemory(device, buffer_, buffer_memory, 0) !=
+          VK_SUCCESS) {
+        dfn.vkFreeMemory(device, buffer_memory, nullptr);
+        dfn.vkDestroyBuffer(device, buffer_, nullptr);
+        buffer_ = VK_NULL_HANDLE;
+        buffer_memory = VK_NULL_HANDLE;
+        if (try_bda) {
+          XELOGW(
+              "Shared memory: vkBindBufferMemory with BDA failed; retrying "
+              "without SHADER_DEVICE_ADDRESS_BIT");
+          continue;
+        }
+        XELOGE("Shared memory: Failed to bind memory to the Vulkan buffer");
+        Shutdown();
+        return false;
+      }
+      buffer_memory_.push_back(buffer_memory);
+      break;
     }
 
     // Persistently map the buffer for direct CPU readback (readback_resolve=uma)
@@ -307,9 +393,15 @@ bool VulkanSharedMemory::Initialize() {
       xe::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize,
                 size_t(1) << page_size_log2()));
 
-  // Second (host-imported) buffer for memexport-touching draws on the
-  // device-local path, so their output stays coherent with the CPU.
-  TryInitializeHostBuffer();
+  if (cvars::memexport_enable && host_buffer_ == VK_NULL_HANDLE) {
+    if (IsHostMapped()) {
+      XELOGI("Shared memory: guest RAM import unavailable - memexport uses "
+             "host-mapped readback");
+    } else {
+      XELOGW("Shared memory: memexport needs guest RAM import or a host-mapped "
+             "buffer");
+    }
+  }
 
   return true;
 }
@@ -376,85 +468,127 @@ bool VulkanSharedMemory::CreateImportedGuestRamBuffer(
   external_memory_buffer_create_info.pNext = nullptr;
   external_memory_buffer_create_info.handleTypes =
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-  VkBufferCreateInfo buffer_create_info;
-  buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  buffer_create_info.pNext = &external_memory_buffer_create_info;
-  buffer_create_info.flags = 0;
-  buffer_create_info.size = kBufferSize;
-  buffer_create_info.usage =
+  const VkBufferUsageFlags base_buffer_usage =
       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-  if (transfer_family != UINT32_MAX) {
-    buffer_create_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
-    buffer_create_info.queueFamilyIndexCount = 2;
-    buffer_create_info.pQueueFamilyIndices = concurrent_queue_families;
-  } else {
-    buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    buffer_create_info.queueFamilyIndexCount = 0;
-    buffer_create_info.pQueueFamilyIndices = nullptr;
+  const bool device_has_bda = vulkan_device->properties().bufferDeviceAddress;
+
+  for (int bda_attempt = 0; bda_attempt < (device_has_bda ? 2 : 1);
+       ++bda_attempt) {
+    const bool try_bda = device_has_bda && (bda_attempt == 0);
+    VkBufferCreateInfo buffer_create_info;
+    buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_create_info.pNext = &external_memory_buffer_create_info;
+    buffer_create_info.flags = 0;
+    buffer_create_info.size = kBufferSize;
+    buffer_create_info.usage =
+        base_buffer_usage |
+        (try_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
+    if (transfer_family != UINT32_MAX) {
+      buffer_create_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+      buffer_create_info.queueFamilyIndexCount = 2;
+      buffer_create_info.pQueueFamilyIndices = concurrent_queue_families;
+    } else {
+      buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      buffer_create_info.queueFamilyIndexCount = 0;
+      buffer_create_info.pQueueFamilyIndices = nullptr;
+    }
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer) !=
+        VK_SUCCESS) {
+      if (try_bda) {
+        XELOGI(
+            "Shared memory host import: buffer creation with BDA rejected; "
+            "retrying without SHADER_DEVICE_ADDRESS_BIT");
+        continue;
+      }
+      XELOGE("Shared memory host import: failed to create the buffer");
+      return false;
+    }
+
+    VkMemoryRequirements buffer_memory_requirements;
+    dfn.vkGetBufferMemoryRequirements(device, buffer,
+                                      &buffer_memory_requirements);
+
+    // The memory type must satisfy the buffer, accept the host pointer, and be
+    // host-visible + host-coherent so guest and GPU observe the same bytes.
+    const uint32_t memory_type_bits =
+        buffer_memory_requirements.memoryTypeBits &
+        host_pointer_properties.memoryTypeBits &
+        vulkan_device->memory_types().host_visible &
+        vulkan_device->memory_types().host_coherent;
+    uint32_t memory_type;
+    if (!xe::bit_scan_forward(memory_type_bits, &memory_type)) {
+      dfn.vkDestroyBuffer(device, buffer, nullptr);
+      if (try_bda) {
+        XELOGI(
+            "Shared memory host import: no coherent host-pointer memory type "
+            "with BDA; retrying without SHADER_DEVICE_ADDRESS_BIT");
+        continue;
+      }
+      XELOGI(
+          "Shared memory host import: no host-visible coherent memory type "
+          "accepts the guest RAM pointer");
+      return false;
+    }
+
+    VkMemoryAllocateFlagsInfo memory_allocate_flags_info = {};
+    memory_allocate_flags_info.sType =
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    memory_allocate_flags_info.pNext = nullptr;
+    memory_allocate_flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    memory_allocate_flags_info.deviceMask = 0;
+
+    VkImportMemoryHostPointerInfoEXT import_info;
+    import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+    import_info.pNext = try_bda ? &memory_allocate_flags_info : nullptr;
+    import_info.handleType =
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    import_info.pHostPointer = guest_ram;
+
+    VkMemoryAllocateInfo memory_allocate_info;
+    memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memory_allocate_info.pNext = &import_info;
+    memory_allocate_info.allocationSize = kBufferSize;
+    memory_allocate_info.memoryTypeIndex = memory_type;
+
+    VkDeviceMemory imported_memory = VK_NULL_HANDLE;
+    if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr,
+                             &imported_memory) != VK_SUCCESS) {
+      dfn.vkDestroyBuffer(device, buffer, nullptr);
+      if (try_bda) {
+        XELOGI(
+            "Shared memory host import: vkAllocateMemory with "
+            "DEVICE_ADDRESS_BIT rejected; retrying without BDA");
+        continue;
+      }
+      XELOGE("Shared memory host import: failed to import {} MB of guest RAM",
+             kBufferSize >> 20);
+      return false;
+    }
+
+    if (dfn.vkBindBufferMemory(device, buffer, imported_memory, 0) !=
+        VK_SUCCESS) {
+      dfn.vkFreeMemory(device, imported_memory, nullptr);
+      dfn.vkDestroyBuffer(device, buffer, nullptr);
+      if (try_bda) {
+        XELOGI(
+            "Shared memory host import: vkBindBufferMemory with BDA rejected; "
+            "retrying without BDA");
+        continue;
+      }
+      XELOGE("Shared memory host import: failed to bind imported memory");
+      return false;
+    }
+
+    out_buffer = buffer;
+    out_memory = imported_memory;
+    // The import pins guest RAM - a later mprotect on the alias would fail the
+    // next submit with EFAULT.
+    memory().SetPhysicalAliasSkipHostProtect(true);
+    return true;
   }
-  VkBuffer buffer;
-  if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer) !=
-      VK_SUCCESS) {
-    XELOGE("Shared memory host import: failed to create the buffer");
-    return false;
-  }
-
-  VkMemoryRequirements buffer_memory_requirements;
-  dfn.vkGetBufferMemoryRequirements(device, buffer,
-                                    &buffer_memory_requirements);
-
-  // The memory type must satisfy the buffer, accept the host pointer, and be
-  // host-visible + host-coherent so guest and GPU observe the same bytes.
-  const uint32_t memory_type_bits = buffer_memory_requirements.memoryTypeBits &
-                                    host_pointer_properties.memoryTypeBits &
-                                    vulkan_device->memory_types().host_visible &
-                                    vulkan_device->memory_types().host_coherent;
-  uint32_t memory_type;
-  if (!xe::bit_scan_forward(memory_type_bits, &memory_type)) {
-    XELOGI(
-        "Shared memory host import: no host-visible coherent memory type "
-        "accepts the guest RAM pointer");
-    dfn.vkDestroyBuffer(device, buffer, nullptr);
-    return false;
-  }
-
-  VkImportMemoryHostPointerInfoEXT import_info;
-  import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
-  import_info.pNext = nullptr;
-  import_info.handleType =
-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-  import_info.pHostPointer = guest_ram;
-
-  VkMemoryAllocateInfo memory_allocate_info;
-  memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  memory_allocate_info.pNext = &import_info;
-  memory_allocate_info.allocationSize = kBufferSize;
-  memory_allocate_info.memoryTypeIndex = memory_type;
-
-  VkDeviceMemory imported_memory;
-  if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr,
-                           &imported_memory) != VK_SUCCESS) {
-    XELOGE("Shared memory host import: failed to import {} MB of guest RAM",
-           kBufferSize >> 20);
-    dfn.vkDestroyBuffer(device, buffer, nullptr);
-    return false;
-  }
-
-  if (dfn.vkBindBufferMemory(device, buffer, imported_memory, 0) !=
-      VK_SUCCESS) {
-    XELOGE("Shared memory host import: failed to bind imported memory");
-    dfn.vkFreeMemory(device, imported_memory, nullptr);
-    dfn.vkDestroyBuffer(device, buffer, nullptr);
-    return false;
-  }
-
-  out_buffer = buffer;
-  out_memory = imported_memory;
-  // The import pins guest RAM - a later mprotect on the alias would fail the
-  // next submit with EFAULT.
-  memory().SetPhysicalAliasSkipHostProtect(true);
-  return true;
+  return false;
 }
 
 bool VulkanSharedMemory::TryInitializeZeroCopy() {
@@ -465,30 +599,28 @@ bool VulkanSharedMemory::TryInitializeZeroCopy() {
   }
   buffer_memory_.push_back(buffer_memory);
   zero_copy_ = true;
+  SetUnwatchSkipVerify(true);
   XELOGI("Shared memory: using zero-copy guest RAM aliasing");
   return true;
 }
 
 void VulkanSharedMemory::TryInitializeHostBuffer() {
-  if (!cvars::memexport_enable) {
+  const ReadbackResolveMode readback_mode = GetReadbackResolveMode();
+  if (!cvars::memexport_enable &&
+      readback_mode != ReadbackResolveMode::kAll &&
+      readback_mode != ReadbackResolveMode::kFast) {
     return;
   }
-  // A second, host-imported (guest RAM) buffer used only for memexport-touching
-  // draws while the main buffer stays fast device-local. Non-sparse, so it can
-  // accept host memory where the sparse buffer can't.
+  // A second, host-imported (guest RAM) buffer used for memexport-touching
+  // draws and non-UMA resolve readbacks while the main buffer stays fast
+  // device-local. Non-sparse, so it can accept host memory where the sparse
+  // buffer can't.
   if (!CreateImportedGuestRamBuffer(host_buffer_, host_buffer_memory_)) {
-    if (IsHostMapped()) {
-      XELOGI("Shared memory: guest RAM import unavailable - memexport uses "
-             "synchronous host-mapped readback");
-    } else {
-      XELOGW("Shared memory: memexport needs guest RAM import or a host-mapped "
-             "buffer (readback_resolve=uma)");
-    }
     host_buffer_ = VK_NULL_HANDLE;
     host_buffer_memory_ = VK_NULL_HANDLE;
     return;
   }
-  XELOGI("Shared memory: host buffer for memexport ranges ready");
+  XELOGI("Shared memory: host buffer for guest RAM import ready");
 }
 
 void VulkanSharedMemory::Shutdown(bool from_destructor) {
@@ -513,6 +645,7 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   }
   buffer_memory_.clear();
   zero_copy_ = false;
+  SetUnwatchSkipVerify(false);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
                                          host_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
@@ -568,6 +701,8 @@ void VulkanSharedMemory::Use(Usage usage,
         buffer_, offset, size, src_stage_mask, dst_stage_mask, src_access_mask,
         dst_access_mask, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         false);
+    // All the draws' accesses so far are ordered by it.
+    draw_exports_.Clear();
     // Memexport-touching draws are routed to the host-imported buffer, so their
     // writes and the reads that consume them go through host_buffer_, not
     // buffer_. Mirror the same ordering barrier onto it so those GPU
@@ -579,7 +714,88 @@ void VulkanSharedMemory::Use(Usage usage,
           VK_QUEUE_FAMILY_IGNORED, false);
     }
   }
+  // Reads with no barrier after them, for an export to wait for.
+  if (usage == Usage::kRead) {
+    draw_exports_.NoteOtherReads();
+  }
   last_written_range_ = written_range;
+}
+
+VulkanSharedMemory::DrawBarrier VulkanSharedMemory::UseForGuestDraw(
+    const std::pair<uint32_t, uint32_t>* reads, size_t read_count,
+    const std::pair<uint32_t, uint32_t>* exports, size_t export_count,
+    uint64_t export_batch) {
+  // The extent of the exports: what the next barrier has to make available.
+  uint32_t export_start = UINT32_MAX, export_end = 0;
+  for (size_t i = 0; i < export_count; ++i) {
+    export_start = std::min(export_start, exports[i].first);
+    export_end = std::max(export_end, exports[i].first + exports[i].second);
+  }
+  const bool exporting = export_start < export_end;
+  const auto add_draw = [&]() {
+    draw_exports_.AddDraw(reads, read_count, exports, export_count,
+                          export_batch);
+    if (exporting) {
+      const bool written = last_written_range_.second != 0;
+      const uint32_t start =
+          written ? std::min(last_written_range_.first, export_start)
+                  : export_start;
+      const uint32_t end =
+          written ? std::max(last_written_range_.first +
+                                 last_written_range_.second,
+                             export_end)
+                  : export_end;
+      last_written_range_ = std::make_pair(start, end - start);
+    }
+  };
+  // As ever from other uses of the buffer, and the first export after them,
+  // which aren't tracked, has to wait for them.
+  if ((last_usage_ != Usage::kRead &&
+       last_usage_ != Usage::kGuestDrawReadWrite) ||
+      (last_usage_ == Usage::kRead && exporting)) {
+    const Usage usage = exporting ? Usage::kGuestDrawReadWrite : Usage::kRead;
+    Use(usage);
+    add_draw();
+    return exporting ? DrawBarrier::kFirstExport : DrawBarrier::kNone;
+  }
+  DrawBarrier result =
+      last_written_range_.second ? DrawBarrier::kElided : DrawBarrier::kNone;
+  VkPipelineStageFlags stage_mask;
+  VkAccessFlags access_mask;
+  GetUsageMasks(Usage::kGuestDrawReadWrite, stage_mask, access_mask);
+  switch (draw_exports_.Check(reads, read_count, exports, export_count,
+                              export_batch)) {
+    case DrawExportTracker::Need::kCommit:
+      if (!exporting) {
+        Use(Usage::kRead);
+        draw_exports_.AddDraw(reads, read_count, exports, export_count,
+                              export_batch);
+        return DrawBarrier::kReadAfterExport;
+      }
+      // Between two draws of the same usage, the masks on both sides are that
+      // usage's. Only the ranges written have to be made visible.
+      command_processor_.PushBufferMemoryBarrier(
+          buffer_, VkDeviceSize(last_written_range_.first),
+          VkDeviceSize(last_written_range_.second), stage_mask, stage_mask,
+          access_mask, access_mask, VK_QUEUE_FAMILY_IGNORED,
+          VK_QUEUE_FAMILY_IGNORED, false);
+      draw_exports_.Clear();
+      last_written_range_ = std::make_pair(uint32_t(0), uint32_t(0));
+      result = DrawBarrier::kExportAfterExport;
+      break;
+    case DrawExportTracker::Need::kWaitForReads:
+      command_processor_.PushBufferMemoryBarrier(
+          buffer_, 0, VK_WHOLE_SIZE, stage_mask, stage_mask,
+          VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT, access_mask,
+          VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+      draw_exports_.ClearReads();
+      result = DrawBarrier::kExportAfterRead;
+      break;
+    default:
+      break;
+  }
+  add_draw();
+  return result;
 }
 
 bool VulkanSharedMemory::CopyToGuestMemory(uint32_t start, uint32_t length) {
@@ -719,15 +935,30 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  VkMemoryAllocateFlagsInfo memory_allocate_flags_info = {};
+  memory_allocate_flags_info.sType =
+      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+  memory_allocate_flags_info.pNext = nullptr;
+  memory_allocate_flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  memory_allocate_flags_info.deviceMask = 0;
+
   VkMemoryAllocateInfo memory_allocate_info;
   memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  memory_allocate_info.pNext = nullptr;
+  memory_allocate_info.pNext = vulkan_device->properties().bufferDeviceAddress
+                                   ? &memory_allocate_flags_info
+                                   : nullptr;
   memory_allocate_info.allocationSize =
       length_allocations << host_gpu_memory_sparse_granularity_log2();
   memory_allocate_info.memoryTypeIndex = buffer_memory_type_;
-  VkDeviceMemory memory;
-  if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) !=
-      VK_SUCCESS) {
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkResult alloc_result =
+      dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory);
+  if (alloc_result != VK_SUCCESS && memory_allocate_info.pNext != nullptr) {
+    memory_allocate_info.pNext = nullptr;
+    alloc_result =
+        dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory);
+  }
+  if (alloc_result != VK_SUCCESS) {
     XELOGE("Shared memory: Failed to allocate sparse buffer memory");
     return false;
   }
@@ -862,17 +1093,19 @@ bool VulkanSharedMemory::UploadRanges(
                      uint32_t(upload_buffer_size), false);
       command_processor_.NoteSharedMemoryUpload(upload_buffer_size);
 
+      uint32_t upload_buffer_pages =
+          uint32_t(upload_buffer_size >> page_size_log2());
+      uint8_t* guest_src =
+          memory().TranslatePhysical(upload_range_start << page_size_log2());
+      SetPageUploadHashes(upload_range_start, upload_buffer_pages, guest_src);
+      std::atomic_thread_fence(std::memory_order_acquire);
+
       if (upload_buffer_size < (1ULL << 32) && upload_buffer_size > 8192) {
-        memory::vastcpy(
-            upload_buffer_mapping,
-            memory().TranslatePhysical(upload_range_start << page_size_log2()),
-            static_cast<uint32_t>(upload_buffer_size));
+        memory::vastcpy(upload_buffer_mapping, guest_src,
+                        static_cast<uint32_t>(upload_buffer_size));
         swcache::WriteFence();
       } else {
-        std::memcpy(
-            upload_buffer_mapping,
-            memory().TranslatePhysical(upload_range_start << page_size_log2()),
-            upload_buffer_size);
+        std::memcpy(upload_buffer_mapping, guest_src, upload_buffer_size);
       }
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
@@ -887,8 +1120,6 @@ bool VulkanSharedMemory::UploadRanges(
       upload_region.dstOffset =
           VkDeviceSize(upload_range_start << page_size_log2());
       upload_region.size = upload_buffer_size;
-      uint32_t upload_buffer_pages =
-          uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
     }

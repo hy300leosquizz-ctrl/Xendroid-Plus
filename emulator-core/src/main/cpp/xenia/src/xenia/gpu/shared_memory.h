@@ -100,7 +100,7 @@ class SharedMemory {
     uint32_t guest_copy = 0;
     GuestCopySource guest_copy_source = GuestCopySource::kNone;
   };
-  void SetHistoryFrame(uint32_t frame) { history_frame_ = frame + 1; }
+  void SetHistoryFrame(uint32_t frame);
   // Diagnostics: the pages CPU writes made invalid since the previous call,
   // and of them the ones invalidated in the same or the previous frame already
   // (counted with shared_memory_page_history only).
@@ -204,6 +204,12 @@ class SharedMemory {
   // Mark the memory range as updated and protect it.
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu,
                       bool read_back = false);
+
+  // Records XXH3 upload hashes for dynamically unwatched pages in
+  // [page_first, page_first + page_count) before copying guest RAM.
+  void SetPageUploadHashes(uint32_t page_first, uint32_t page_count,
+                           const uint8_t* source);
+  void SetUnwatchSkipVerify(bool skip) { unwatch_skip_verify_ = skip; }
 
   // Whether any page in the ranges lost validity since the current GPU
   // submission opened. Pages that were never invalidated while the submission
@@ -312,6 +318,31 @@ class SharedMemory {
   uint64_t* system_page_flags_invalidated_in_submission_ = nullptr;
   // Pages of exports read back (RangeWrittenByGpu read_back).
   uint64_t* system_page_flags_preserve_exempt_ = nullptr;
+  // Pages accessed by GPU commands in the current open submission.
+  std::vector<uint64_t> system_page_flags_used_in_submission_;
+
+  // Dynamic writewatch unwatching for pages rewritten across frames.
+  std::vector<uint64_t> page_upload_hash_;
+  std::vector<uint64_t> page_upload_hash_valid_;
+  std::vector<uint64_t> unwatched_pages_;
+  std::vector<uint64_t> texture_watched_pages_;
+  std::vector<uint64_t> dirty_this_frame_;
+  std::vector<uint64_t> dirty_score_nonzero_;
+  std::vector<uint64_t> unwatch_candidates_;
+  std::vector<uint8_t> dirty_score_;
+  uint32_t unwatched_page_count_ = 0;
+  uint32_t unwatch_decay_counter_ = 0;
+  bool unwatch_skip_verify_ = false;
+
+  void OnFrameEndUnwatch();
+  void EnableWatchesExceptDynamic(uint32_t page_first, uint32_t page_last);
+  void VerifyUnwatchedPages(uint32_t page_first, uint32_t page_last);
+  void RewatchPages(uint32_t block, uint64_t mask);
+  bool UnwatchedPageMatchesUpload(uint32_t page);
+  void MarkRangeUsedInSubmission(uint32_t start, uint32_t length);
+  std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackImpl(
+      uint32_t physical_address_start, uint32_t length, bool exact_range,
+      bool from_unwatch_verify);
 
   // Set when GPU-written flags change, so an unchanged frame skips the copy.
   bool gpu_written_data_dirty_ = false;

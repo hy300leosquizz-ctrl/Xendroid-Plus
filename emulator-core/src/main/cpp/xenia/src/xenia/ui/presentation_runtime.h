@@ -41,6 +41,11 @@ struct PresentationRuntime {
   std::atomic<int> presenter_tid{0};
   std::atomic<int64_t> presenter_work_ns{0};
   std::atomic<uint64_t> presenter_work_sequence{0};
+  // Target work duration in ns pushed by the host when Presenter ADPF is active (0 = off / suspended).
+  std::atomic<int64_t> presenter_adpf_target_ns{0};
+  // Native ADPF state: 0 = inactive/closed, 1 = active per-frame, -1 = unsupported.
+  std::atomic<int> presenter_adpf_state{0};
+  void (*presenter_adpf_sync)(int64_t) = nullptr;
   std::mutex configuration_mutex;
   std::string lsfg_cache;
   std::string gpu_label;
@@ -96,6 +101,97 @@ inline void RecordGenerationGpu(PresentationRuntime& runtime, int64_t ns) {
   const size_t bucket = std::min<size_t>(size_t(ns / kGenerationGpuBucketNs), kGenerationGpuBuckets - 1);
   runtime.generation_gpu_histogram[bucket].fetch_add(1, std::memory_order_relaxed);
 }
+
+struct PresenterAdpfApi {
+  void* context = nullptr;
+  void* (*create_session)(void* context, int32_t tid, int64_t target_ns) = nullptr;
+  void (*update_target)(void* context, void* session, int64_t target_ns) = nullptr;
+  void (*report_actual)(void* context, void* session, int64_t actual_ns) = nullptr;
+  void (*close_session)(void* context, void* session) = nullptr;
+};
+
+// Per-frame presenter ADPF session state machine (#123), free of Android NDK headers
+// so host unit tests exercise session lifecycle, target deduplication, and failure latching.
+class PresenterAdpfTracker {
+ public:
+  int OnFrame(const PresenterAdpfApi& api, int32_t tid, int64_t actual_ns, int64_t target_ns) {
+    if (target_ns <= 0 || tid <= 0) {
+      Close(api);
+      return 0;
+    }
+    if (session_ && tid != tid_) {
+      Close(api);
+      failed_tid_ = 0;
+    } else if (!session_ && failed_tid_ != 0 && failed_tid_ != tid) {
+      failed_tid_ = 0;
+    }
+    if (!session_) {
+      if (failed_tid_ == tid) {
+        return -1;
+      }
+      if (!api.create_session) {
+        failed_tid_ = tid;
+        return -1;
+      }
+      session_ = api.create_session(api.context, tid, target_ns);
+      if (!session_) {
+        failed_tid_ = tid;
+        return -1;
+      }
+      tid_ = tid;
+      last_target_ns_ = target_ns;
+    } else if (target_ns != last_target_ns_) {
+      if (api.update_target) {
+        api.update_target(api.context, session_, target_ns);
+      }
+      last_target_ns_ = target_ns;
+    }
+    if (actual_ns > 0 && api.report_actual) {
+      api.report_actual(api.context, session_, actual_ns);
+    }
+    return 1;
+  }
+
+  void SyncTarget(const PresenterAdpfApi& api, int64_t target_ns) {
+    if (target_ns <= 0) {
+      Close(api);
+      failed_tid_ = 0;
+      return;
+    }
+    if (session_ && target_ns != last_target_ns_) {
+      if (api.update_target) {
+        api.update_target(api.context, session_, target_ns);
+      }
+      last_target_ns_ = target_ns;
+    }
+  }
+
+  void Close(const PresenterAdpfApi& api) {
+    if (session_) {
+      if (api.close_session) {
+        api.close_session(api.context, session_);
+      }
+      session_ = nullptr;
+    }
+    tid_ = 0;
+    last_target_ns_ = 0;
+  }
+
+  int state() const {
+    if (session_) return 1;
+    if (failed_tid_ != 0) return -1;
+    return 0;
+  }
+
+  int32_t tid() const { return tid_; }
+  int64_t last_target_ns() const { return last_target_ns_; }
+
+ private:
+  void* session_ = nullptr;
+  int32_t tid_ = 0;
+  int32_t failed_tid_ = 0;
+  int64_t last_target_ns_ = 0;
+};
 
 struct OutputRectangle { int32_t x, y; uint32_t width, height; };
 inline OutputRectangle CalculateOutputRectangle(DisplayMode mode, uint32_t source_width,

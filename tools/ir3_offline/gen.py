@@ -15,7 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 X = os.path.join(REPO, "emulator-core/src/main/cpp/xenia")
 GEN = os.environ.get("XENIA_GENERATED_DIR") or next(iter(sorted(glob.glob(
-    os.path.join(REPO, "emulator-core/.cxx/Release/*/arm64-v8a/version.h")))),
+    os.path.join(REPO, "emulator-core/.cxx/*/*/arm64-v8a/version.h")))),
     "")
 GEN = os.path.dirname(GEN) if GEN.endswith("version.h") else GEN
 if not GEN or not os.path.isfile(os.path.join(GEN, "version.h")):
@@ -32,6 +32,7 @@ gpu/spirv_shader_translator_fetch.cc gpu/spirv_shader_translator_memexport.cc
 gpu/spirv_shader_translator_rb.cc gpu/spirv_builder.cc gpu/shader.cc
 gpu/shader_translator.cc gpu/shader_translator_disasm.cc gpu/ucode.cc
 gpu/xenos.cc gpu/registers.cc gpu/register_file.cc gpu/spirv_shader.cc
+gpu/spirv_nonfinite_analysis.cc
 base/logging.cc base/string_buffer.cc base/cvar.cc base/string.cc
 base/memory.cc base/memory_posix.cc base/filesystem.cc base/filesystem_posix.cc
 base/threading.cc base/threading_posix.cc base/threading_timer_queue.cc

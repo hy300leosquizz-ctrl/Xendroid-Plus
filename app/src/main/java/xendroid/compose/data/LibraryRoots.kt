@@ -20,6 +20,11 @@ object LibraryRoots {
 
     fun remove(roots: List<String>, path: String): List<String> = roots - path
 
+    /** Replaces [oldPath] in place with [newPath], keeping the install slot and never duplicating. */
+    fun replace(roots: List<String>, oldPath: String, newPath: String): List<String> =
+        if (newPath.isBlank() || oldPath !in roots || oldPath == newPath) roots
+        else roots.map { if (it == oldPath) newPath else it }.distinct()
+
     /** [path] first (it receives full-game installs), the others in their order. */
     fun first(roots: List<String>, path: String): List<String> = if (path !in roots) roots else listOf(path) + (roots - path)
 

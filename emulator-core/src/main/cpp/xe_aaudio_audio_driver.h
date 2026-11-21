@@ -10,22 +10,21 @@
 #define XENDROID_XE_AAUDIO_AUDIO_DRIVER_H
 
 #include <atomic>
-#include <vector>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
-#include <queue>
-#include <stack>
 #include <thread>
+#include <vector>
 
 #include <aaudio/AAudio.h>
 
 #include "xenia/apu/audio_driver.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/threading.h"
 #include "xe_audio_block_renderer.h"
 #include "xe_audio_buffer_tuner.h"
 
 DECLARE_uint32(apu_aaudio_buffer_bursts);
-#include "xenia/base/threading.h"
 
 namespace xe {
 namespace apu {
@@ -43,15 +42,22 @@ class AAudioAudioDriver : public AudioDriver {
   ~AAudioAudioDriver() override;
 
   bool Initialize() override;
-    void Pause() override;
-    void Resume() override;
-    void SetVolume(float volume) override;
+  void Pause() override;
+  void Resume() override;
+  void SetVolume(float volume) override;
   size_t GetQueuedFrameCount() override;
   bool ReportsQueuedFrameCount() const override { return true; }
   void SubmitFrame(float* frame) override;
   void Shutdown() override;
 
  protected:
+  // Power-of-two capacity for the lock-free SPSC guest-block ringbuffer.
+  // AudioSystem bounds in-flight submissions via semaphore_ (apu_max_queued_frames
+  // <= 64), so 128 slots guarantees SubmitFrame and AudioCallback never block
+  // or allocate on the real-time SCHED_FIFO callback thread.
+  static constexpr uint32_t kRingCapacity = 128;
+  static constexpr uint32_t kRingMask = kRingCapacity - 1;
+
   static aaudio_data_callback_result_t AudioCallback(
       AAudioStream* stream,
       void* userdata,
@@ -70,6 +76,10 @@ class AAudioAudioDriver : public AudioDriver {
   bool RestartStream();
   // Performs rebuild requests from the error callback, retrying on failure.
   void RecoveryThreadMain();
+  // Drains queued blocks at real-time pace while no output stream is open
+  // during Bluetooth / USB route transitions so guest audio-paced threads do
+  // not freeze. Caller holds stream_mutex_ with stream_initialized_ == false.
+  void DrainWhileDisconnectedLocked(uint32_t max_blocks);
   // 15j: one second's underruns into the adaptive buffer (apu_aaudio_adaptive_buffer).
   void AdaptBuffer(uint32_t fresh_xruns);
 
@@ -77,6 +87,9 @@ class AAudioAudioDriver : public AudioDriver {
 
   AAudioStreamBuilder* builder_ = nullptr;
   AAudioStream* stream_ = nullptr;
+  // Published with release on BuildStream / cleared before close so late error
+  // callbacks from a disconnecting BT stream cannot tear down its replacement.
+  std::atomic<AAudioStream*> active_stream_{nullptr};
   bool stream_initialized_ = false;
   // Serializes stream lifecycle. The data callback uses its `stream` argument,
   // not stream_, so it never takes this.
@@ -100,9 +113,12 @@ class AAudioAudioDriver : public AudioDriver {
   const uint32_t channel_samples_;
   const uint32_t submit_samples_;
   const uint32_t host_block_samples_;
-  std::queue<float*> frames_queued_ = {};
-  std::stack<float*> frames_unused_ = {};
-  std::mutex frames_mutex_ = {};
+
+  // Pre-allocated contiguous SPSC ringbuffer storage + cacheline-separated
+  // producer/consumer indices (zero mutexes, zero heap allocations in callback).
+  std::vector<float> ring_storage_;
+  alignas(64) std::atomic<uint32_t> ring_write_{0};
+  alignas(64) std::atomic<uint32_t> ring_read_{0};
 
   // Conversion, gain, gap concealment and resampling of the guest blocks
   // (xe_audio_block_renderer.h). Callback thread only.
@@ -117,8 +133,17 @@ class AAudioAudioDriver : public AudioDriver {
   // (a write from Resume's thread could race a callback still running).
   std::atomic<bool> rate_reset_{false};
 
+  // Loudness Guard + post-resume / post-250ms-stall ramp-in state
+  // (ported cleanly from XDroid360 bf84217bb, BSD-3-Clause).
+  std::atomic<bool> fade_request_{false};
+  uint64_t last_callback_ns_ = 0;
+  uint32_t post_stall_ramp_pos_ = 288;
+  float limiter_gain_ = 1.0f;
+  void ApplyLoudnessGuardAndRamp(float* stereo_out, int32_t num_frames,
+                                 uint64_t now_ns);
+
   // The next queued guest block, or nullptr; and one given back once played.
-  // Callback thread only (they take frames_mutex_ for the queues).
+  // Lock-free SPSC operations on ring_write_ / ring_read_.
   const float* NextGuestBlock();
   void ReturnGuestBlock(const float* block);
 
@@ -135,13 +160,12 @@ class AAudioAudioDriver : public AudioDriver {
   // Samples the downmix pushed past full scale.
   std::atomic<uint64_t> stat_clipped_{0};
   std::atomic<uint32_t> stat_rate_milli_{1000};
-  // The callbacks' own time (rendering, the queue's lock), microseconds.
+  // The callbacks' own time (rendering), microseconds.
   std::atomic<uint64_t> stat_callback_us_sum_{0};
   std::atomic<uint32_t> stat_callback_us_max_{0};
   void LogAndResetStats();
   // Adds the stream's new xruns to ae::RunStats(); AAudio counts per stream, so
   // the count seen so far restarts with every rebuild. recovery_thread_ only.
-  // The underruns since the last call, also added to the run's count.
   uint32_t PublishXRuns();
   int32_t xruns_published_ = 0;
   // 15j: the adaptive buffer's depth in bursts, and the frames one burst drains.
@@ -156,4 +180,4 @@ class AAudioAudioDriver : public AudioDriver {
 }  // namespace apu
 }  // namespace xe
 
-#endif //xendroid_XE_AAUDIO_AUDIO_DRIVER_H
+#endif  // XENDROID_XE_AAUDIO_AUDIO_DRIVER_H

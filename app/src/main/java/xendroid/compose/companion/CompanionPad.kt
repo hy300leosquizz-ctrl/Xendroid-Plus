@@ -38,6 +38,8 @@ class CompanionPadLink(
                             onRumble: (Int, Int) -> Unit, onClosed: (String) -> Unit) -> CompanionClient,
     /** The game's rumble for this phone's slot: left motor shl 16 or right motor; 0 stops. */
     private val onRumble: (motors: Long) -> Unit = {},
+    private val newBluetoothClient: ((btMac: String, code: String, name: String,
+                                      onRumble: (Int, Int) -> Unit, onClosed: (String) -> Unit) -> CompanionClient)? = null,
 ) {
     sealed interface State {
         /** Not connected; [why] says why the last attempt or connection ended. */
@@ -64,14 +66,22 @@ class CompanionPadLink(
 
     fun connect(address: String, code: String, name: String) {
         val target = CompanionTarget.parse(address)
-            ?: return idle(Why(Why.Kind.BAD_ADDRESS))
+        val btMac = if (target == null && newBluetoothClient != null) CompanionBluetooth.parseMac(address) else null
+        if (target == null && btMac == null) return idle(Why(Why.Kind.BAD_ADDRESS))
         if (!CompanionTarget.isCode(code)) return idle(Why(Why.Kind.BAD_CODE))
+        val targetLabel = target?.toString() ?: "bt://$btMac"
         val created = synchronized(this) {
             if (client != null) return
             var self: CompanionClient? = null
-            val made = newClient(target, code.trim(), name.trim().ifEmpty { "Phone" },
-                { left, right -> onRumble((left.toLong() shl 16) or right.toLong()) },
-                { reason -> self?.let { ended(it, reason) } })
+            val cleanCode = code.trim()
+            val cleanName = name.trim().ifEmpty { "Phone" }
+            val rumbleCb: (Int, Int) -> Unit = { left, right -> onRumble((left.toLong() shl 16) or right.toLong()) }
+            val closedCb: (String) -> Unit = { reason -> self?.let { ended(it, reason) } }
+            val made = if (target != null) {
+                newClient(target, cleanCode, cleanName, rumbleCb, closedCb)
+            } else {
+                newBluetoothClient!!.invoke(btMac!!, cleanCode, cleanName, rumbleCb, closedCb)
+            }
             self = made
             client = made
             pad = PadState.RELEASED
@@ -85,7 +95,7 @@ class CompanionPadLink(
             synchronized(this) {
                 if (client !== created) return  // the user left while connecting
                 client = null
-                mutableState.value = State.Idle(describe(e, target))
+                mutableState.value = State.Idle(describe(e, targetLabel))
             }
         }
     }
@@ -132,10 +142,10 @@ class CompanionPadLink(
         synchronized(this) { if (client == null) mutableState.value = State.Idle(why) }
     }
 
-    private fun describe(e: Exception, target: CompanionTarget): Why = when (e) {
-        is CompanionRejected -> Why(Why.Kind.REJECTED, target.toString(), code = e.reason)
-        is ConnectException, is SocketTimeoutException, is NoRouteToHostException -> Why(Why.Kind.UNREACHABLE, target.toString())
-        is CompanionProtocolException -> Why(Why.Kind.NOT_XENDROID, target.toString(), detail = e.message.orEmpty())
-        else -> Why(Why.Kind.FAILED, target.toString(), detail = e.message ?: e.javaClass.simpleName)
+    private fun describe(e: Exception, target: String): Why = when (e) {
+        is CompanionRejected -> Why(Why.Kind.REJECTED, target, code = e.reason)
+        is ConnectException, is SocketTimeoutException, is NoRouteToHostException -> Why(Why.Kind.UNREACHABLE, target)
+        is CompanionProtocolException -> Why(Why.Kind.NOT_XENDROID, target, detail = e.message.orEmpty())
+        else -> Why(Why.Kind.FAILED, target, detail = e.message ?: e.javaClass.simpleName)
     }
 }

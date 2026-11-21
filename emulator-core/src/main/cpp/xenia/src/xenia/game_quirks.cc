@@ -2,14 +2,46 @@
 #include "xenia/game_quirks.h"
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <variant>
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/platform.h"
+
+#if XE_PLATFORM_xendroid || XE_PLATFORM_ANDROID
+#include <unistd.h>
+DECLARE_string(vulkan_lib_path);
+#endif
 
 namespace xe {
 namespace game_quirks {
+
+namespace {
+
+bool IsTurnipAdreno750OrNewer() {
+#if XE_PLATFORM_xendroid || XE_PLATFORM_ANDROID
+  if (cvars::vulkan_lib_path.empty() || access("/dev/kgsl-3d0", F_OK) != 0) {
+    return false;
+  }
+  char gpu_model[64] = {};
+  if (FILE* f = std::fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r")) {
+    if (!std::fgets(gpu_model, sizeof(gpu_model), f)) {
+      gpu_model[0] = '\0';
+    }
+    std::fclose(f);
+  }
+  const char* digits = std::strpbrk(gpu_model, "0123456789");
+  return digits && std::atoi(digits) >= 750;
+#else
+  return false;
+#endif
+}
+
+}  // namespace
 
 using QuirkValue = std::variant<bool, int64_t, double, const char*>;
 
@@ -247,6 +279,32 @@ static const Quirk kQuirks[] = {
      "4x depth-only shadow draws into the 1x surface of their samples"},
     {0x4D5308AB, "vulkan_samples_as_pixels_simple_ps", true,
      "4x draws with simple pixel shaders into the 1x surface"},
+    // Software round-toward-zero in vertex shaders (after 2026-10-05) pushed
+    // that same fountain checkpoint (~2520 draws, 65 passes, 6298 tiles a
+    // frame) back to 21.3-21.6 fps, 44.6-45.2 ms of GPU a frame with pass
+    // timestamps (1280x2048 scene pass 29.2-29.9 ms, 1120x2352 shadow pass
+    // 3.3-3.4 ms). Measured on the POCO F7 (Adreno 825, Turnip V38,
+    // 2026-11-18):
+    // - Without software RTZ: 31.3 ms (1280x2048 18.8 ms, 1120x2352 1.33 ms),
+    //   no exploding or z-fighting geometry in the scene.
+    // - Without SM3 zero-multiply emulation in vertex shaders (exact for finite
+    //   operands, so positions still match across passes): 40.8 ms (1280x2048
+    //   25.5 ms).
+    // - 2D fetches with the host's implicit LOD: 43.5 ms.
+    // - Texture loads straight into the image (exact, interleaved A/B):
+    //   45.2 -> 44.5 ms (misc 5.58 -> 4.65 ms).
+    // Together: 28.2 ms of GPU a frame (-37%, 1280x2048 15.3 ms, 1120x2352
+    // 1.01 ms), 29.3-30 fps even with pass timestamps on, the same sky,
+    // horizon, cobblestone ground and fountain. Memexport barriers by range,
+    // structured forward jumps and coarse 4x-as-1x were neutral here.
+    {0x4D5308AB, "alu_round_toward_zero", false,
+     "vertex math with the host's rounding"},
+    {0x4D5308AB, "spirv_vs_relaxed_math", int64_t(1),
+     "no SM3 zero-multiply emulation in vertex shaders"},
+    {0x4D5308AB, "spirv_texture_implicit_lod", true,
+     "2D texture fetches with the host's LOD"},
+    {0x4D5308AB, "vulkan_texture_load_to_image", true,
+     "texture loads straight into the image"},
     // Crysis 3 (CryENGINE 3) moves one 1350-tile depth surface between 1x and
     // 4x MSAA 47 times each way a frame on the deck of its first checkpoint:
     // 156 transfers (45100 tiles) and 211 render passes a frame, GPU-bound at
@@ -392,6 +450,88 @@ static const Quirk kQuirks[] = {
      "the car shadow's depth moments resolve as integers"},
     {0x4D530910, "texture_integer_num_format", true,
      "the car shadow samples its depth moments as integers"},
+    // Halo: Reach, standing in the first mission: 17 fps with none of these, its
+    // limit of 30 fps with them, the sky, the fog and the distant valley matching
+    // (2026-11-04). The steps below are measured with the GPU's timestamps, which
+    // cost a little: 64.4 ms a frame to start with, 35.9 ms with all of them.
+    // Its particles are updated in place by a vertex shader (838B50F94967ACAD)
+    // with memory export, 115 draws of 16 particles each, the others also
+    // exporting or waiting for that:
+    // - Each exporting draw got a barrier, whatever the next draw touched, ending
+    //   the render pass and invalidating the GPU's caches: 53.0 ms, 103 render
+    //   passes instead of 227, by range.
+    // - Each jump of that shader went through a loop and a switch over all its
+    //   labels, up to 43 jumps in 14 iterations: 50.5 ms as if and else.
+    // - Everything that reaches a memory export, there most of it, was rounded
+    //   toward zero in software, which the host can't do in hardware (39184
+    //   instructions, 8.6 ms for those draws, down to 4.9 ms). No exploding or
+    //   z-fighting geometry on foot in the first mission without it: 43.1 ms.
+    // Its half-resolution soft particles (11 draws) kept its depth moving between
+    // 1x and 4x, 24000 tiles a frame, down to 13000 with them in the 1x surface,
+    // shaded once per 2x2 pixels (2.9 ms). The rest are the exact or tested options
+    // of the other titles. NOT spirv_ps_relaxed_math: it darkens the sky and
+    // brightens the valley.
+    {0x4D53085B, "vulkan_memexport_barriers_by_range", true,
+     "barriers only between exports and draws that touch them"},
+    {0x4D53085B, "spirv_structured_forward_jumps", true,
+     "shader jumps as if and else"},
+    {0x4D53085B, "alu_round_toward_zero", false,
+     "vertex math with the host's rounding"},
+    {0x4D53085B, "spirv_vs_relaxed_math", int64_t(1),
+     "no SM3 zero-multiply emulation in vertex shaders"},
+    {0x4D53085B, "spirv_texture_implicit_lod", true,
+     "2D texture fetches with the host's LOD"},
+    {0x4D53085B, "vulkan_fragment_shading_rate", true,
+     "shading 4x draws in the 1x surface once per 2x2 pixels"},
+    {0x4D53085B, "vulkan_depth_4x_as_1x", true,
+     "4x depth-only draws into the 1x surface of their samples"},
+    {0x4D53085B, "vulkan_samples_as_pixels_simple_ps", true,
+     "4x draws with simple pixel shaders into the 1x surface"},
+    {0x4D53085B, "vulkan_samples_as_pixels_coarse", true,
+     "4x draws with textures into the 1x surface, once per 2x2 pixels"},
+    {0x4D53085B, "vulkan_msaa_single_sample_storage", false,
+     "per-sample data in 4x surfaces"},
+    // Fable II: terrain alpha-blended layers rely on exact 20e4 float24 depth
+    // quantization in the pixel shader to avoid transparent/missing ground.
+    {0x4D5307F1, "depth_float24_convert_in_pixel_shader", true,
+     "float24 depth quantization prevents transparent terrain"},
+    // Spider-Man titles: screen-space / post-FX quads outside [0, 1] clip Z
+    // require depth clamping rather than near/far clipping.
+    {0x4156081C, "vulkan_depth_clamp_without_depth", true,
+     "Spider-Man: Web of Shadows screen-space draws outside depth range"},
+    {0x4156081C, "force_depth_clamp", true,
+     "Spider-Man: Web of Shadows depth clamp"},
+    {0x41560878, "vulkan_depth_clamp_without_depth", true,
+     "Spider-Man: Shattered Dimensions screen-space draws outside depth range"},
+    {0x41560878, "force_depth_clamp", true,
+     "Spider-Man: Shattered Dimensions depth clamp"},
+    {0x415608B1, "vulkan_depth_clamp_without_depth", true,
+     "Spider-Man: Edge of Time screen-space draws outside depth range"},
+    {0x415608B1, "force_depth_clamp", true,
+     "Spider-Man: Edge of Time depth clamp"},
+    // Peter Jackson's King Kong: inline APC delivery inside synchronous file
+    // reads deadlocks the audio/streaming worker.
+    {0x555307D3, "file_read_no_apc_inline", true,
+     "prevent inline APC delivery freeze during file reads"},
+    // WWE 2K14: ranged physical allocations must start at the requested low
+    // bound without the 4 KiB offset or match start crashes.
+    {0x545408B2, "ignore_offset_for_ranged_allocations", true,
+     "crash as a match starts"},
+    // Battlefield 2: Modern Combat: reloads evicted EDRAM depth and uploads
+    // from pages marked no-access.
+    {0x454107DB, "depth_float24_convert_in_pixel_shader", true,
+     "black flickering ground polygons"},
+    {0x454107DB, "gpu_allow_invalid_upload_range", true,
+     "black flickering ground polygons"},
+    // Dead or Alive Xtreme 2: CPU reads back pages written by GPU resolves.
+    {0x544307D2, "clear_memory_page_state", true,
+     "garbled character select and intro"},
+    // FIFA 16: stadium shadow mask readback requires fast resolve copy to RAM.
+    {0x454109EE, "readback_resolve", "fast", "half of the pitch black"},
+    // FIFA Street (2012): indoor pitch surfaces render with green/black colors
+    // unless all resolves are copied back to guest RAM (#114).
+    {0x4541097B, "readback_resolve", "all",
+     "indoor pitch surface renders with green/black colors without full readback"},
     // Naruto: Rise of a Ninja: its worker thread 0x18 starts (8265BB68) by
     // calling the routine at +0xEC of its object. When it ran on its
     // creator's CPU right after its creation, the object held the thread's id
@@ -401,11 +541,24 @@ static const Quirk kQuirks[] = {
     // session (POCO F7, 2026-10-29).
     {0x555307E5, "guest_scheduler", false,
      "a new thread calls its routine before its creator stores it"},
+    // Fight Night Champion: Marketplace DLC packages stay locked even with
+    // license_mask = -1 unless the signed-in profile reports SignedInToLive
+    // with an online XUID and Live user flags/privileges (#132).
+    {0x45410915, "live_signin", true,
+     "DLCs require an Xbox Live-signed-in profile"},
 };
 
 // Same path/priority as a per-game config file.
 static bool ApplyOne(const Quirk& quirk) {
   if (!cvar::ConfigVars) {
+    return false;
+  }
+  if (std::strcmp(quirk.cvar, "vulkan_texture_load_to_image") == 0 &&
+      std::holds_alternative<bool>(quirk.value) && std::get<bool>(quirk.value) &&
+      !IsTurnipAdreno750OrNewer()) {
+    XELOGI("Skipping game quirk '{}' for {:08X}: preserving AFBC/UBWC outside "
+           "Turnip Adreno >= 750",
+           quirk.cvar, quirk.title_id);
     return false;
   }
   auto it = cvar::ConfigVars->find(quirk.cvar);

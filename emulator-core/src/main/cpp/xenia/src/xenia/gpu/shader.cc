@@ -96,17 +96,115 @@ Shader::Translation::Dump(const std::filesystem::path& base_path,
   return std::make_pair(std::move(binary_path), std::move(disasm_path));
 }
 
+bool Shader::has_only_forward_jumps() const {
+  int8_t cached = has_only_forward_jumps_.load(std::memory_order_acquire);
+  if (cached >= 0) {
+    return cached != 0;
+  }
+  bool forward_only = !uses_subroutine_calls_;
+  if (forward_only && !label_addresses_.empty()) {
+    struct FlowTransfer {
+      uint32_t index;
+      uint32_t kind;
+      uint32_t address;
+    };
+    std::vector<FlowTransfer> flow_transfers;
+    for (uint32_t i = 0; i < cf_pair_index_bound_ && forward_only; ++i) {
+      ControlFlowInstruction cf_ab[2];
+      UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
+      for (uint32_t j = 0; j < 2; ++j) {
+        const ControlFlowInstruction& cf = cf_ab[j];
+        switch (cf.opcode()) {
+          case ControlFlowOpcode::kCondCall:
+          case ControlFlowOpcode::kReturn:
+            forward_only = false;
+            break;
+          case ControlFlowOpcode::kCondJmp:
+            flow_transfers.push_back({i * 2 + j, 0, cf.cond_jmp.address()});
+            break;
+          case ControlFlowOpcode::kLoopStart:
+            flow_transfers.push_back({i * 2 + j, 1, cf.loop_start.address()});
+            break;
+          case ControlFlowOpcode::kLoopEnd:
+            flow_transfers.push_back({i * 2 + j, 2, cf.loop_end.address()});
+            break;
+          default:
+            break;
+        }
+      }
+    }
+    if (forward_only) {
+      std::vector<std::pair<uint32_t, uint32_t>> loop_stack;
+      std::vector<std::pair<uint32_t, uint32_t>> loop_bodies;
+      for (const FlowTransfer& transfer : flow_transfers) {
+        if (transfer.kind == 0) {
+          if (transfer.address <= transfer.index) {
+            forward_only = false;
+            break;
+          }
+        } else if (transfer.kind == 1) {
+          if (transfer.address <= transfer.index + 1) {
+            forward_only = false;
+            break;
+          }
+          loop_stack.emplace_back(transfer.index, transfer.address);
+        } else {
+          if (loop_stack.empty() ||
+              transfer.address != loop_stack.back().first + 1 ||
+              loop_stack.back().second != transfer.index + 1) {
+            forward_only = false;
+            break;
+          }
+          loop_bodies.emplace_back(loop_stack.back().first, transfer.index);
+          loop_stack.pop_back();
+        }
+      }
+      if (!loop_stack.empty()) {
+        forward_only = false;
+      }
+      for (const FlowTransfer& transfer : flow_transfers) {
+        if (transfer.kind != 0 || !forward_only) {
+          continue;
+        }
+        for (const auto& body : loop_bodies) {
+          bool source_inside =
+              transfer.index > body.first && transfer.index <= body.second;
+          bool target_inside =
+              transfer.address > body.first && transfer.address <= body.second;
+          if (target_inside && !source_inside) {
+            forward_only = false;
+            break;
+          }
+        }
+      }
+    }
+  }
+  has_only_forward_jumps_.store(forward_only ? 1 : 0,
+                                std::memory_order_release);
+  return forward_only;
+}
+
 Shader::Translation* Shader::GetOrCreateTranslation(uint64_t modification,
                                                     bool* is_new) {
+  if (last_translation_ && last_translation_modification_ == modification) {
+    if (is_new) {
+      *is_new = false;
+    }
+    return last_translation_;
+  }
   auto it = translations_.find(modification);
   if (it != translations_.end()) {
     if (is_new) {
       *is_new = false;
     }
+    last_translation_modification_ = modification;
+    last_translation_ = it->second;
     return it->second;
   }
   Translation* translation = CreateTranslationInstance(modification);
   translations_.emplace(modification, translation);
+  last_translation_modification_ = modification;
+  last_translation_ = translation;
   if (is_new) {
     *is_new = true;
   }
@@ -117,6 +215,9 @@ void Shader::DestroyTranslation(uint64_t modification) {
   auto it = translations_.find(modification);
   if (it == translations_.end()) {
     return;
+  }
+  if (last_translation_ == it->second) {
+    last_translation_ = nullptr;
   }
   delete it->second;
   translations_.erase(it);

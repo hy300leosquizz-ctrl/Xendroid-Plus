@@ -4,7 +4,10 @@ import android.view.KeyEvent
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import kotlinx.coroutines.runBlocking
 import org.junit.Test
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import xendroid.compose.data.GameButtons
 
 /** Locks the deterministic transform KeymapStore uses to build its host lookup
@@ -61,5 +64,17 @@ class KeymapMappingTest {
         assertEquals(KeyEvent.KEYCODE_SPACE, out[0])                       // overridden
         assertEquals(KeyEvent.KEYCODE_BUTTON_A, out[4])                    // default-filled
         assertEquals(KeyEvent.KEYCODE_BUTTON_L2, out[14])                  // left trigger -> L2
+    }
+
+    @Test fun keymapDtoRoundTripsThroughSerializer() = runBlocking {
+        val original = KeymapDto(
+            initialized = true,
+            bindings = mapOf(4 to KeyEvent.KEYCODE_BUTTON_B, 5 to KeyEvent.KEYCODE_BUTTON_A, 14 to KeyEvent.KEYCODE_BUTTON_L2),
+            vibrate = true,
+        )
+        val buffer = ByteArrayOutputStream()
+        KeymapSerializer.writeTo(original, buffer)
+        val decoded = KeymapSerializer.readFrom(ByteArrayInputStream(buffer.toByteArray()))
+        assertEquals(original, decoded)
     }
 }

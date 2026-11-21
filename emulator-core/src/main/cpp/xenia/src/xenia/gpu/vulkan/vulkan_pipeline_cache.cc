@@ -140,16 +140,33 @@ DEFINE_string(
     "Diagnostics with vulkan_pipeline_statistics: also save the driver's "
     "internal representations (such as the final GPU assembly) of matching "
     "guest pipelines as text files in shader_ir next to the Vulkan pipeline "
-    "cache. A comma-separated list of pixel shader hashes (hex) and/or "
-    "min_fs=N for every pipeline whose fragment shader has at least N "
-    "instructions. Takes effect for pipelines created afterwards.",
+    "cache. A comma-separated list of pixel shader hashes (hex), vs=HASH for "
+    "vertex shaders and/or min_fs=N for every pipeline whose fragment shader "
+    "has at least N instructions. Takes effect for pipelines created "
+    "afterwards.",
     "Vulkan");
 
+DEFINE_bool(
+    vulkan_shader_object, false,
+    "Use VK_EXT_shader_object for zero-link per-stage shader compilation when "
+    "supported by the Vulkan driver, automatically falling back to graphics "
+    "pipelines for tessellated or geometry-shader draws.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_graphics_pipeline_library, true,
+    "Use VK_EXT_graphics_pipeline_library to fast-link cached vertex input, "
+    "pre-rasterization, fragment shader, and fragment output libraries before "
+    "background link-time optimization (LTO).",
+    "Vulkan");
+
+DECLARE_bool(force_depth_clamp);
 DECLARE_bool(vulkan_dynamic_rendering);
 DECLARE_bool(spirv_disable_rounding_mode_rte);
 DECLARE_bool(precise_interpolation);
 DECLARE_bool(host_alpha_to_coverage);
 DECLARE_bool(alpha_to_coverage_as_alpha_test);
+DECLARE_bool(spirv_texture_iscale_specialization);
 #if XE_PLATFORM_xendroid || XE_PLATFORM_ANDROID
 DECLARE_string(ir3_debug);
 #endif
@@ -159,7 +176,8 @@ namespace gpu {
 namespace vulkan {
 
 namespace {
-bool MatchesPipelineIrDumpFilter(uint64_t ps_hash, int64_t fs_instructions) {
+bool MatchesPipelineIrDumpFilter(uint64_t vs_hash, uint64_t ps_hash,
+                                 int64_t fs_instructions) {
   const std::string& filter = cvars::vulkan_pipeline_ir_dump;
   size_t begin = 0;
   while (begin < filter.size()) {
@@ -174,6 +192,10 @@ bool MatchesPipelineIrDumpFilter(uint64_t ps_hash, int64_t fs_instructions) {
     }
     if (token.rfind("min_fs=", 0) == 0) {
       if (fs_instructions >= std::strtoll(token.c_str() + 7, nullptr, 10)) {
+        return true;
+      }
+    } else if (token.rfind("vs=", 0) == 0) {
+      if (std::strtoull(token.c_str() + 3, nullptr, 16) == vs_hash) {
         return true;
       }
     } else if (std::strtoull(token.c_str(), nullptr, 16) == ps_hash) {
@@ -323,7 +345,7 @@ void LogPipelineStatistics(const ui::vulkan::VulkanDevice& vulkan_device,
            ps_hash, ps_modification, executables[i].name, line);
   }
   if (!ir_dump_directory.empty() &&
-      MatchesPipelineIrDumpFilter(ps_hash, fs_instructions)) {
+      MatchesPipelineIrDumpFilter(vs_hash, ps_hash, fs_instructions)) {
     DumpPipelineInternalRepresentations(vulkan_device, pipeline, executables,
                                         ir_dump_directory, vs_hash, ps_hash,
                                         ps_modification);
@@ -364,6 +386,11 @@ bool VulkanPipelineCache::precise_interpolation_supported() const {
   // The translator gates emission on the device barycentric feature, so the
   // cvar is the only extra control here.
   return cvars::precise_interpolation;
+}
+
+bool VulkanPipelineCache::depth_float24_convert_in_pixel_shader() const {
+  return render_target_cache_.depth_float24_convert_in_pixel_shader() ||
+         cvars::vulkan_fable2_float24_depth;
 }
 
 bool VulkanPipelineCache::Initialize() {
@@ -434,29 +461,46 @@ bool VulkanPipelineCache::Initialize() {
   }
 
   // Substitute fragment shaders for guest depth-only draws when in-PS float24
-  // conversion is active - keep the depth buffer's encoding consistent with
-  // PS-converted draws (matches the DXBC backend's
-  // float24_{truncate,round}_ps).
-  if (render_target_cache_.depth_float24_convert_in_pixel_shader()) {
+  // conversion is active (or when vulkan_fable2_float24_depth is toggled at
+  // runtime) - keep the depth buffer's encoding consistent with PS-converted
+  // draws (matches the DXBC backend's float24_{truncate,round}_ps).
+  if (!edram_fragment_shader_interlock) {
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;
-    auto build = [&](DepthStencilMode mode, VkShaderModule& out) -> bool {
-      std::vector<uint8_t> code =
+    auto build = [&](DepthStencilMode mode, VkShaderModule& out,
+                     std::vector<uint8_t>& code_out) -> bool {
+      code_out =
           guest_shader_cache_.translator().CreateDepthOnlyFragmentShader(mode);
       out = ui::vulkan::util::CreateShaderModule(
-          vulkan_device, reinterpret_cast<const uint32_t*>(code.data()),
-          code.size());
+          vulkan_device, reinterpret_cast<const uint32_t*>(code_out.data()),
+          code_out.size());
       return out != VK_NULL_HANDLE;
     };
     if (!build(DepthStencilMode::kFloat24Truncating,
-               float24_truncate_fragment_shader_) ||
+               float24_truncate_fragment_shader_,
+               float24_truncate_fragment_shader_code_) ||
         !build(DepthStencilMode::kFloat24Rounding,
-               float24_round_fragment_shader_)) {
+               float24_round_fragment_shader_,
+               float24_round_fragment_shader_code_)) {
       XELOGE(
           "VulkanPipelineCache: Failed to create the float24 substitute "
           "depth-only fragment shaders");
       return false;
     }
+  }
+
+  use_graphics_pipeline_library_ =
+      cvars::vulkan_graphics_pipeline_library &&
+      vulkan_device->extensions().ext_EXT_graphics_pipeline_library &&
+      vulkan_device->properties().graphicsPipelineLibrary &&
+      vulkan_device->properties()
+          .graphicsPipelineLibraryIndependentInterpolationDecoration &&
+      !edram_fragment_shader_interlock;
+  if (use_graphics_pipeline_library_) {
+    XELOGI(
+        "VulkanPipelineCache: VK_EXT_graphics_pipeline_library enabled "
+        "(fastLinking={})",
+        vulkan_device->properties().graphicsPipelineLibraryFastLinking ? 1 : 0);
   }
 
   // Create tessellation shaders if tessellation is supported.
@@ -588,11 +632,9 @@ bool VulkanPipelineCache::Initialize() {
 }
 
 void VulkanPipelineCache::Shutdown() {
-  // Shut down shader storage first.
-  ShutdownShaderStorage();
-
-  // Shut down all threads, before destroying the pipelines since they may be
-  // creating them.
+  // Shut down all creation threads FIRST, before shutting down shader storage
+  // or destroying pipelines, since creation threads may enqueue validated
+  // pipeline storage writes upon VK_SUCCESS.
   if (!creation_threads_.empty()) {
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -604,6 +646,8 @@ void VulkanPipelineCache::Shutdown() {
     }
     creation_threads_.clear();
   }
+  // Shut down shader storage after creation threads stop.
+  ShutdownShaderStorage();
   // Clear any pending completion callback (may capture 'this') and reset
   // startup state.
   {
@@ -638,6 +682,36 @@ void VulkanPipelineCache::Shutdown() {
     }
   }
   pipelines_.clear();
+
+  // Destroy cached VK_EXT_graphics_pipeline_library part libraries.
+  {
+    std::lock_guard<std::mutex> lock(gpl_mutex_);
+    auto destroy_lib_map = [&](auto& lib_map) {
+      for (const auto& pair : lib_map) {
+        if (pair.second != VK_NULL_HANDLE) {
+          dfn.vkDestroyPipeline(device, pair.second, nullptr);
+        }
+      }
+      lib_map.clear();
+    };
+    destroy_lib_map(gpl_vertex_input_libs_);
+    destroy_lib_map(gpl_pre_raster_libs_);
+    destroy_lib_map(gpl_fragment_shader_libs_);
+    destroy_lib_map(gpl_fragment_output_libs_);
+  }
+
+  // Destroy cached VK_EXT_shader_object handles.
+  {
+    std::lock_guard<std::mutex> lock(shader_objects_mutex_);
+    if (dfn.vkDestroyShaderEXT) {
+      for (const auto& pair : shader_objects_) {
+        if (pair.second != VK_NULL_HANDLE) {
+          dfn.vkDestroyShaderEXT(device, pair.second, nullptr);
+        }
+      }
+    }
+    shader_objects_.clear();
+  }
 
   // Destroy the pipeline cache.
   if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
@@ -859,6 +933,21 @@ void VulkanPipelineCache::RefreshPipelineLayoutIfStale(
   }
 }
 
+namespace {
+// XenDroid: a discrete or continuous tessellated draw of triangles or quads whose
+// domain shader reads the indices of all the corners of a patch (r1), as opposed
+// to the single patch index of one with patches as its guest primitive type.
+bool IsDomainControlPointIndexed(uint64_t vertex_shader_modification) {
+  const Shader::HostVertexShaderType host_vertex_shader_type =
+      SpirvShaderTranslator::Modification(vertex_shader_modification)
+          .vertex.host_vertex_shader_type;
+  return host_vertex_shader_type ==
+             Shader::HostVertexShaderType::kTriangleDomainCPIndexed ||
+         host_vertex_shader_type ==
+             Shader::HostVertexShaderType::kQuadDomainCPIndexed;
+}
+}  // namespace
+
 bool VulkanPipelineCache::ConfigurePipeline(
     VulkanShader::VulkanTranslation* vertex_shader,
     VulkanShader::VulkanTranslation* pixel_shader,
@@ -913,6 +1002,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
   // counts read as 0 and this yields the minimal (no-texture) layout - it is
   // upgraded to the real layout by the creation thread after translation, or
   // by RefreshPipelineLayoutIfStale on an earlier cache hit.
+  // Translation state is read before the layout as a creation thread may finish
+  // a shader in between. A shader taken as translated then has its bindings in
+  // the layout.
+  const bool vertex_shader_translated = vertex_shader->is_translated();
   bool layout_counts_complete;
   const PipelineLayoutProvider* pipeline_layout =
       GetGuestGraphicsPipelineLayout(vertex_shader, pixel_shader,
@@ -963,12 +1056,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
       }
     }
 
-    pipeline_storage_file_flush_needed_ = true;
-    PipelineStoredDescription stored_description;
-    stored_description.description_hash = description.GetHash();
-    std::memcpy(&stored_description.description, &description,
-                sizeof(description));
-    storage_writer_.QueuePipelineWrite(stored_description);
+    // Defer persisting the pipeline description until EnsurePipelineCreated
+    // confirms vkCreateGraphicsPipelines == VK_SUCCESS, preventing broken
+    // pipeline keys from poisoning .vk.xpso on disk.
+    pipeline_pair.second.storage_write_pending.store(true,
+                                                     std::memory_order_release);
   }
 
   // Get tessellation shaders if needed.
@@ -984,7 +1076,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
     // For adaptive mode, we always use multi-control-point (per-edge factors).
     // For discrete/continuous, the host vertex shader type determines this.
     bool use_control_point_count =
-        (description.tessellation_mode == PipelineTessellationMode::kAdaptive);
+        description.tessellation_mode == PipelineTessellationMode::kAdaptive ||
+        IsDomainControlPointIndexed(description.vertex_shader_modification);
     tessellation_control_shader = GetTessellationControlShader(
         description.tessellation_mode, description.tessellation_patch,
         use_control_point_count);
@@ -1037,7 +1130,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
       // shaders) and is upgraded to the real one on the creation thread.
       pipeline_pair.second.uses_interpreter.store(use_interpreter,
                                                   std::memory_order_release);
-      bool make_placeholder = use_interpreter || vertex_shader->is_translated();
+      bool make_placeholder = use_interpreter || vertex_shader_translated;
       if (make_placeholder) {
         // Set is_placeholder BEFORE creating the pipeline to avoid a race with
         // the creation thread checking this flag.
@@ -1098,7 +1191,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
     } else {
       // Sync mode (no creation threads / async off / no pixel shader):
       // translate on this thread and create the pipeline immediately.
-      if (!vertex_shader->is_translated()) {
+      if (!layout_counts_complete) {
         if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
           return false;
         }
@@ -1145,7 +1238,22 @@ bool VulkanPipelineCache::ConfigurePipeline(
       }
       creation_request_cond_.notify_one();
     } else {
-      // Sync mode or no creation threads: create inline on the GPU thread.
+      // Sync mode or no creation threads: translate both stages and refresh the
+      // pipeline layout before creating inline on the GPU thread.
+      if (!layout_counts_complete) {
+        if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
+          return false;
+        }
+        const PipelineLayoutProvider* real_layout =
+            GetGuestGraphicsPipelineLayout(vertex_shader, pixel_shader);
+        if (!real_layout) {
+          return false;
+        }
+        pipeline_pair.second.pipeline_layout.store(real_layout,
+                                                   std::memory_order_release);
+        pipeline_pair.second.pipeline_layout_stale.store(
+            false, std::memory_order_release);
+      }
       if (!EnsurePipelineCreated(creation_arguments)) {
         pipeline_pair.second.creation_failed.store(true,
                                                    std::memory_order_release);
@@ -1416,6 +1524,317 @@ bool VulkanPipelineCache::ExpeditePipeline(Pipeline* pipeline) {
   return real_pipeline_ready();
 }
 
+bool VulkanPipelineCache::WaitForPipeline(Pipeline* pipeline,
+                                          uint32_t timeout_ms) {
+  auto real_pipeline_ready = [pipeline]() {
+    const VkPipeline current =
+        pipeline->pipeline.load(std::memory_order_acquire);
+    return current != VK_NULL_HANDLE &&
+           current !=
+               pipeline->placeholder_pipeline.load(std::memory_order_acquire);
+  };
+  if (real_pipeline_ready()) {
+    return true;
+  }
+  if (timeout_ms == 0 || creation_threads_.empty() ||
+      pipeline->creation_failed.load(std::memory_order_acquire)) {
+    return real_pipeline_ready();
+  }
+  std::unique_lock<std::mutex> lock(creation_request_lock_);
+  if (!creation_queue_.empty()) {
+    creation_request_cond_.notify_one();
+  }
+  creation_done_cond_.wait_for(
+      lock, std::chrono::milliseconds(timeout_ms), [&]() {
+        return real_pipeline_ready() ||
+               pipeline->creation_failed.load(std::memory_order_acquire) ||
+               (!pipeline->creation_in_flight.load(std::memory_order_relaxed) &&
+                creation_queue_.empty());
+      });
+  return real_pipeline_ready();
+}
+
+bool VulkanPipelineCache::CanUseShaderObjects(
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result)
+    const {
+  if (!cvars::vulkan_shader_object) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  if (!vulkan_device->extensions().ext_EXT_shader_object ||
+      !vulkan_device->properties().shaderObject) {
+    return false;
+  }
+  // VK_EXT_shader_object draws are invalid inside traditional vkCmdBeginRenderPass
+  // (VUID-vkCmdDraw-renderPass-08878) and require dynamic rendering + full
+  // EDS1/EDS3 dynamic state setters in UpdateDynamicState.
+  if (!cvars::vulkan_dynamic_rendering ||
+      !vulkan_device->properties().dynamicRendering) {
+    return false;
+  }
+  if (!dynamic_state_capabilities_.extended_dynamic_state ||
+      !dynamic_state_capabilities_.depth_clamp_enable ||
+      !dynamic_state_capabilities_.polygon_mode ||
+      !dynamic_state_capabilities_.color_blend_enable ||
+      !dynamic_state_capabilities_.color_blend_equation ||
+      !dynamic_state_capabilities_.color_write_mask) {
+    return false;
+  }
+  if (render_target_cache_.GetPath() !=
+      RenderTargetCache::Path::kHostRenderTargets) {
+    return false;
+  }
+  if (primitive_processing_result.IsTessellated()) {
+    return false;
+  }
+  switch (primitive_processing_result.host_primitive_type) {
+    case xenos::PrimitiveType::kLineList:
+    case xenos::PrimitiveType::kLineStrip:
+    case xenos::PrimitiveType::kTriangleList:
+    case xenos::PrimitiveType::kTriangleStrip:
+      return true;
+    case xenos::PrimitiveType::kTriangleFan:
+      return vulkan_device->properties().triangleFans;
+    case xenos::PrimitiveType::kRectangleList:
+      return primitive_processing_result.host_vertex_shader_type ==
+             Shader::HostVertexShaderType::kRectangleListAsTriangleStrip;
+    default:
+      return false;
+  }
+}
+
+VkShaderEXT VulkanPipelineCache::GetOrCreateShaderObject(
+    VkShaderStageFlagBits stage, VkShaderStageFlags next_stage,
+    uint64_t shader_hash, uint64_t modification, const uint8_t* spirv_bytes,
+    size_t spirv_size, const PipelineLayoutProvider* pipeline_layout,
+    const VkSpecializationInfo* specialization_info,
+    uint64_t specialization_key) {
+  if (!spirv_bytes || !spirv_size || !pipeline_layout) {
+    return VK_NULL_HANDLE;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  if (!dfn.vkCreateShadersEXT) {
+    return VK_NULL_HANDLE;
+  }
+  VkDescriptorSetLayout
+      set_layouts[SpirvShaderTranslator::kDescriptorSetCount] = {};
+  uint32_t set_layout_count =
+      pipeline_layout->GetDescriptorSetLayouts(set_layouts);
+  if (!set_layout_count) {
+    return VK_NULL_HANDLE;
+  }
+
+  XXH3_state_t hash_state;
+  XXH3_64bits_reset(&hash_state);
+  XXH3_64bits_update(&hash_state, &stage, sizeof(stage));
+  XXH3_64bits_update(&hash_state, &next_stage, sizeof(next_stage));
+  XXH3_64bits_update(&hash_state, &shader_hash, sizeof(shader_hash));
+  XXH3_64bits_update(&hash_state, &modification, sizeof(modification));
+  XXH3_64bits_update(&hash_state, &specialization_key,
+                     sizeof(specialization_key));
+  XXH3_64bits_update(&hash_state, set_layouts,
+                     sizeof(VkDescriptorSetLayout) * set_layout_count);
+  const uint64_t cache_key = XXH3_64bits_digest(&hash_state);
+
+  {
+    std::lock_guard<std::mutex> lock(shader_objects_mutex_);
+    auto it = shader_objects_.find(cache_key);
+    if (it != shader_objects_.end()) {
+      return it->second;
+    }
+  }
+
+  VkShaderCreateInfoEXT create_info = {};
+  create_info.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT;
+  create_info.flags = 0;
+  create_info.stage = stage;
+  create_info.nextStage = next_stage;
+  create_info.codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT;
+  create_info.codeSize = spirv_size;
+  create_info.pCode = spirv_bytes;
+  create_info.pName = "main";
+  create_info.setLayoutCount = set_layout_count;
+  create_info.pSetLayouts = set_layouts;
+  create_info.pushConstantRangeCount = 0;
+  create_info.pPushConstantRanges = nullptr;
+  create_info.pSpecializationInfo = specialization_info;
+
+  VkShaderEXT shader_obj = VK_NULL_HANDLE;
+  VkResult res = dfn.vkCreateShadersEXT(vulkan_device->device(), 1,
+                                        &create_info, nullptr, &shader_obj);
+  if (res != VK_SUCCESS || shader_obj == VK_NULL_HANDLE) {
+    XELOGW(
+        "VulkanPipelineCache: vkCreateShadersEXT failed for stage {} hash "
+        "{:016X} (result={})",
+        static_cast<uint32_t>(stage), shader_hash, static_cast<int>(res));
+    shader_obj = VK_NULL_HANDLE;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(shader_objects_mutex_);
+    auto [it, inserted] = shader_objects_.emplace(cache_key, shader_obj);
+    if (!inserted && shader_obj != VK_NULL_HANDLE && dfn.vkDestroyShaderEXT) {
+      dfn.vkDestroyShaderEXT(vulkan_device->device(), shader_obj, nullptr);
+      return it->second;
+    }
+  }
+  return shader_obj;
+}
+
+bool VulkanPipelineCache::ConfigureShaderObjects(
+    VulkanShader::VulkanTranslation* vertex_shader,
+    VulkanShader::VulkanTranslation* pixel_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask,
+    VulkanRenderTargetCache::RenderPassKey render_pass_key,
+    ShaderObjectDrawConfig& config_out) {
+  if (!CanUseShaderObjects(primitive_processing_result)) {
+    return false;
+  }
+  if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
+    return false;
+  }
+
+  PipelineDescription description;
+  if (!GetCurrentStateDescription(
+          vertex_shader, pixel_shader, primitive_processing_result,
+          normalized_depth_control, normalized_color_mask, render_pass_key,
+          description)) {
+    return false;
+  }
+  if (!ArePipelineRequirementsMet(description)) {
+    return false;
+  }
+  if (description.geometry_shader != PipelineGeometryShader::kNone ||
+      description.tessellation_mode != PipelineTessellationMode::kNone) {
+    return false;
+  }
+
+  bool layout_complete = false;
+  const PipelineLayoutProvider* pipeline_layout =
+      GetGuestGraphicsPipelineLayout(vertex_shader, pixel_shader,
+                                     &layout_complete);
+  if (!pipeline_layout || !layout_complete) {
+    return false;
+  }
+
+  FillDynamicState(description, config_out.dynamic_state);
+  config_out.pipeline_layout = pipeline_layout;
+
+  VkShaderEXT vs_obj = GetOrCreateShaderObject(
+      VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT,
+      description.vertex_shader_hash, description.vertex_shader_modification,
+      vertex_shader->translated_binary().data(),
+      vertex_shader->translated_binary().size(), pipeline_layout, nullptr, 0);
+  if (vs_obj == VK_NULL_HANDLE) {
+    return false;
+  }
+
+  VkShaderEXT fs_obj = VK_NULL_HANDLE;
+  if (pixel_shader) {
+    VkSpecializationMapEntry map_entries
+        [SpirvShaderTranslator::kTextureSignClassFetchConstantCount + 2];
+    uint32_t spec_values
+        [SpirvShaderTranslator::kTextureSignClassFetchConstantCount + 2];
+    uint32_t spec_count = 0;
+    for (uint32_t i = 0;
+         i < SpirvShaderTranslator::kTextureSignClassFetchConstantCount; ++i) {
+      uint32_t sign_class = (description.texture_sign_classes >> (2 * i)) & 3;
+      if (!sign_class) {
+        continue;
+      }
+      VkSpecializationMapEntry& entry = map_entries[spec_count];
+      entry.constantID =
+          SpirvShaderTranslator::kSpecIdTextureSignClassFirst + i;
+      entry.offset = sizeof(uint32_t) * spec_count;
+      entry.size = sizeof(uint32_t);
+      spec_values[spec_count++] = sign_class;
+    }
+    if (description.texture_exp_adjust_zero) {
+      VkSpecializationMapEntry& entry = map_entries[spec_count];
+      entry.constantID = SpirvShaderTranslator::kSpecIdTextureExpAdjustZero;
+      entry.offset = sizeof(uint32_t) * spec_count;
+      entry.size = sizeof(VkBool32);
+      spec_values[spec_count++] = VK_TRUE;
+    }
+    if (cvars::spirv_texture_iscale_specialization &&
+        description.texture_integer_scale_used != UINT32_MAX) {
+      VkSpecializationMapEntry& entry = map_entries[spec_count];
+      entry.constantID = SpirvShaderTranslator::kSpecIdTextureIntegerScaleUsed;
+      entry.offset = sizeof(uint32_t) * spec_count;
+      entry.size = sizeof(uint32_t);
+      spec_values[spec_count++] = description.texture_integer_scale_used;
+    }
+    VkSpecializationInfo spec_info = {};
+    const VkSpecializationInfo* spec_info_ptr = nullptr;
+    if (spec_count) {
+      spec_info.mapEntryCount = spec_count;
+      spec_info.pMapEntries = map_entries;
+      spec_info.dataSize = sizeof(uint32_t) * spec_count;
+      spec_info.pData = spec_values;
+      spec_info_ptr = &spec_info;
+    }
+    uint64_t spec_key =
+        uint64_t(description.texture_sign_classes) |
+        (uint64_t(description.texture_exp_adjust_zero) << 16) |
+        (uint64_t(description.texture_integer_scale_used) << 17);
+    fs_obj = GetOrCreateShaderObject(
+        VK_SHADER_STAGE_FRAGMENT_BIT, 0, description.pixel_shader_hash,
+        description.pixel_shader_modification,
+        pixel_shader->translated_binary().data(),
+        pixel_shader->translated_binary().size(), pipeline_layout,
+        spec_info_ptr, spec_key);
+    if (fs_obj == VK_NULL_HANDLE) {
+      return false;
+    }
+  } else if (depth_float24_convert_in_pixel_shader() &&
+             (description.depth_write_enable ||
+              description.depth_compare_op != xenos::CompareFunction::kAlways) &&
+             (description.render_pass_key.depth_and_color_used & 0b1) &&
+             description.render_pass_key.depth_format ==
+                 xenos::DepthRenderTargetFormat::kD24FS8) {
+    const bool round_f24 = render_target_cache_.depth_float24_round();
+    const std::vector<uint8_t>& f24_code =
+        round_f24 ? float24_round_fragment_shader_code_
+                  : float24_truncate_fragment_shader_code_;
+    fs_obj = GetOrCreateShaderObject(
+        VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+        round_f24 ? UINT64_C(0xF240000000000002) : UINT64_C(0xF240000000000001),
+        0, f24_code.data(), f24_code.size(), pipeline_layout, nullptr, 0);
+    if (fs_obj == VK_NULL_HANDLE) {
+      return false;
+    }
+  }
+
+  config_out.vertex_shader = vs_obj;
+  config_out.fragment_shader = fs_obj;
+
+  const xenos::MsaaSamples host_msaa_samples =
+      description.render_pass_key.GetHostMsaaSamples();
+  if (host_msaa_samples == xenos::MsaaSamples::k2X &&
+      !render_target_cache_.IsMsaa2xSupported(
+          description.render_pass_key.depth_and_color_used != 0)) {
+    config_out.rasterization_samples = VK_SAMPLE_COUNT_4_BIT;
+    config_out.sample_mask = 0b1001;
+  } else {
+    config_out.rasterization_samples =
+        VkSampleCountFlagBits(uint32_t(1) << uint32_t(host_msaa_samples));
+    config_out.sample_mask = UINT32_MAX;
+  }
+  config_out.alpha_to_coverage_enable =
+      (description.alpha_to_coverage && cvars::host_alpha_to_coverage)
+          ? VK_TRUE
+          : VK_FALSE;
+  config_out.depth_bias_enable =
+      (description.render_pass_key.depth_and_color_used & 0b1) ? VK_TRUE
+                                                               : VK_FALSE;
+  return true;
+}
+
 bool VulkanPipelineCache::TranslateAnalyzedShader(
     SpirvShaderTranslator& translator,
     VulkanShader::VulkanTranslation& translation, bool use_try_claim) {
@@ -1431,9 +1850,7 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(
     if (use_try_claim) {
       should_translate = translation.TryClaimTranslation();
       if (!should_translate) {
-        while (!translation.is_translated()) {
-          xe::threading::MaybeYield();
-        }
+        translation.WaitForTranslation();
       }
     }
     if (should_translate) {
@@ -1745,6 +2162,9 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     description_out.pixel_shader_modification = pixel_shader->modification();
     description_out.texture_sign_classes = texture_sign_classes_ & 0xFFFF;
     description_out.texture_exp_adjust_zero = texture_exp_adjust_zero_ ? 1 : 0;
+    description_out.texture_integer_scale_used =
+        cvars::spirv_texture_iscale_specialization ? texture_integer_scale_used_
+                                                   : 0u;
   }
   // Same normalization as the framebuffer key: the loadOp discard bits do not
   // affect pipeline compatibility under dynamic rendering, and letting them
@@ -1848,7 +2268,8 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
 
   description_out.depth_clamp_enable =
       device_properties.depthClamp &&
-      (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ||
+      (cvars::force_depth_clamp ||
+       regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ||
        (cvars::vulkan_depth_clamp_without_depth &&
         !normalized_depth_control.z_enable &&
         !normalized_depth_control.stencil_enable));
@@ -2138,16 +2559,23 @@ void VulkanPipelineCache::FillDynamicState(
                                  : VK_FRONT_FACE_COUNTER_CLOCKWISE;
   dynamic_state.depth_clamp_enable =
       description.depth_clamp_enable ? VK_TRUE : VK_FALSE;
-  switch (description.polygon_mode) {
-    case PipelinePolygonMode::kLine:
-      dynamic_state.polygon_mode = VK_POLYGON_MODE_LINE;
-      break;
-    case PipelinePolygonMode::kPoint:
-      dynamic_state.polygon_mode = VK_POLYGON_MODE_POINT;
-      break;
-    default:
-      dynamic_state.polygon_mode = VK_POLYGON_MODE_FILL;
-      break;
+  if (!command_processor_.GetVulkanDevice()->properties().fillModeNonSolid) {
+    dynamic_state.polygon_mode = VK_POLYGON_MODE_FILL;
+  } else {
+    switch (description.polygon_mode) {
+      case PipelinePolygonMode::kLine:
+        dynamic_state.polygon_mode = VK_POLYGON_MODE_LINE;
+        break;
+      case PipelinePolygonMode::kPoint:
+        dynamic_state.polygon_mode =
+            command_processor_.GetVulkanDevice()->properties().pointPolygons
+                ? VK_POLYGON_MODE_POINT
+                : VK_POLYGON_MODE_LINE;
+        break;
+      default:
+        dynamic_state.polygon_mode = VK_POLYGON_MODE_FILL;
+        break;
+    }
   }
 
   // Depth / stencil. Mirror the static path's implicit depth-test-enable
@@ -2272,16 +2700,6 @@ bool VulkanPipelineCache::ArePipelineRequirementsMet(
   }
 
   if (!device_properties.depthClamp && description.depth_clamp_enable) {
-    return false;
-  }
-
-  if (!device_properties.pointPolygons &&
-      description.polygon_mode == PipelinePolygonMode::kPoint) {
-    return false;
-  }
-
-  if (!device_properties.fillModeNonSolid &&
-      description.polygon_mode != PipelinePolygonMode::kFill) {
     return false;
   }
 
@@ -2432,11 +2850,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   bool creating_placeholder = fragment_shader_override != VK_NULL_HANDLE;
 
   if (existing_pipeline != VK_NULL_HANDLE) {
-    if (!is_placeholder || creating_placeholder) {
-      // Already have a real pipeline, or trying to create another placeholder.
+    if ((!is_placeholder && !creation_arguments.lto_link_only) ||
+        creating_placeholder) {
+      // Already have a real pipeline (and not running the background LTO pass),
+      // or trying to create another placeholder.
       return true;
     }
-    // Have a placeholder, and we're creating the real pipeline to replace it.
+    // Have a placeholder or a fast-linked GPL pipeline, and we're creating the
+    // real / LTO pipeline to replace it.
   }
 
   // This function preferably should validate the description to prevent
@@ -2584,9 +3005,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   // (spirv_texture_exp_adjust_specialization) - entries for constants a shader
   // doesn't have are ignored.
   VkSpecializationMapEntry texture_sign_class_map_entries
-      [SpirvShaderTranslator::kTextureSignClassFetchConstantCount + 1];
+      [SpirvShaderTranslator::kTextureSignClassFetchConstantCount + 2];
   uint32_t texture_sign_class_values
-      [SpirvShaderTranslator::kTextureSignClassFetchConstantCount + 1];
+      [SpirvShaderTranslator::kTextureSignClassFetchConstantCount + 2];
   VkSpecializationInfo texture_sign_class_specialization_info;
   if (fragment_shader_override != VK_NULL_HANDLE) {
     // Use the override shader (for placeholder pipelines).
@@ -2624,6 +3045,17 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       map_entry.size = sizeof(VkBool32);
       texture_sign_class_values[texture_sign_class_count++] = VK_TRUE;
     }
+    if (cvars::spirv_texture_iscale_specialization &&
+        description.texture_integer_scale_used != UINT32_MAX) {
+      VkSpecializationMapEntry& map_entry =
+          texture_sign_class_map_entries[texture_sign_class_count];
+      map_entry.constantID =
+          SpirvShaderTranslator::kSpecIdTextureIntegerScaleUsed;
+      map_entry.offset = sizeof(uint32_t) * texture_sign_class_count;
+      map_entry.size = sizeof(uint32_t);
+      texture_sign_class_values[texture_sign_class_count++] =
+          description.texture_integer_scale_used;
+    }
     if (texture_sign_class_count) {
       texture_sign_class_specialization_info.mapEntryCount =
           texture_sign_class_count;
@@ -2638,7 +3070,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   } else {
     if (edram_fragment_shader_interlock) {
       shader_stage_fragment.module = depth_only_fragment_shader_;
-    } else if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+    } else if (depth_float24_convert_in_pixel_shader() &&
                (description.depth_write_enable ||
                 description.depth_compare_op !=
                     xenos::CompareFunction::kAlways) &&
@@ -2755,19 +3187,25 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
   rasterization_state.depthClampEnable =
       description.depth_clamp_enable ? VK_TRUE : VK_FALSE;
-  switch (description.polygon_mode) {
-    case PipelinePolygonMode::kFill:
-      rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
-      break;
-    case PipelinePolygonMode::kLine:
-      rasterization_state.polygonMode = VK_POLYGON_MODE_LINE;
-      break;
-    case PipelinePolygonMode::kPoint:
-      rasterization_state.polygonMode = VK_POLYGON_MODE_POINT;
-      break;
-    default:
-      assert_unhandled_case(description.polygon_mode);
-      return false;
+  if (!vulkan_device->properties().fillModeNonSolid) {
+    rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
+  } else {
+    switch (description.polygon_mode) {
+      case PipelinePolygonMode::kFill:
+        rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
+        break;
+      case PipelinePolygonMode::kLine:
+        rasterization_state.polygonMode = VK_POLYGON_MODE_LINE;
+        break;
+      case PipelinePolygonMode::kPoint:
+        rasterization_state.polygonMode =
+            vulkan_device->properties().pointPolygons ? VK_POLYGON_MODE_POINT
+                                                      : VK_POLYGON_MODE_LINE;
+        break;
+      default:
+        assert_unhandled_case(description.polygon_mode);
+        return false;
+    }
   }
   rasterization_state.cullMode = VK_CULL_MODE_NONE;
   if (description.cull_front) {
@@ -3052,9 +3490,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     // Determine patch control point count based on mode and patch type.
     // For adaptive mode, we use the actual patch corner count (3 for triangles,
     // 4 for quads) since each control point has its own edge factor.
-    // For discrete/continuous modes, we use 1 control point (the Xenos vertex
-    // shader receives the patch index and computes all corners internally).
-    if (description.tessellation_mode == PipelineTessellationMode::kAdaptive) {
+    // For discrete/continuous modes, we use 1 control point if the Xenos vertex
+    // shader receives the patch index and computes all corners internally, and
+    // the corners if it receives their indices. Halo: Reach's faces, drawn with
+    // the latter with 1 control point, each index being a patch, were invisible.
+    if (description.tessellation_mode == PipelineTessellationMode::kAdaptive ||
+        IsDomainControlPointIndexed(description.vertex_shader_modification)) {
       tessellation_state.patchControlPoints =
           (description.tessellation_patch ==
            PipelineTessellationPatchType::kTriangle)
@@ -3152,11 +3593,212 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   if (profile) {
     pso_create_start = std::chrono::steady_clock::now();
   }
-  VkPipeline pipeline;
-  // A driver cache hit may come without the internal representations.
-  VkResult result = dfn.vkCreateGraphicsPipelines(
-      device, capture_ir ? VK_NULL_HANDLE : vk_pipeline_cache_, 1,
-      &pipeline_create_info, nullptr, &pipeline);
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+  bool gpl_fast_linked = false;
+  if (use_graphics_pipeline_library_ && !creating_placeholder &&
+      !capture_statistics && !capture_ir && !is_tessellated &&
+      creation_arguments.geometry_shader == VK_NULL_HANDLE) {
+    // Clean-room VK_EXT_graphics_pipeline_library 4-part decomposition:
+    // 1. Vertex Input Interface
+    // 2. Pre-Rasterization Shaders (VS)
+    // 3. Fragment Shader (FS / optional depth-only FS)
+    // 4. Fragment Output Interface (Color blend + MSAA + attachments)
+    const bool retain_lto = !creation_threads_.empty();
+    const VkPipelineCreateFlags lib_flags =
+        VK_PIPELINE_CREATE_LIBRARY_BIT_KHR |
+        (retain_lto
+             ? VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT
+             : 0);
+
+    auto get_or_build_lib =
+        [&](std::unordered_map<uint64_t, VkPipeline,
+                               xe::hash::IdentityHasher<uint64_t>>& lib_map,
+            uint64_t key,
+            VkGraphicsPipelineLibraryFlagsEXT part_flag,
+            VkGraphicsPipelineCreateInfo& part_ci) -> VkPipeline {
+      {
+        std::lock_guard<std::mutex> lock(gpl_mutex_);
+        auto it = lib_map.find(key);
+        if (it != lib_map.end()) {
+          return it->second;
+        }
+      }
+      VkGraphicsPipelineLibraryCreateInfoEXT gpl_info = {};
+      gpl_info.sType =
+          VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT;
+      gpl_info.pNext = part_ci.pNext;
+      gpl_info.flags = part_flag;
+      part_ci.pNext = &gpl_info;
+      part_ci.flags = lib_flags;
+      VkPipeline lib_handle = VK_NULL_HANDLE;
+      if (dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1, &part_ci,
+                                        nullptr, &lib_handle) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+      }
+      {
+        std::lock_guard<std::mutex> lock(gpl_mutex_);
+        auto [it, inserted] = lib_map.emplace(key, lib_handle);
+        if (!inserted) {
+          dfn.vkDestroyPipeline(device, lib_handle, nullptr);
+          return it->second;
+        }
+      }
+      return lib_handle;
+    };
+
+    const uint64_t vi_key =
+        (uint64_t(input_assembly_state.topology) << 1) |
+        uint64_t(input_assembly_state.primitiveRestartEnable ? 1 : 0);
+    VkGraphicsPipelineCreateInfo vi_ci = {};
+    vi_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    vi_ci.pVertexInputState = &vertex_input_state;
+    vi_ci.pInputAssemblyState = &input_assembly_state;
+    vi_ci.pDynamicState = &dynamic_state;
+    vi_ci.basePipelineIndex = -1;
+    VkPipeline vi_lib = get_or_build_lib(
+        gpl_vertex_input_libs_, vi_key,
+        VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, vi_ci);
+
+    XXH3_state_t hstate;
+    XXH3_64bits_reset(&hstate);
+    XXH3_64bits_update(&hstate, &description.vertex_shader_hash,
+                       sizeof(description.vertex_shader_hash));
+    XXH3_64bits_update(&hstate, &description.vertex_shader_modification,
+                       sizeof(description.vertex_shader_modification));
+    XXH3_64bits_update(&hstate, &pipeline_create_info.layout,
+                       sizeof(pipeline_create_info.layout));
+    XXH3_64bits_update(&hstate, &rasterization_state,
+                       sizeof(rasterization_state));
+    XXH3_64bits_update(&hstate, &description.render_pass_key,
+                       sizeof(description.render_pass_key));
+    const uint64_t pr_key = XXH3_64bits_digest(&hstate);
+    VkGraphicsPipelineCreateInfo pr_ci = {};
+    pr_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pr_ci.pNext =
+        use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
+    pr_ci.stageCount = 1;
+    pr_ci.pStages = &shader_stages[0];
+    pr_ci.pViewportState = &viewport_state;
+    pr_ci.pRasterizationState = &rasterization_state;
+    pr_ci.pDynamicState = &dynamic_state;
+    pr_ci.layout = pipeline_create_info.layout;
+    pr_ci.renderPass = pipeline_create_info.renderPass;
+    pr_ci.subpass = 0;
+    pr_ci.basePipelineIndex = -1;
+    VkPipeline pr_lib =
+        vi_lib != VK_NULL_HANDLE
+            ? get_or_build_lib(
+                  gpl_pre_raster_libs_, pr_key,
+                  VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
+                  pr_ci)
+            : VK_NULL_HANDLE;
+
+    const bool has_fs = shader_stage_count > 1;
+    XXH3_64bits_reset(&hstate);
+    XXH3_64bits_update(&hstate, &description.pixel_shader_hash,
+                       sizeof(description.pixel_shader_hash));
+    XXH3_64bits_update(&hstate, &description.pixel_shader_modification,
+                       sizeof(description.pixel_shader_modification));
+    uint64_t fs_spec_bits =
+        uint64_t(description.texture_sign_classes & 0xFFFFu) |
+        (uint64_t(description.texture_exp_adjust_zero ? 1u : 0u) << 16) |
+        (uint64_t(description.texture_integer_scale_used) << 17) |
+        (has_fs ? (UINT64_C(1) << 49) : 0ull);
+    XXH3_64bits_update(&hstate, &fs_spec_bits, sizeof(fs_spec_bits));
+    XXH3_64bits_update(&hstate, &pipeline_create_info.layout,
+                       sizeof(pipeline_create_info.layout));
+    XXH3_64bits_update(&hstate, &depth_stencil_state,
+                       sizeof(depth_stencil_state));
+    XXH3_64bits_update(&hstate, &multisample_state.rasterizationSamples,
+                       sizeof(multisample_state.rasterizationSamples));
+    XXH3_64bits_update(&hstate, &multisample_state.alphaToCoverageEnable,
+                       sizeof(multisample_state.alphaToCoverageEnable));
+    XXH3_64bits_update(&hstate, &sample_mask, sizeof(sample_mask));
+    XXH3_64bits_update(&hstate, &description.render_pass_key,
+                       sizeof(description.render_pass_key));
+    const uint64_t fs_key = XXH3_64bits_digest(&hstate);
+    VkGraphicsPipelineCreateInfo fs_ci = {};
+    fs_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    fs_ci.pNext =
+        use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
+    fs_ci.stageCount = has_fs ? 1 : 0;
+    fs_ci.pStages = has_fs ? &shader_stages[1] : nullptr;
+    fs_ci.pMultisampleState = &multisample_state;
+    fs_ci.pDepthStencilState = &depth_stencil_state;
+    fs_ci.pDynamicState = &dynamic_state;
+    fs_ci.layout = pipeline_create_info.layout;
+    fs_ci.renderPass = pipeline_create_info.renderPass;
+    fs_ci.subpass = 0;
+    fs_ci.basePipelineIndex = -1;
+    VkPipeline fs_lib =
+        pr_lib != VK_NULL_HANDLE
+            ? get_or_build_lib(
+                  gpl_fragment_shader_libs_, fs_key,
+                  VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, fs_ci)
+            : VK_NULL_HANDLE;
+
+    XXH3_64bits_reset(&hstate);
+    XXH3_64bits_update(&hstate, &description.render_pass_key,
+                       sizeof(description.render_pass_key));
+    XXH3_64bits_update(&hstate, &color_blend_state.attachmentCount,
+                       sizeof(color_blend_state.attachmentCount));
+    XXH3_64bits_update(&hstate, color_blend_attachments,
+                       sizeof(VkPipelineColorBlendAttachmentState) *
+                           color_blend_state.attachmentCount);
+    XXH3_64bits_update(&hstate, &multisample_state.rasterizationSamples,
+                       sizeof(multisample_state.rasterizationSamples));
+    XXH3_64bits_update(&hstate, &multisample_state.alphaToCoverageEnable,
+                       sizeof(multisample_state.alphaToCoverageEnable));
+    XXH3_64bits_update(&hstate, &sample_mask, sizeof(sample_mask));
+    const uint64_t fo_key = XXH3_64bits_digest(&hstate);
+    VkGraphicsPipelineCreateInfo fo_ci = {};
+    fo_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    fo_ci.pNext =
+        use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
+    fo_ci.pMultisampleState = &multisample_state;
+    fo_ci.pColorBlendState = &color_blend_state;
+    fo_ci.pDynamicState = &dynamic_state;
+    fo_ci.renderPass = pipeline_create_info.renderPass;
+    fo_ci.subpass = 0;
+    fo_ci.basePipelineIndex = -1;
+    VkPipeline fo_lib =
+        fs_lib != VK_NULL_HANDLE
+            ? get_or_build_lib(
+                  gpl_fragment_output_libs_, fo_key,
+                  VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
+                  fo_ci)
+            : VK_NULL_HANDLE;
+
+    if (vi_lib != VK_NULL_HANDLE && pr_lib != VK_NULL_HANDLE &&
+        fs_lib != VK_NULL_HANDLE && fo_lib != VK_NULL_HANDLE) {
+      VkPipeline libs[4] = {vi_lib, pr_lib, fs_lib, fo_lib};
+      VkPipelineLibraryCreateInfoKHR link_info = {};
+      link_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
+      link_info.libraryCount = 4;
+      link_info.pLibraries = libs;
+
+      VkGraphicsPipelineCreateInfo link_ci = {};
+      link_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+      link_ci.pNext = &link_info;
+      link_ci.flags = creation_arguments.lto_link_only
+                          ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT
+                          : 0;
+      link_ci.layout = pipeline_create_info.layout;
+      link_ci.basePipelineIndex = -1;
+      result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
+                                             &link_ci, nullptr, &pipeline);
+      if (result == VK_SUCCESS && !creation_arguments.lto_link_only) {
+        gpl_fast_linked = true;
+      }
+    }
+  }
+  if (result != VK_SUCCESS) {
+    // Monolithic compile (or automatic fallback if GPL libraries/link failed).
+    result = dfn.vkCreateGraphicsPipelines(
+        device, capture_ir ? VK_NULL_HANDLE : vk_pipeline_cache_, 1,
+        &pipeline_create_info, nullptr, &pipeline);
+  }
   if (result == VK_SUCCESS) {
     // Mark the persistent VkPipelineCache dirty so EndSubmission re-saves it.
     vk_pipeline_cache_dirty_.store(true, std::memory_order_relaxed);
@@ -3240,11 +3882,44 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   if (!creating_placeholder) {
     creation_arguments.pipeline->second.is_placeholder.store(
         false, std::memory_order_release);
-    XELOGI("Pipeline created for VS {:016X}, PS {:016X}",
-           creation_arguments.vertex_shader->shader().ucode_data_hash(),
-           creation_arguments.pixel_shader
-               ? creation_arguments.pixel_shader->shader().ucode_data_hash()
-               : 0);
+    // Persist the pipeline description ONLY after vkCreateGraphicsPipelines
+    // returned VK_SUCCESS (poisoning guard).
+    if (creation_arguments.pipeline->second.storage_write_pending.exchange(
+            false, std::memory_order_acq_rel) &&
+        storage_writer_.is_active()) {
+      PipelineStoredDescription stored_description;
+      stored_description.description_hash = description.GetHash();
+      std::memcpy(&stored_description.description, &description,
+                  sizeof(description));
+      storage_writer_.QueuePipelineWrite(stored_description);
+      pipeline_storage_file_flush_needed_.store(true,
+                                                std::memory_order_release);
+    }
+    // If we published a fast-linked GPL pipeline, schedule a low-priority
+    // background LTO link pass to hot-swap an optimized handle once idle.
+    if (gpl_fast_linked && !creation_threads_.empty() &&
+        !creation_threads_shutdown_.load(std::memory_order_relaxed) &&
+        !creation_arguments.pipeline->second.lto_queued.exchange(
+            true, std::memory_order_acq_rel)) {
+      PipelineCreationArguments lto_args = creation_arguments;
+      lto_args.priority = 0;
+      lto_args.lto_link_only = true;
+      {
+        std::lock_guard<std::mutex> lock(creation_request_lock_);
+        if (!creation_threads_shutdown_) {
+          creation_queue_.push(lto_args);
+        }
+      }
+      creation_request_cond_.notify_one();
+    }
+    if (!creation_arguments.lto_link_only) {
+      XELOGI("Pipeline created for VS {:016X}, PS {:016X}{}",
+             creation_arguments.vertex_shader->shader().ucode_data_hash(),
+             creation_arguments.pixel_shader
+                 ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+                 : 0,
+             gpl_fast_linked ? " (GPL fast-link)" : "");
+    }
   }
 
   return true;
@@ -3553,8 +4228,10 @@ void VulkanPipelineCache::InitializeShaderStorage(
         tessellation_vertex_shader =
             GetTessellationVertexShader(pipeline_description.tessellation_mode);
         bool use_control_point_count =
-            (pipeline_description.tessellation_mode ==
-             PipelineTessellationMode::kAdaptive);
+            pipeline_description.tessellation_mode ==
+                PipelineTessellationMode::kAdaptive ||
+            IsDomainControlPointIndexed(
+                pipeline_description.vertex_shader_modification);
         tessellation_control_shader = GetTessellationControlShader(
             pipeline_description.tessellation_mode,
             pipeline_description.tessellation_patch, use_control_point_count);

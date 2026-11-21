@@ -397,6 +397,8 @@ private fun Pads(devices: InputDevicesNow, rumble: PadRumbleState, default: Rumb
                 } else XdNote(stringResource(R.string.ct_no_motor))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     XdButton(stringResource(R.string.xd_pad_test), links.onTest, size = XdButtonSize.SM, icon = XdIcons.gamepad)
+                    XdButton(stringResource(R.string.xd_pad_keymap), links.onKeymap,
+                        kind = XdButtonKind.SECONDARY, size = XdButtonSize.SM, icon = XdIcons.keyboard)
                     if (pad.canVibrate) XdButton(stringResource(R.string.ct_vibrate), { InputDevices.vibrate(pad.id, effective) },
                         kind = XdButtonKind.GHOST, size = XdButtonSize.SM, icon = XdIcons.vibrate, enabled = effective != RumbleIntensity.OFF)
                 }

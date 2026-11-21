@@ -20,6 +20,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/gpu/shader_translator.h"
 #include "xenia/gpu/spirv_builder.h"
+#include "xenia/gpu/structured_jumps.h"
 #include "xenia/gpu/xenos.h"
 
 namespace xe {
@@ -35,13 +36,16 @@ namespace gpu {
 
 class SpirvShaderTranslator : public ShaderTranslator {
  public:
+  // Invocations per workgroup of the kMemExportCompute shader.
+  static constexpr uint32_t kMemExportComputeGroupSize = 64;
+
   union Modification {
     // If anything in this structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number! Backends add it to their dated
     // PipelineDescription::kVersion, so bumping either one is enough. Only
     // ever raise it, a reverted layout change needs another bump.
-    static constexpr uint32_t kVersion = 18;
+    static constexpr uint32_t kVersion = 19;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -136,6 +140,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // scaling. Doesn't affect fetch offsets, those follow texture scale, not
       // from the draw. This is only set when the draw is native because of a
       // set scale threshold (FBO only).
+      // XenDroid: without resolution scaling, which the threshold needs, it
+      // instead means the samples of a 4x draw are pixels here, so PsParamGen
+      // halves the position (no bits are left in this structure).
       uint32_t resolution_scale_native : 1;
     } pixel;
     uint64_t value = 0;
@@ -145,6 +152,25 @@ class SpirvShaderTranslator : public ShaderTranslator {
       static_assert_size(*this, sizeof(value));
     }
   };
+
+  // Whether a 4x-as-2x2 samples-as-pixels pixel shader may execute at 2x2
+  // coarse fragment shading rate (where coarse derivatives already span one
+  // guest pixel and need no 2x scaling). Must agree 1:1 with the command
+  // processor's 2x2 VRS decision.
+  static bool IsSamplesAsPixelsCoarseAllowed(Modification modification,
+                                             bool shader_writes_depth,
+                                             bool shader_kills_or_exports,
+                                             bool shader_fable2_float24_depth) {
+    if (!modification.pixel.resolution_scale_native || shader_writes_depth ||
+        shader_kills_or_exports || shader_fable2_float24_depth ||
+        modification.pixel.dynamic_addressable_register_count >= 126) {
+      return false;
+    }
+    return modification.pixel.depth_stencil_mode ==
+               Modification::DepthStencilMode::kEarlyHint ||
+           modification.pixel.depth_stencil_mode ==
+               Modification::DepthStencilMode::kNoAlphaTests;
+  }
 
   enum : uint32_t {
     kSysFlag_VertexIndexLoad_Shift,
@@ -348,15 +374,21 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t interpreter_cf_instr_count;
     uint32_t texture_integer_scale_pad[2];
 
-    // Integer num_format on fixed textures. Each dword packs the scale needed
-    // to turn normalized host samples back into guest integer values.
-    // bits 0:3 = component_bits - 1
-    // bit 4 = signed
-    // bit 5 = unsigned-biased
-    // Zero means no scale.
+    // Packed fixed texture conversion (see GetIntegerScaleBits).
+    // Every component occupies 6 bits in bits 0:23:
+    //   bits 0:3 = component_bits - 1
+    //   bits 4:5 = xenos::TextureSign
+    // bit 24 = normalized num_format
+    // bit 26 = point sampled fetch constant
+    // Zero means no conversion.
     // Appended at the very tail (std140 uint4 [35]) so it disturbs neither the
     // xenos_draw.glsli tessellation offsets nor the interpreter [34] slot.
     uint32_t texture_integer_scale_bits[32];
+
+    // Optional VK_KHR_buffer_device_address base pointer (lo, hi) for 512 MB
+    // guest shared memory when vulkan_shared_memory_bda is active.
+    uint32_t shared_memory_device_address[2];
+    uint32_t shared_memory_bda_pad[2];
   };
 
   // xenos_draw.glsli reads these tessellation fields from the system constants
@@ -378,6 +410,43 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     kConstantBufferCount,
   };
+
+  // Batched memory export compute (kMemExportCompute with the
+  // user_clip_plane_cull modification bit, which has no other meaning there
+  // since compute has no clip planes): consecutive memory-export-only draws of
+  // one vertex shader run as one dispatch, workgroup Y = draw.
+  static constexpr uint32_t kMemExportBatchMaxBytes = 65536;
+  static constexpr uint32_t kMemExportBatchMaxDraws = 64;
+  static constexpr uint32_t kMemExportBatchStrideSystem =
+      uint32_t((sizeof(SystemConstants) + 15) & ~size_t(15));
+  static constexpr uint32_t kMemExportBatchStrideBoolLoop =
+      sizeof(uint32_t) * 4 * (2 + 8);
+  static constexpr uint32_t MemExportBatchStrideFetch(bool decoded) {
+    return sizeof(uint32_t) * 4 * (32 * 6 / 4 + (decoded ? 32 * 2 : 0));
+  }
+  static constexpr uint32_t MemExportBatchStrideFloat(
+      uint32_t float_constant_count) {
+    return sizeof(float) * 4 *
+           (float_constant_count ? float_constant_count : UINT32_C(1));
+  }
+  static uint32_t MemExportBatchSize(uint32_t float_constant_count,
+                                     bool fetch_decoded = false) {
+    uint32_t stride = kMemExportBatchStrideSystem;
+    if (kMemExportBatchStrideBoolLoop > stride) {
+      stride = kMemExportBatchStrideBoolLoop;
+    }
+    uint32_t fetch_stride = MemExportBatchStrideFetch(fetch_decoded);
+    if (fetch_stride > stride) {
+      stride = fetch_stride;
+    }
+    uint32_t float_stride = MemExportBatchStrideFloat(float_constant_count);
+    if (float_stride > stride) {
+      stride = float_stride;
+    }
+    uint32_t max_by_bytes = kMemExportBatchMaxBytes / stride;
+    return max_by_bytes < kMemExportBatchMaxDraws ? max_by_bytes
+                                                  : kMemExportBatchMaxDraws;
+  }
 
   // The minimum limit for maxPerStageDescriptorStorageBuffers is 4, and for
   // maxStorageBufferRange it's 128 MB. These are the values of those limits on
@@ -464,6 +533,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool fragment_shader_barycentric;
 
     bool allow_float_contraction = false;
+    // Mali Valhall (< r47) SPIR-V 1.3 version cap & scalar-condition vector
+    // OpSelect rewrite (Arm errata SDEN-3735689).
+    bool mali_cap_spirv_13 = false;
+    bool rewrite_scalar_select = false;
+    // VK_KHR_buffer_device_address support for optional BDA shared memory.
+    bool buffer_device_address = false;
+    // VK_KHR_fragment_shading_rate pipelineFragmentShadingRate for 2x2 coarse
+    // shading on 4x-as-2x2 samples-as-pixels draws.
+    bool samples_as_pixels_coarse = false;
   };
 
   SpirvShaderTranslator(const Features& features,
@@ -583,6 +661,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // the host compiler drops the multiplication of every fetched component by
   // 2^0.
   static constexpr uint32_t kSpecIdTextureExpAdjustZero = 1010;
+  // spirv_texture_iscale_specialization: 32-bit mask of fetch constants whose
+  // texture_integer_scale_bits is non-zero for the pipeline. Default UINT32_MAX
+  // when unspecialized so standalone SPIR-V preserves full runtime behavior;
+  // specialized to 0 on draws without fixed-integer/point-snap textures so the
+  // host compiler folds away the entire integer-scale UBO load and branches.
+  static constexpr uint32_t kSpecIdTextureIntegerScaleUsed = 1021;
   enum TextureSignClass : uint32_t {
     kTextureSignClassRuntime,
     // All components unsigned.
@@ -660,6 +744,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void PostTranslation() override;
 
   void ProcessLabel(uint32_t cf_index) override;
+  // Forward-only control flow: each label starts a one-pass do-while(false)
+  // segment, entered when no pending jump targets a later label.
+  void OpenForwardSegment(uint32_t cf_index);
+  void CloseForwardSegment();
 
   void ProcessExecInstructionBegin(const ParsedExecInstruction& instr) override;
   void ProcessExecInstructionEnd(const ParsedExecInstruction& instr) override;
@@ -720,6 +808,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
     return is_vertex_shader() &&
            GetSpirvShaderModification().vertex.host_vertex_shader_type ==
                Shader::HostVertexShaderType::kMemExportCompute;
+  }
+  bool IsSpirvMemExportBatched() const {
+    return IsSpirvComputeShader() &&
+           GetSpirvShaderModification().vertex.user_clip_plane_cull;
   }
   bool IsSpirvRectListAsTriangleStrip() const {
     return IsSpirvVertexShader() &&
@@ -786,8 +878,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // float24 from the rasterizer's own depth (not guest oDepth), each sample
   // needs its own depth value for intersections to be antialiased.
   bool IsSampleRate() const {
-    return is_pixel_shader() && DSV_IsWritingFloat24Depth() &&
-           !current_shader().writes_depth();
+    return is_pixel_shader() && !IsDrawSamplesAsPixels() &&
+           DSV_IsWritingFloat24Depth() && !current_shader().writes_depth();
   }
 
   uint32_t GetModificationInterpolatorMask() const {
@@ -806,6 +898,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void EnsureBuildPointAvailable();
 
   void StartVertexOrTessEvalShaderBeforeMain();
+  // gl_VertexIndex, or gl_GlobalInvocationID.x for kMemExportCompute, as uint.
+  spv::Id LoadHostVertexIndexUint();
   void StartVertexOrTessEvalShaderInMain();
   void CompleteVertexOrTessEvalShaderInMain();
   void ResetUcodeInvocationStateInMain();
@@ -837,12 +931,23 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Closes conditionals opened by exec and instructions within them (but not by
   // labels) and updates the state accordingly.
   void CloseExecConditionals();
+  // spirv_structured_forward_jumps: which forward jumps become if / if-else
+  // and which labels leave the main switch.
+  void AnalyzeStructuredJumps();
+  spv::Id LoadBoolConstantCondition(uint32_t bool_constant_index);
+  void OpenStructuredJumpRegion(const ParsedJumpInstruction& instr,
+                                uint32_t else_end);
+  void CloseStructuredJumpRegions(uint32_t cf_index);
 
   spv::Id GetStorageAddressingIndex(
       InstructionStorageAddressingMode addressing_mode, uint32_t storage_index,
       bool is_float_constant = false);
   // Loads unswizzled operand without sign modifiers as float4.
   spv::Id LoadOperandStorage(const InstructionOperand& operand);
+  // Scalarized GPR load/store with intra-basic-block SSA forwarding when
+  // vulkan_shader_register_ssa is active.
+  spv::Id LoadRegisterVariable(uint32_t reg_index);
+  void StoreRegisterVariable(uint32_t reg_index, spv::Id value_float4);
   spv::Id ApplyOperandModifiers(spv::Id operand_value,
                                 const InstructionOperand& original_operand,
                                 bool invert_negate = false,
@@ -909,6 +1014,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id AluAdd(spv::Id a, spv::Id b);
   spv::Id AluSubtract(spv::Id a, spv::Id b);
   spv::Id AluMultiply(spv::Id a, spv::Id b);
+  spv::Id AluAddMasked(spv::Id a, spv::Id b, uint32_t used_components,
+                       uint32_t rtz_components);
+  spv::Id AluSubtractMasked(spv::Id a, spv::Id b, uint32_t used_components,
+                            uint32_t rtz_components);
+  spv::Id AluMultiplyMasked(spv::Id a, spv::Id b, uint32_t used_components,
+                            uint32_t rtz_components);
   // Steps a sum or product of a and b rounded to nearest toward zero if its
   // exact error shows it rounded away, and saturates overflow.
   spv::Id RoundTowardZero(spv::Id rounded, spv::Id error, spv::Id a, spv::Id b);
@@ -1059,6 +1170,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   // Scale of the draw being translated. All position-dependent paths use
   // these. Only fetch offset scaling uses draw_resolution_scale_x_/y_ directly.
+  bool IsDrawSamplesAsPixels() const {
+    return is_pixel_shader() && draw_resolution_scale_x_ == 1 &&
+           draw_resolution_scale_y_ == 1 &&
+           GetSpirvShaderModification().pixel.resolution_scale_native;
+  }
+  bool IsDrawSamplesAsPixelsCoarse() const;
+  spv::Id ScaleDerivativeToGuestPixels(spv::Id type, spv::Id derivative);
   uint32_t GetCurrentDrawResolutionScaleX() const {
     return is_pixel_shader() &&
                    GetSpirvShaderModification().pixel.resolution_scale_native
@@ -1100,6 +1218,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // spirv_texture_exp_adjust_specialization, created on first use.
   spv::Id texture_exp_adjust_zero_spec_constant_;
   spv::Id GetTextureExpAdjustZeroSpecConstant();
+  // spirv_texture_iscale_specialization, created on first use.
+  spv::Id texture_integer_scale_used_spec_constant_;
+  spv::Id GetTextureIntegerScaleUsedSpecConstant();
   // A texture fetch's fetch constant word whose access chain indices are in
   // id_vector_temp_, or 0 with kMathRelaxationTextureFetchConstants.
   spv::Id LoadTextureFetchConstantWordFromTemp();
@@ -1232,6 +1353,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantInterpreterUcodeBaseDwords,
     kSystemConstantInterpreterCfInstrCount,
     kSystemConstantTextureIntegerScaleBits,
+    kSystemConstantSharedMemoryDeviceAddress,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
@@ -1241,6 +1363,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id buffers_shared_memory_;
   spv::Id buffer_edram_;
   spv::Id buffer_zpd_fsi_counter_;
+  bool use_shared_memory_bda_ = false;
+  spv::Id type_bda_uint_struct_ = spv::NoResult;
+  spv::Id type_bda_uint_ptr_ = spv::NoResult;
+  spv::Id type_uadd_carry_ = spv::NoResult;
 
   // Not using combined images and samplers because
   // maxPerStageDescriptorSamplers is often lower than
@@ -1251,6 +1377,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   // VS as VS only - int.
   spv::Id input_vertex_index_;
+  // kMemExportCompute: gl_GlobalInvocationID replacing gl_VertexIndex.
+  spv::Id input_global_invocation_id_ = spv::NoResult;
+  // Batched memory export compute: gl_WorkGroupID, whose Y is the draw.
+  spv::Id input_workgroup_id_ = spv::NoResult;
+  // Output for real vertex shaders, Private for the memory export compute
+  // shader, which has no stage outputs.
+  spv::StorageClass vs_output_storage_class_ = spv::StorageClass::Output;
   // VS as TES only - per-control-point float array carrying the patch/control
   // point index computed by the host vertex and hull shaders.
   spv::Id input_control_point_index_;
@@ -1369,8 +1502,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // uint4[32] coefficients for ScalarEstimate, created on first use.
   std::array<spv::Id, size_t(ScalarEstimateOp::kLog) + 1>
       var_main_estimate_coefficients_;
-  // float4[register_count()].
+  // float4[register_count()] when dynamic register addressing is used, or
+  // scalarized xe_var_r0..r63 when register_ssa_enabled_ is true.
   spv::Id var_main_registers_;
+  bool register_ssa_enabled_ = false;
+  std::array<spv::Id, 64> var_main_register_vars_{};
+  spv::Id ssa_reg_block_id_ = spv::NoResult;
+  std::array<spv::Id, 64> ssa_reg_values_{};
   // Memory export variables are created only when needed.
   // float4.
   spv::Id var_main_memexport_address_;
@@ -1439,7 +1577,36 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Block* main_switch_header_;
   std::unique_ptr<spv::Instruction> main_switch_op_;
   spv::Block* main_switch_merge_;
+  // Forward jump segments (instead of the main switch, for shaders whose jumps
+  // all go forward). The int variable holds the label a taken jump goes to
+  // (0 when none, INT32_MAX after exece); a segment runs if it is <= its label.
+  bool main_forward_segments_ = false;
+  spv::Id var_main_forward_target_ = spv::NoResult;
+  spv::Block* main_segment_loop_header_ = nullptr;
+  spv::Block* main_segment_continue_ = nullptr;
+  spv::Block* main_segment_merge_ = nullptr;
+  spv::Block* main_segment_guard_merge_ = nullptr;
+  struct ForwardGuestLoop {
+    uint32_t skip_address;
+    spv::Block* header;
+    spv::Block* continue_target;
+    spv::Block* merge;
+    spv::Block* guard_merge;
+  };
+  std::vector<ForwardGuestLoop> main_forward_guest_loops_;
   std::vector<spv::Id> main_switch_next_pc_phi_operands_;
+
+  // spirv_structured_forward_jumps.
+  StructuredJumps structured_jumps_;
+  struct StructuredJumpRegion {
+    // The label ending the branch being built.
+    uint32_t end;
+    // The else branch if it's still to be built.
+    spv::Block* else_block;
+    uint32_t else_end;
+    spv::Block* merge;
+  };
+  std::vector<StructuredJumpRegion> structured_jump_regions_;
 
   // If the exec bool constant / predicate conditional is open, block after it
   // (not added to the function yet).
@@ -1466,8 +1633,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool cf_exec_predicate_written_;
 
   // Whether the result of the ALU operation being translated is
-  // rounding-sensitive (see Shader::IsAluVectorResultRoundingSensitive).
+  // rounding-sensitive (see Shader::IsAluVectorResultRoundingSensitive) and,
+  // for vector ALU ops, the 4-bit mask of sensitive result components.
   bool alu_op_result_rounding_sensitive_ = false;
+  uint32_t alu_vector_rounding_sensitive_components_ = 0;
+  // Static fixpoint +-Inf/NaN taint per guest ALU instruction address
+  // (spirv_nonfinite_safe_fmul), and 2-bit taint of the active vector/scalar op.
+  std::vector<uint8_t> mul_taint_;
+  uint8_t current_alu_mul_taint_ = 0x03;
 };
 
 }  // namespace gpu

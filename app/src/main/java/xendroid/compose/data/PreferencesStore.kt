@@ -78,6 +78,14 @@ class PreferencesStore(private val appContext: Context) {
         }
     }
 
+    /** Replaces [oldPath] in place with [newPath]; neither folder's files are touched. */
+    suspend fun replaceGameDirPath(oldPath: String, newPath: String) {
+        appContext.dataStore.edit { prefs ->
+            val roots = LibraryRoots.decode(prefs[gameDirPathsKey], prefs[gameDirPathKey])
+            prefs[gameDirPathsKey] = LibraryRoots.encode(LibraryRoots.replace(roots, oldPath, newPath))
+        }
+    }
+
     /** Stops scanning a folder; its files are never touched. */
     suspend fun removeGameDirPath(path: String) {
         appContext.dataStore.edit { prefs ->

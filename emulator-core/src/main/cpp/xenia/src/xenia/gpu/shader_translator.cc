@@ -621,21 +621,25 @@ void Shader::GatherAluResultInformation(const InstructionResult& result,
 
 namespace {
 
-// Temporary register components, 4 bits per register, and the previous scalar
-// result whose values may reach a rounding-sensitive use.
+// Temporary register components, 4 bits per register, the previous scalar
+// result, and the address register (a0) whose values may reach a
+// rounding-sensitive use.
 struct RoundingSensitiveValues {
   uint64_t registers[xenos::kMaxShaderTempRegisters / 16] = {};
   bool previous_scalar = false;
+  bool address_register = false;
 
   bool operator==(const RoundingSensitiveValues& other) const {
     return !std::memcmp(registers, other.registers, sizeof(registers)) &&
-           previous_scalar == other.previous_scalar;
+           previous_scalar == other.previous_scalar &&
+           address_register == other.address_register;
   }
   void Merge(const RoundingSensitiveValues& other) {
     for (size_t i = 0; i < xe::countof(registers); ++i) {
       registers[i] |= other.registers[i];
     }
     previous_scalar = previous_scalar || other.previous_scalar;
+    address_register = address_register || other.address_register;
   }
 
   // aL-relative addressing may access any register.
@@ -743,6 +747,7 @@ void GatherInstructionRoundingSensitivity(const uint32_t* op_ptr, bool is_fetch,
 
   uint32_t vector_sensitive =
       values.GetResultComponents(instr.vector_and_constant_result);
+  const bool a0_sensitive = values.address_register;
   // Result components whose operands are needed, also for the operation's own
   // rounding-sensitive use of them.
   uint32_t vector_operands_used_for = vector_sensitive;
@@ -756,8 +761,11 @@ void GatherInstructionRoundingSensitivity(const uint32_t* op_ptr, bool is_fetch,
       vector_operands_used = vector_operands_used_for != 0;
       break;
     case AluVectorOpcode::kMaxA:
-      // a0 is set from W of the first operand.
-      vector_operands_used = true;
+      // a0 is set from W of the first operand. Only needed when a0 is read
+      // downstream before being overwritten.
+      if (a0_sensitive) {
+        vector_operands_used = true;
+      }
       break;
     default:
       break;
@@ -771,6 +779,10 @@ void GatherInstructionRoundingSensitivity(const uint32_t* op_ptr, bool is_fetch,
   switch (instr.scalar_opcode) {
     case AluScalarOpcode::kMaxAs:
     case AluScalarOpcode::kMaxAsf:
+      if (a0_sensitive) {
+        scalar_operands_used = true;
+      }
+      break;
     case AluScalarOpcode::kFrcs:
     case AluScalarOpcode::kTruncs:
     case AluScalarOpcode::kFloors:
@@ -787,12 +799,33 @@ void GatherInstructionRoundingSensitivity(const uint32_t* op_ptr, bool is_fetch,
     if (instr.scalar_opcode != AluScalarOpcode::kRetainPrev) {
       values.previous_scalar = false;
     }
+    if (instr.vector_opcode == AluVectorOpcode::kMaxA ||
+        instr.scalar_opcode == AluScalarOpcode::kMaxAs ||
+        instr.scalar_opcode == AluScalarOpcode::kMaxAsf) {
+      values.address_register = false;
+    }
+  }
+  for (uint32_t i = 0; i < instr.vector_operand_count; ++i) {
+    if (instr.vector_operands[i].storage_addressing_mode ==
+        InstructionStorageAddressingMode::kAddressRegisterRelative) {
+      values.address_register = true;
+    }
+  }
+  for (uint32_t i = 0; i < instr.scalar_operand_count; ++i) {
+    if (instr.scalar_operands[i].storage_addressing_mode ==
+        InstructionStorageAddressingMode::kAddressRegisterRelative) {
+      values.address_register = true;
+    }
   }
   if (vector_operands_used) {
+    AluVectorOpcode needed_opcode =
+        (instr.vector_opcode == AluVectorOpcode::kMaxA && !a0_sensitive)
+            ? AluVectorOpcode::kMax
+            : instr.vector_opcode;
     for (uint32_t i = 0; i < instr.vector_operand_count; ++i) {
       values.AddOperand(
           instr.vector_operands[i],
-          GetAluVectorOpNeededSourceComponents(instr.vector_opcode, i + 1,
+          GetAluVectorOpNeededSourceComponents(needed_opcode, i + 1,
                                                vector_operands_used_for));
     }
   }
@@ -814,11 +847,9 @@ void GatherInstructionRoundingSensitivity(const uint32_t* op_ptr, bool is_fetch,
     }
   }
 
-  if (vector_sensitive) {
-    alu_results |= 0b01;
-  }
+  alu_results |= uint8_t(vector_sensitive & 0b1111u);
   if (scalar_sensitive) {
-    alu_results |= 0b10;
+    alu_results |= 0b10000u;
   }
 }
 
@@ -944,6 +975,7 @@ bool ShaderTranslator::TranslateAnalyzedShader(
   assert_true(shader.is_ucode_analyzed());
   if (!shader.is_ucode_analyzed()) {
     XELOGE("AnalyzeUcode must be done on the shader before translation");
+    translation.PublishTranslation(false);
     return false;
   }
   translation_ = &translation;
@@ -1016,6 +1048,7 @@ bool ShaderTranslator::TranslateAnalyzedShader(
   // Publish last: creation threads take is_translated() as the binary, the
   // validity and (after PostTranslation) the shader's bindings being complete.
   translation.is_translated_.store(true, std::memory_order_release);
+  translation.is_translated_.notify_all();
   return is_valid;
 }
 

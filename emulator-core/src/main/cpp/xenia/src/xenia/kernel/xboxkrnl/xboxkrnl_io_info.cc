@@ -250,21 +250,37 @@ dword_result_t NtSetInformationFile_entry(
     case XFileRenameInformation: {
       auto info = info_ptr.as<X_FILE_RENAME_INFORMATION*>();
       // Compute path, possibly attrs relative.
-      std::string target_name =
+      auto target_name =
           util::TranslateAnsiPath(kernel_memory(), &info->ansi_string);
-      // As NtCreateFile does for a name not relative to a directory handle.
-      if (!info->root_dir_handle) {
-        xeObStripDosDevicesPrefix(target_name);
-      }
+      xeObStripDosDevicesPrefix(target_name);
       std::filesystem::path target_path = target_name;
 
       // Place IsValidPath in path from where it can be accessed everywhere
-      if (!IsValidPath(target_path.string(), false)) {
+      if (!IsValidPath(xe::path_to_utf8(target_path), false)) {
         return X_STATUS_OBJECT_NAME_INVALID;
       }
 
       if (!target_path.has_filename()) {
         return X_STATUS_INVALID_PARAMETER;
+      }
+
+      if (info->root_dir_handle) {
+        auto root_file = kernel_state()->object_table()->LookupObject<XFile>(
+            info->root_dir_handle);
+        if (!root_file) {
+          return X_STATUS_INVALID_HANDLE;
+        }
+        if (target_name.find(':') == std::string::npos &&
+            !target_name.starts_with('\\')) {
+          const auto base = xe::utf8::find_base_guest_path(target_name);
+          const auto leaf = xe::utf8::find_name_from_guest_path(target_name);
+          vfs::Entry* new_parent = base.empty()
+                                       ? root_file->entry()
+                                       : root_file->entry()->ResolvePath(base);
+          result =
+              file->Rename(new_parent, leaf, info->replace_existing != 0);
+          break;
+        }
       }
 
       result = file->Rename(target_path, info->replace_existing != 0);
@@ -296,7 +312,7 @@ dword_result_t NtSetInformationFile_entry(
       auto device = file->device();
       uint64_t allocation_size =
           xe::round_up(uint64_t(info->allocation_size),
-                       uint64_t(device->sectors_per_allocation_unit()) *
+                       uint64_t(file->entry()->sectors_per_allocation_unit()) *
                            device->bytes_per_sector(),
                        false);
       uint64_t file_size = 0;
@@ -412,7 +428,8 @@ dword_result_t NtQueryVolumeInformationFile_entry(
       auto info = info_ptr.as<X_FILE_FS_SIZE_INFORMATION*>();
       info->total_allocation_units = device->total_allocation_units();
       info->available_allocation_units = device->available_allocation_units();
-      info->sectors_per_allocation_unit = device->sectors_per_allocation_unit();
+      info->sectors_per_allocation_unit =
+          file->entry()->sectors_per_allocation_unit();
       info->bytes_per_sector = device->bytes_per_sector();
       // TODO(gibbed): sanity check, XCTD userland code seems to require this.
       assert_true(info->bytes_per_sector == 0x200);

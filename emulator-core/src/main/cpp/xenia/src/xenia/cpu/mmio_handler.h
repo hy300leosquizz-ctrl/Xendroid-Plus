@@ -34,6 +34,10 @@ typedef void (*MMIOWriteCallback)(void* ppc_context, void* callback_context,
                                   uint32_t addr, uint32_t value);
 typedef void (*MmioAccessRecordCallback)(void* context,
                                          void* host_insn_address);
+// Releases the granule a faulting stwcx. has claimed and returns where it fails
+// from, or 0 when the fault is not in one.
+typedef uint64_t (*ReservedStoreFaultCallback)(void* context, Exception* ex);
+typedef bool (*ReservedStoreFaultPcCheckCallback)(void* context, uint64_t pc);
 struct MMIORange {
   uint32_t address;
   uint32_t mask;
@@ -97,6 +101,14 @@ class MMIOHandler {
     user_membase_.store(user_membase, std::memory_order_relaxed);
   }
 
+  void SetReservedStoreFaultCallback(
+      ReservedStoreFaultCallback callback, void* context,
+      ReservedStoreFaultPcCheckCallback pc_check = nullptr) {
+    reserved_store_fault_context_ = context;
+    reserved_store_fault_pc_check_ = pc_check;
+    reserved_store_fault_callback_ = callback;
+  }
+
  protected:
   MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase,
               uint8_t* membase_end, HostToGuestVirtual host_to_guest_virtual,
@@ -108,6 +120,11 @@ class MMIOHandler {
 
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
+  bool HandleAccessViolation(Exception* ex);
+  static bool FastAccessViolationThunk(void* data, uint64_t fault_pc,
+                                       uint64_t fault_address, bool is_write);
+  bool FastAccessViolation(uint64_t fault_pc, uint64_t fault_address,
+                           bool is_write);
 
   uint8_t* virtual_membase_;
   uint8_t* physical_membase_;
@@ -124,6 +141,9 @@ class MMIOHandler {
   MmioAccessRecordCallback record_mmio_callback_;
 
   void* record_mmio_context_;
+  ReservedStoreFaultCallback reserved_store_fault_callback_ = nullptr;
+  ReservedStoreFaultPcCheckCallback reserved_store_fault_pc_check_ = nullptr;
+  void* reserved_store_fault_context_ = nullptr;
   static MMIOHandler* global_handler_;
   static std::atomic<uint64_t> last_fault_host_pc_;
   static std::atomic<uint32_t> last_fault_thread_id_;

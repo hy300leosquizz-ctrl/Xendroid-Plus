@@ -31,6 +31,7 @@ class GamePatchesViewModel(
             val conflicts: List<PatchConflict> = emptyList(),
             val versions: Map<String, PatchVersion.Match> = emptyMap(),
             val versionKnown: Boolean = false,
+            val hasAspectTemplate: Boolean = false,
         ) : UiState
         data object Empty : UiState
         data class Error(val message: String) : UiState
@@ -76,6 +77,28 @@ class GamePatchesViewModel(
         }
     }
 
+    /** Generates a 20:9 / 21:9 / custom aspect-ratio user `.patch.toml` and saves it via [PatchStore]. */
+    fun createUltrawidePatch(gameName: String, ratio: Float, ratioLabel: String, customAddress: String? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _message.value = runCatching {
+                val texts = store.textsForTitle(titleId).map { it.second }
+                val toml = AspectRatioPatchHelper.buildUltrawideToml(
+                    titleId = titleId,
+                    titleName = gameName.ifBlank { titleId },
+                    sourceTexts = texts,
+                    targetRatio = ratio,
+                    ratioLabel = ratioLabel,
+                    customAddress = customAddress,
+                ) ?: error(appContext.getString(R.string.pt_aspect_no_template))
+                val stored = store.importUserPatch(titleId, "ultrawide-${ratioLabel.replace(':', '-')}", toml)
+                appContext.getString(R.string.pt_added, stored)
+            }.getOrElse { e ->
+                appContext.getString(R.string.pt_not_added, e.message ?: appContext.getString(R.string.pt_unreadable))
+            }
+            _state.value = compute()
+        }
+    }
+
     init { reload() }
 
     private fun reload() {
@@ -117,7 +140,8 @@ class GamePatchesViewModel(
         val gameHashes = runCatching { xendroid.compose.sessions.SessionRuns.store().lastRun(titleId)?.moduleHashes }
             .getOrNull().orEmpty()
         val versions = files.associate { it.fileName to PatchVersion.match(it.hashes, gameHashes) }
-        if (files.isEmpty()) UiState.Empty else UiState.Loaded(files, conflicts, versions, gameHashes.isNotEmpty())
+        val adaptable = AspectRatioPatchHelper.hasAdaptableTemplate(texts.map { it.second })
+        if (files.isEmpty()) UiState.Empty else UiState.Loaded(files, conflicts, versions, gameHashes.isNotEmpty(), adaptable)
     }.getOrElse { UiState.Error(it.message ?: appContext.getString(R.string.pt_load_failed)) }
 
     private companion object {

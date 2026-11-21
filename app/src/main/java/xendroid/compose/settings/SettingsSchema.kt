@@ -28,7 +28,7 @@ object SettingsSchema {
             b("Vulkan", "vulkan_log_debug_messages", "Log debug messages", false),
             b("Vulkan", "vulkan_validation", "Validation layers", false),
             b("Vulkan", "vulkan_renderdoc_capture", "RenderDoc capture layer", false),
-            b("Vulkan", "vulkan_allow_present_mode_immediate", "Allow present mode: immediate", true),
+            b("Vulkan", "vulkan_allow_present_mode_immediate", "Allow present mode: immediate", false),
             b("Vulkan", "vulkan_allow_present_mode_mailbox", "Allow present mode: mailbox", false),
             b("Vulkan", "vulkan_allow_present_mode_fifo_relaxed", "Allow present mode: FIFO relaxed", true),
             b("Vulkan", "vulkan_async_skip_draws", "Async skip draws", true),
@@ -59,6 +59,13 @@ object SettingsSchema {
             // reuse is on) picks edge's bitmask gate vs the content-hash gate for A/B.
             b("Vulkan", "vulkan_cache_texture_descriptors", "Cache texture descriptors", true),
             b("Vulkan", "vulkan_texture_descriptor_reuse_edge", "Texture descriptor gate: edge (off = hash)", false),
+            b("Vulkan", "vulkan_xclipse_bc_transcode", "Samsung Xclipse BCn compute transcode", true),
+            b("Vulkan", "vulkan_msaa_4x_as_2x2", "EDRAM 4x MSAA as 2x2 single-sample (AFBC)", true),
+            b("Vulkan", "vulkan_adreno_bcenabler", "Adreno 6xx hardware BCn enabler", true),
+            b("Vulkan", "vulkan_memexport_batch", "Batch vertex memexport compute dispatches", true),
+            b("Vulkan", "vulkan_tight_render_area", "Tight TBDR render area from dirty/scissor bounds", true),
+            b("Vulkan", "vulkan_shader_object", "Shader objects (VK_EXT_shader_object)", false),
+            b("Vulkan", "vulkan_graphics_pipeline_library", "Graphics pipeline library (VK_EXT_GPL)", true),
         )),
 
         SettingsCategory("Video", listOf(
@@ -92,6 +99,7 @@ object SettingsSchema {
         )),
 
         SettingsCategory("Storage", listOf(
+            b("Storage", "iso_stream_pread", "Stream ISO discs on demand (pread64)", true),
             b("Storage", "mount_scratch", "Mount scratch", false),
             b("Storage", "mount_cache", "Mount cache", false),
             b("Storage", "mount_memory_unit", "Mount memory unit (MU)", false),
@@ -122,6 +130,7 @@ object SettingsSchema {
             b("Kernel", "apply_title_update", "Apply title update", true),
             b("Kernel", "kernel_debug_monitor", "Kernel debug monitor", false),
             b("Kernel", "network_enabled", "Networking", true),
+            b("Kernel", "file_read_no_apc_inline", "Defer file-read APC completion", false),
         )),
 
         SettingsCategory("Network", listOf(
@@ -142,10 +151,13 @@ object SettingsSchema {
         SettingsCategory("HID", listOf(
             l("HID", "hid", "HID backend", "android",
                 "android" to "android", "nop" to "nop"),
+            l("HID", "jit_frame_start", "Just-in-time frame start", "0",
+                "0" to "Off", "1" to "Always on", "2" to "Auto (-20 ms latency)"),
         )),
 
         SettingsCategory("Memory", listOf(
             i("Memory", "mmap_address_high", "mmap address high", 8, 2, 63),
+            b("Memory", "shm_coalesce_writewatch_pages", "Coalesce 64 KB writewatch page faults", true),
             b("Memory", "scribble_heap", "Scribble heap", false),
             b("Memory", "protect_zero", "Protect zero page", true),
             b("Memory", "writable_executable_memory", "Writable executable memory", true),
@@ -192,7 +204,7 @@ object SettingsSchema {
             // A dropdown, not a slider: only a few values are meaningful, and "unlimited"
             // needs to be an explicit choice rather than the bottom of a range.
             l("GPU", "framerate_limit", "Frame rate limit", "60",
-                "60" to "60 FPS", "30" to "30 FPS", "45" to "45 FPS", "40" to "40 FPS", "20" to "20 FPS", "15" to "15 FPS",
+                "60" to "60 FPS", "15" to "15 FPS", "20" to "20 FPS", "30" to "30 FPS", "40" to "40 FPS", "45" to "45 FPS",
                 "90" to "90 FPS", "120" to "120 FPS", "0" to "Unlimited"),
             b("GPU", "guest_display_refresh_cap", "Cap guest display refresh (VSync)", true),
             // vulkan_texture_cache: -1 leaves each sampler as the game set it.
@@ -265,9 +277,17 @@ object SettingsSchema {
                 "vulkan" to "vulkan", "null" to "null"),
             b("GPU", "depth_float24_convert_in_pixel_shader", "Depth float24 convert in pixel shader", false),
             b("GPU", "value_convert_7e3_8888_reuse", "value_convert_7e3_8888_reuse", true),
+            b("GPU", "spirv_forward_jump_segments", "Acyclic forward-jump SPIR-V segments", true),
+            b("GPU", "spirv_nonfinite_safe_fmul", "Static non-finite analysis for native FMul", true),
+            b("GPU", "spirv_texture_iscale_specialization", "Specialize integer-scaled texture fetches", true),
+            b("GPU", "vulkan_shader_register_ssa", "Promote Xenos GPRs to SPIR-V SSA", true),
+            b("GPU", "vulkan_fable2_float24_depth", "Quantize float24 fragment depth (Fable II)", false),
         )),
 
         SettingsCategory("CPU", listOf(
+            b("CPU", "a64_call_aware_volatile_gprs", "Call-aware volatile GPR allocation (16 GPRs)", true),
+            b("CPU", "a64_fast_vmx_estimates", "Fast ARM64 VMX reciprocal/rsqrt estimates", false),
+            b("CPU", "enable_early_precompilation", "Precompile .pdata functions on module load", false),
             b("CPU", "validate_hir", "Validate HIR", false),
             b("CPU", "trace_function_references", "Trace function references", false),
             b("CPU", "trace_function_coverage", "Trace function coverage", false),

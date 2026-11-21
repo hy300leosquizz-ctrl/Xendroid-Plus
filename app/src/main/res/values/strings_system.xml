@@ -17,6 +17,9 @@
     <string name="xd_fr_driver_note">The phone\'s own Vulkan driver is enough to start. A Turnip package can be installed later in Drivers, and switched back whenever you want.</string>
     <string name="xd_fd_summary">%1$s in %2$s</string>
     <string name="xd_fd_scanning">Looking…</string>
+    <string name="xd_fd_change">Change…</string>
+    <string name="xd_fd_changed">Using %1$s instead of %2$s.</string>
+    <string name="xd_fd_settings_note">Add, change or stop scanning the folders where your games are stored. Your game files are never moved or deleted.</string>
     <string name="xd_fd_install_here">Install here</string>
     <string name="xd_fd_unavailable_detail">Its games stay out of the library until the folder is back (SD card or permission?).</string>
     <string name="xd_fd_install_moved">Installs go to this folder now.</string>

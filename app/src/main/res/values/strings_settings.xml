@@ -263,4 +263,42 @@
         <item quantity="one">and %1$d more</item>
         <item quantity="other">and %1$d more</item>
     </plurals>
+    <string name="st_t_storage_iso_stream_pread">Stream .iso discs on demand</string>
+    <string name="st_d_storage_iso_stream_pread">Reads Xbox 360 .iso sectors via pread64 and a 16 MiB LRU block cache instead of mapping the full 8.5 GB disc into memory, saving 2 to 5 GB of RAM on Android.</string>
+    <string name="st_t_hid_jit_frame_start">Just-in-time frame start</string>
+    <string name="st_d_hid_jit_frame_start">Delays guest input sampling toward the presentation deadline so button presses take effect about 20 ms sooner. Automatic yields when Frame Generation paces frames.</string>
+    <string name="st_t_vulkan_vulkan_xclipse_bc_transcode">Samsung Xclipse BCn compute transcode</string>
+    <string name="st_d_vulkan_vulkan_xclipse_bc_transcode">Transcodes DXT/BCn textures on the GPU on Samsung Xclipse drivers where native BCn sampling causes artifacts or driver faults.</string>
+    <string name="st_t_vulkan_vulkan_msaa_4x_as_2x2">Emulate 4x MSAA as 2x2</string>
+    <string name="st_d_vulkan_vulkan_msaa_4x_as_2x2">Maps Xbox 360 4x MSAA targets onto 2x2 layout where mobile tile GPUs save bandwidth and GMEM space with minimal visual difference.</string>
+    <string name="st_t_vulkan_vulkan_adreno_bcenabler">Adreno proprietary BCn enabler</string>
+    <string name="st_d_vulkan_vulkan_adreno_bcenabler">Unlocks hardware BCn compressed texture formats on Qualcomm proprietary Adreno Vulkan drivers that hide them in capability queries.</string>
+    <string name="st_t_vulkan_vulkan_memexport_batch">Batch GPU memory exports</string>
+    <string name="st_d_vulkan_vulkan_memexport_batch">Coalesces consecutive Xenos memexport writes into fewer barriers and host-visible flushes.</string>
+    <string name="st_t_gpu_spirv_forward_jump_segments">Segment SPIR-V forward jumps</string>
+    <string name="st_d_gpu_spirv_forward_jump_segments">Lowers forward jumps in Xenos shaders into structured SPIR-V segments instead of deep switch ladders, speeding up mobile shader compilation.</string>
+    <string name="st_t_gpu_spirv_nonfinite_safe_fmul">Non-finite safe SPIR-V multiply</string>
+    <string name="st_d_gpu_spirv_nonfinite_safe_fmul">Preserves Xbox 360 0 * Inf = 0 semantics in translated SPIR-V shaders without full IEEE NaN overhead.</string>
+    <string name="st_t_gpu_spirv_texture_iscale_specialization">Specialize SPIR-V texture coordinate scale</string>
+    <string name="st_d_gpu_spirv_texture_iscale_specialization">Folds constant texture resolution scale factors into specialized SPIR-V modules to cut per-sample ALU work.</string>
+    <string name="st_t_gpu_vulkan_shader_register_ssa">SSA register promotion in SPIR-V</string>
+    <string name="st_d_gpu_vulkan_shader_register_ssa">Promotes non-indexed Xenos temporary registers to SPIR-V SSA values instead of private arrays so mobile GPU compilers allocate hardware registers.</string>
+    <string name="st_t_vulkan_vulkan_shader_object">Vulkan shader objects (EXT)</string>
+    <string name="st_d_vulkan_vulkan_shader_object">Uses VK_EXT_shader_object when supported by the driver to bind compiled shaders directly without monolithic graphics pipelines.</string>
+    <string name="st_t_vulkan_vulkan_graphics_pipeline_library">Graphics pipeline library (GPL)</string>
+    <string name="st_d_vulkan_vulkan_graphics_pipeline_library">Uses VK_EXT_graphics_pipeline_library when supported to link precompiled vertex, fragment and state subsets with near-zero stutter.</string>
+    <string name="st_t_gpu_vulkan_fable2_float24_depth">Float24 depth precision fix (Fable II)</string>
+    <string name="st_d_gpu_vulkan_fable2_float24_depth">Enforces exact 20e4 float24 depth rounding needed to prevent Z-fighting and shadow corruption in Fable II and Unreal Engine 3 titles.</string>
+    <string name="st_t_vulkan_vulkan_tight_render_area">Tight render pass area</string>
+    <string name="st_d_vulkan_vulkan_tight_render_area">Bounds Vulkan renderArea to the active scissor/viewport rectangle so tile-based mobile GPUs skip loading and resolving unused tiles.</string>
+    <string name="st_t_cpu_a64_call_aware_volatile_gprs">ARM64 call-aware volatile GPRs</string>
+    <string name="st_d_cpu_a64_call_aware_volatile_gprs">Avoids spilling caller-saved PowerPC GPRs across guest calls in the ARM64 JIT backend when downstream blocks overwrite them.</string>
+    <string name="st_t_cpu_a64_fast_vmx_estimates">Fast ARM64 VMX reciprocal/rsqrt estimates</string>
+    <string name="st_d_cpu_a64_fast_vmx_estimates">Uses single-instruction ARM64 NEON FRECPE/FRSQRTE estimates for AltiVec/VMX math. Faster, but turn off if physics or skinning jitter.</string>
+    <string name="st_t_cpu_enable_early_precompilation">Early AOT function precompilation</string>
+    <string name="st_d_cpu_enable_early_precompilation">Compiles discovered PowerPC functions on background worker threads when the module loads rather than waiting for first execution.</string>
+    <string name="st_t_memory_shm_coalesce_writewatch_pages">Coalesce write-watch page protections</string>
+    <string name="st_d_memory_shm_coalesce_writewatch_pages">Batches contiguous guest physical pages into single mprotect syscalls when arming or clearing GPU write watches.</string>
+    <string name="st_t_kernel_file_read_no_apc_inline">Defer file read APC completion</string>
+    <string name="st_d_kernel_file_read_no_apc_inline">Queues asynchronous NtReadFile completion APCs instead of running them inline, fixing race conditions in streaming engines that expect deferred delivery.</string>
 </resources>

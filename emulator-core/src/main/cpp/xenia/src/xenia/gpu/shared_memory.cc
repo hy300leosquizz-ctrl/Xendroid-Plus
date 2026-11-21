@@ -17,6 +17,34 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/xxhash.h"
+
+DECLARE_bool(shm_coalesce_writewatch_pages);
+
+DEFINE_bool(
+    shm_unwatch_release_exclusion, true,
+    "Pages watched by a texture or CPU-side cache stop being excluded from "
+    "dynamic unwatching once a CPU write fires their watches.",
+    "GPU");
+DEFINE_bool(
+    shared_memory_unwatch_dynamic_pages, true,
+    "Leave shared memory pages that the CPU rewrites frame after frame "
+    "unwatched and verify them against their XXH3 upload hash instead of "
+    "re-protecting with mprotect on every upload.",
+    "GPU");
+DEFINE_int32(
+    shm_unwatch_score, 2,
+    "Frames with a CPU rewrite (score +1 each, -1 per frame without) after "
+    "which an uploaded shared memory page is left unwatched and hash-verified.",
+    "GPU");
+DEFINE_int32(
+    shm_unwatch_score_max, 8,
+    "Ceiling of a page's rewrite score before it decays back to watched.",
+    "GPU");
+DEFINE_int32(
+    shm_unwatch_decay_frames, 1,
+    "Frames between decrements of a shared memory page's rewrite score.",
+    "GPU");
 
 DEFINE_bool(
     shared_memory_preserve_gpu_writes, false,
@@ -74,6 +102,19 @@ bool SharedMemory::InitializeCommon() {
       system_page_flags_base + 3 * num_system_page_flags_;
 
   memset(system_page_flags_base, 0, 4 * 8 * num_system_page_flags_entries);
+
+  system_page_flags_used_in_submission_.assign(num_system_page_flags_,
+                                               UINT64_MAX);
+  page_upload_hash_.assign(size_t(num_system_page_flags_) * 64, 0);
+  page_upload_hash_valid_.assign(num_system_page_flags_, 0);
+  unwatched_pages_.assign(num_system_page_flags_, 0);
+  texture_watched_pages_.assign(num_system_page_flags_, 0);
+  dirty_this_frame_.assign(num_system_page_flags_, 0);
+  dirty_score_nonzero_.assign(num_system_page_flags_, 0);
+  unwatch_candidates_.assign(num_system_page_flags_, 0);
+  dirty_score_.assign(size_t(num_system_page_flags_) * 64, 0);
+  unwatched_page_count_ = 0;
+  unwatch_decay_counter_ = 0;
 
   if (cvars::shared_memory_page_history) {
     page_history_.resize(kBufferSize >> page_size_log2_);
@@ -143,18 +184,34 @@ void SharedMemory::ShutdownCommon() {
   system_page_flags_valid_and_gpu_written_ = nullptr;
   system_page_flags_invalidated_in_submission_ = nullptr;
   system_page_flags_preserve_exempt_ = nullptr;
+  system_page_flags_used_in_submission_.clear();
+  page_upload_hash_.clear();
+  page_upload_hash_valid_.clear();
+  unwatched_pages_.clear();
+  texture_watched_pages_.clear();
+  dirty_this_frame_.clear();
+  dirty_score_nonzero_.clear();
+  unwatch_candidates_.clear();
+  dirty_score_.clear();
+  unwatched_page_count_ = 0;
+  unwatch_decay_counter_ = 0;
   num_system_page_flags_ = 0;
 }
 
 void SharedMemory::InvalidateAllPages() {
   auto global_lock = global_critical_region_.Acquire();
 
-  std::memset(system_page_flags_valid_, 0,
-              num_system_page_flags_ * sizeof(uint64_t));
+  for (uint32_t b = 0; b < num_system_page_flags_; ++b) {
+    __atomic_store_n(&system_page_flags_valid_[b], uint64_t(0),
+                     __ATOMIC_RELEASE);
+  }
   std::memset(system_page_flags_valid_and_gpu_written_, 0,
               num_system_page_flags_ * sizeof(uint64_t));
   std::memset(system_page_flags_invalidated_in_submission_, 0xFF,
               num_system_page_flags_ * sizeof(uint64_t));
+  std::fill(system_page_flags_used_in_submission_.begin(),
+            system_page_flags_used_in_submission_.end(), UINT64_MAX);
+  std::fill(page_upload_hash_valid_.begin(), page_upload_hash_valid_.end(), 0);
 
   // Mark all chunks dirty so the next copy refreshes everything.
   dirty_blocks_ = 0xFFFFFFFF;
@@ -168,6 +225,31 @@ void SharedMemory::OnGpuSubmissionOpened() {
   auto global_lock = global_critical_region_.Acquire();
   std::memset(system_page_flags_invalidated_in_submission_, 0,
               num_system_page_flags_ * sizeof(uint64_t));
+  std::fill(system_page_flags_used_in_submission_.begin(),
+            system_page_flags_used_in_submission_.end(), 0);
+}
+
+void SharedMemory::MarkRangeUsedInSubmission(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize ||
+      system_page_flags_used_in_submission_.empty()) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t b = block_first; b <= block_last; ++b) {
+    uint64_t mask = UINT64_MAX;
+    if (b == block_first) {
+      mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (b == block_last && (page_last & 63) != 63) {
+      mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    system_page_flags_used_in_submission_[b] |= mask;
+  }
 }
 
 bool SharedMemory::AnyPageInvalidatedSinceSubmissionOpen(
@@ -232,7 +314,8 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
         uint64_t gpu_written_block = system_page_flags_valid_and_gpu_written_[i];
         system_page_flags_invalidated_in_submission_[i] |=
             system_page_flags_valid_[i] & ~gpu_written_block;
-        system_page_flags_valid_[i] = gpu_written_block;
+        __atomic_store_n(&system_page_flags_valid_[i], gpu_written_block,
+                         __ATOMIC_RELEASE);
       }
     } else {
       while (dirty_mask) {
@@ -247,7 +330,8 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
               system_page_flags_valid_and_gpu_written_[i];
           system_page_flags_invalidated_in_submission_[i] |=
               system_page_flags_valid_[i] & ~gpu_written_block;
-          system_page_flags_valid_[i] = gpu_written_block;
+          __atomic_store_n(&system_page_flags_valid_[i], gpu_written_block,
+                           __ATOMIC_RELEASE);
         }
       }
     }
@@ -294,6 +378,23 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(
       watch_page_first << page_size_log2_ >> kWatchBucketSizeLog2;
   uint32_t bucket_last =
       watch_page_last << page_size_log2_ >> kWatchBucketSizeLog2;
+  // Pages with active range watches (e.g., textures) must receive immediate
+  // invalidation callbacks and are excluded from dynamic unwatching.
+  if (!texture_watched_pages_.empty()) {
+    for (uint32_t b = watch_page_first >> 6; b <= watch_page_last >> 6; ++b) {
+      uint64_t mask = UINT64_MAX;
+      if (b == watch_page_first >> 6) {
+        mask &= ~((uint64_t(1) << (watch_page_first & 63)) - 1);
+      }
+      if (b == watch_page_last >> 6 && (watch_page_last & 63) != 63) {
+        mask &= (uint64_t(1) << ((watch_page_last & 63) + 1)) - 1;
+      }
+      texture_watched_pages_[b] |= mask;
+      if (unwatched_pages_[b] & mask) {
+        RewatchPages(b, unwatched_pages_[b] & mask);
+      }
+    }
+  }
   // chrispy: Not required the global lock is always held by the caller
   // auto global_lock = global_critical_region_.Acquire();
 
@@ -430,6 +531,11 @@ bool SharedMemory::AllocateSparseHostGpuMemoryRange(
   return false;
 }
 
+void SharedMemory::SetHistoryFrame(uint32_t frame) {
+  history_frame_ = frame + 1;
+  OnFrameEndUnwatch();
+}
+
 SharedMemory::PageHistory SharedMemory::GetPageHistory(
     uint32_t address) const {
   if (page_history_.empty() || address >= kBufferSize) {
@@ -466,6 +572,15 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
   {
     auto global_lock = global_critical_region_.Acquire();
 
+    if (written_by_gpu && memory_invalidation_callback_handle_) {
+      // Protect before publishing the GPU-written bit so a racing CPU store
+      // cannot slip past without faulting while leaving the bit set.
+      memory().EnablePhysicalMemoryAccessCallbacks(
+          valid_page_first << page_size_log2_,
+          (valid_page_last - valid_page_first + 1) << page_size_log2_, true,
+          false);
+    }
+
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
       uint64_t valid_bits = UINT64_MAX;
       if (i == valid_block_first) {
@@ -474,9 +589,23 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
       if (i == valid_block_last && (valid_page_last & 63) != 63) {
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
-      // SystemPageFlagsBlock& block = system_page_flags_[i];
-      system_page_flags_valid_[i] |= valid_bits;
+      __atomic_fetch_or(&system_page_flags_valid_[i], valid_bits,
+                        __ATOMIC_RELEASE);
+      if (!page_upload_hash_valid_.empty()) {
+        __atomic_fetch_and(&page_upload_hash_valid_[i], ~valid_bits,
+                           __ATOMIC_RELAXED);
+      }
       if (written_by_gpu) {
+        if (!unwatched_pages_.empty()) {
+          uint64_t unwatched_bits = unwatched_pages_[i] & valid_bits;
+          if (unwatched_bits) {
+            unwatched_pages_[i] &= ~unwatched_bits;
+            unwatched_page_count_ -= uint32_t(xe::bit_count(unwatched_bits));
+          }
+        }
+        if (!system_page_flags_used_in_submission_.empty()) {
+          system_page_flags_used_in_submission_[i] |= valid_bits;
+        }
         // In the same critical region as the GPU write, so a guest write
         // faulting in can't see the pages of an export read back as preserved.
         // A page that a GPU write not read back (a resolve) left only in the
@@ -510,14 +639,230 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
     }
   }
 
-  if (memory_invalidation_callback_handle_) {
+  if (memory_invalidation_callback_handle_ && !written_by_gpu) {
     // A page that isn't writable here gets no watch. A later guest
     // protect-to-writable invalidates it unconditionally, so its writes are
     // still caught.
+    if (cvars::shared_memory_unwatch_dynamic_pages &&
+        cvars::shm_coalesce_writewatch_pages && !dirty_score_.empty()) {
+      EnableWatchesExceptDynamic(valid_page_first, valid_page_last);
+    } else {
+      memory().EnablePhysicalMemoryAccessCallbacks(
+          valid_page_first << page_size_log2_,
+          (valid_page_last - valid_page_first + 1) << page_size_log2_, true,
+          false);
+    }
+  }
+}
+
+void SharedMemory::SetPageUploadHashes(uint32_t page_first,
+                                       uint32_t page_count,
+                                       const uint8_t* source) {
+  if (page_upload_hash_.empty() || !page_count || !unwatched_page_count_) {
+    return;
+  }
+  const uint32_t last = page_first + page_count - 1;
+  const size_t page_size = size_t(1) << page_size_log2_;
+  for (uint32_t b = page_first >> 6; b <= last >> 6; ++b) {
+    uint64_t mask = UINT64_MAX;
+    if (b == page_first >> 6) {
+      mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (b == last >> 6 && (last & 63) != 63) {
+      mask &= (uint64_t(1) << ((last & 63) + 1)) - 1;
+    }
+    uint64_t bits = mask & unwatched_pages_[b];
+    while (bits) {
+      uint32_t bit = 0;
+      xe::bit_scan_forward(bits, &bit);
+      bits &= bits - 1;
+      const uint32_t page = (b << 6) + bit;
+      page_upload_hash_[page] = XXH3_64bits(
+          source + size_t(page - page_first) * page_size, page_size);
+      __atomic_fetch_or(&page_upload_hash_valid_[b], uint64_t(1) << bit,
+                        __ATOMIC_RELAXED);
+    }
+  }
+}
+
+void SharedMemory::EnableWatchesExceptDynamic(uint32_t page_first,
+                                              uint32_t page_last) {
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t run_start = UINT32_MAX;
+  for (uint32_t b = page_first >> 6; b <= page_last >> 6; ++b) {
+    uint64_t mask = UINT64_MAX;
+    if (b == page_first >> 6) {
+      mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (b == page_last >> 6 && (page_last & 63) != 63) {
+      mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    const uint64_t dynamic = unwatch_candidates_[b] & mask &
+                             ~texture_watched_pages_[b] &
+                             ~system_page_flags_valid_and_gpu_written_[b];
+    const uint64_t added = dynamic & ~unwatched_pages_[b];
+    unwatched_page_count_ += uint32_t(xe::bit_count(added));
+    unwatched_pages_[b] |= dynamic;
+    const uint64_t to_watch = mask & ~unwatched_pages_[b];
+
+    const uint32_t bit_first = (b == page_first >> 6) ? (page_first & 63) : 0;
+    const uint32_t bit_last = (b == page_last >> 6) ? (page_last & 63) : 63;
+    for (uint32_t bit = bit_first; bit <= bit_last; ++bit) {
+      const uint32_t page = (b << 6) + bit;
+      if (to_watch & (uint64_t(1) << bit)) {
+        if (run_start == UINT32_MAX) {
+          run_start = page;
+        }
+      } else if (run_start != UINT32_MAX) {
+        memory().EnablePhysicalMemoryAccessCallbacks(
+            run_start << page_size_log2_,
+            (page - run_start) << page_size_log2_, true, false);
+        run_start = UINT32_MAX;
+      }
+    }
+  }
+  if (run_start != UINT32_MAX) {
     memory().EnablePhysicalMemoryAccessCallbacks(
-        valid_page_first << page_size_log2_,
-        (valid_page_last - valid_page_first + 1) << page_size_log2_, true,
-        false);
+        run_start << page_size_log2_,
+        (page_last + 1 - run_start) << page_size_log2_, true, false);
+  }
+}
+
+bool SharedMemory::UnwatchedPageMatchesUpload(uint32_t page) {
+  const uint32_t address = page << page_size_log2_;
+  const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
+  auto* phys_heap = memory().GetPhysicalHeap();
+  for (uint32_t off = 0; off < page_bytes; off += 4096) {
+    uint32_t protect = 0;
+    if (!phys_heap->QueryProtectUnlocked(address + off, &protect) ||
+        !(protect & kMemoryProtectRead)) {
+      return false;
+    }
+  }
+  if (!((__atomic_load_n(&page_upload_hash_valid_[page >> 6],
+                         __ATOMIC_RELAXED) >>
+         (page & 63)) &
+        1)) {
+    return false;
+  }
+  return XXH3_64bits(memory().TranslatePhysical<const uint8_t*>(address),
+                     size_t(page_bytes)) == page_upload_hash_[page];
+}
+
+void SharedMemory::VerifyUnwatchedPages(uint32_t page_first,
+                                        uint32_t page_last) {
+  for (uint32_t b = page_first >> 6; b <= page_last >> 6; ++b) {
+    uint64_t mask = UINT64_MAX;
+    if (b == page_first >> 6) {
+      mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (b == page_last >> 6 && (page_last & 63) != 63) {
+      mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    uint64_t bits =
+        unwatched_pages_[b] & mask &
+        __atomic_load_n(&system_page_flags_valid_[b], __ATOMIC_ACQUIRE);
+    while (bits) {
+      uint32_t bit = 0;
+      xe::bit_scan_forward(bits, &bit);
+      bits &= bits - 1;
+      const uint32_t page = (b << 6) + bit;
+      if (!UnwatchedPageMatchesUpload(page)) {
+        MemoryInvalidationCallbackImpl(page << page_size_log2_,
+                                       uint32_t(1) << page_size_log2_, true,
+                                       true);
+      }
+    }
+  }
+}
+
+void SharedMemory::RewatchPages(uint32_t block, uint64_t mask) {
+  auto global_lock = global_critical_region_.Acquire();
+  mask &= unwatched_pages_[block];
+  if (!mask) {
+    return;
+  }
+  unwatched_pages_[block] &= ~mask;
+  unwatched_page_count_ -= uint32_t(xe::bit_count(mask));
+  // Arm protection before verifying so any racing CPU store faults cleanly.
+  uint64_t valid = mask & system_page_flags_valid_[block];
+  uint64_t runs = valid;
+  while (runs) {
+    uint32_t first = 0;
+    xe::bit_scan_forward(runs, &first);
+    const uint64_t shifted = runs >> first;
+    const uint32_t count =
+        shifted == UINT64_MAX ? 64 - first : uint32_t(xe::tzcnt(~shifted));
+    memory().EnablePhysicalMemoryAccessCallbacks(
+        ((block << 6) + first) << page_size_log2_, count << page_size_log2_,
+        true, false);
+    runs &= ~(count >= 64 ? UINT64_MAX
+                          : (((uint64_t(1) << count) - 1) << first));
+  }
+  while (valid) {
+    uint32_t bit = 0;
+    xe::bit_scan_forward(valid, &bit);
+    valid &= valid - 1;
+    const uint32_t page = (block << 6) + bit;
+    if (!UnwatchedPageMatchesUpload(page)) {
+      MemoryInvalidationCallbackImpl(page << page_size_log2_,
+                                     uint32_t(1) << page_size_log2_, true,
+                                     true);
+    }
+  }
+}
+
+void SharedMemory::OnFrameEndUnwatch() {
+  if (dirty_score_.empty()) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  const bool unwatch_enabled =
+      cvars::shared_memory_unwatch_dynamic_pages &&
+      cvars::shm_coalesce_writewatch_pages;
+  const int32_t decay_frames = std::max(cvars::shm_unwatch_decay_frames, 1);
+  const uint8_t unwatch_score_max =
+      uint8_t(std::clamp(cvars::shm_unwatch_score_max, 1, 255));
+  const uint8_t unwatch_score = uint8_t(
+      std::clamp(cvars::shm_unwatch_score, 1, int32_t(unwatch_score_max)));
+  const bool decay_frame = ++unwatch_decay_counter_ >= uint32_t(decay_frames);
+  if (decay_frame) {
+    unwatch_decay_counter_ = 0;
+  }
+  for (uint32_t b = 0; b < num_system_page_flags_; ++b) {
+    const uint64_t dirty = dirty_this_frame_[b];
+    uint64_t live = dirty | dirty_score_nonzero_[b];
+    uint64_t rewatch = unwatch_enabled ? 0 : unwatched_pages_[b];
+    if (!live && !rewatch) {
+      continue;
+    }
+    dirty_this_frame_[b] = 0;
+    while (live) {
+      uint32_t i = 0;
+      xe::bit_scan_forward(live, &i);
+      live &= live - 1;
+      const uint64_t bit = uint64_t(1) << i;
+      uint8_t& score = dirty_score_[(b << 6) + i];
+      if (dirty & bit) {
+        score = std::min(uint8_t(score + 1), unwatch_score_max);
+      } else if (score && decay_frame) {
+        --score;
+      }
+      if (unwatch_enabled && score >= unwatch_score) {
+        unwatch_candidates_[b] |= bit;
+      } else {
+        unwatch_candidates_[b] &= ~bit;
+      }
+      if (score) {
+        dirty_score_nonzero_[b] |= bit;
+      } else {
+        dirty_score_nonzero_[b] &= ~bit;
+        rewatch |= unwatched_pages_[b] & bit;
+      }
+    }
+    if (rewatch) {
+      RewatchPages(b, rewatch);
+    }
   }
 }
 
@@ -567,13 +912,17 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   uint32_t block_first = page_first >> 6;
   uint32_t block_last = page_last >> 6;
 
+  if (unwatched_page_count_ && !unwatch_skip_verify_) {
+    VerifyUnwatchedPages(page_first, page_last);
+  }
+
   // Lockless fast-path: check if all pages are already valid.
   // This avoids lock acquisition for the common case where pages are resident.
   uint64_t* valid_flags = system_page_flags_valid_;
   if (valid_flags) {
     bool all_valid = true;
     for (uint32_t i = block_first; i <= block_last && all_valid; ++i) {
-      uint64_t block_valid = valid_flags[i];
+      uint64_t block_valid = __atomic_load_n(&valid_flags[i], __ATOMIC_ACQUIRE);
       if (i == block_first) {
         // Mask out pages before page_first
         uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
@@ -590,6 +939,7 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
     }
     if (all_valid) {
       // All pages already valid, nothing to upload
+      MarkRangeUsedInSubmission(start, length);
       return true;
     }
   }
@@ -612,10 +962,13 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
         (std::make_pair(range_start, page_last + 1 - range_start));
   }
   if (!current_upload_range) {
+    MarkRangeUsedInSubmission(start, length);
     return true;
   }
 
-  return UploadRanges(uploads, current_upload_range);
+  const bool uploaded = UploadRanges(uploads, current_upload_range);
+  MarkRangeUsedInSubmission(start, length);
+  return uploaded;
 }
 
 bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) const {
@@ -780,6 +1133,13 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     uint32_t physical_address_start, uint32_t length, bool exact_range) {
+  return MemoryInvalidationCallbackImpl(physical_address_start, length,
+                                        exact_range, false);
+}
+
+std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackImpl(
+    uint32_t physical_address_start, uint32_t length, bool exact_range,
+    bool from_unwatch_verify) {
   if (length == 0 || physical_address_start >= kBufferSize) {
     return std::make_pair(uint32_t(0), UINT32_MAX);
   }
@@ -794,27 +1154,35 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   auto global_lock = global_critical_region_.Acquire();
 
   if (!exact_range) {
-    // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
-    // invalidated - if no GPU-written data nearby that was not intended to be
-    // invalidated since it's not in sync with CPU memory and can't be
-    // reuploaded. It's a lot cheaper to upload some excess data than to catch
-    // access violations - with 4 KB callbacks, 58410824 (being a
-    // software-rendered game) runs at 4 FPS on Intel Core i7-3770, with 64 KB,
-    // the CPU game code takes 3 ms to run per frame, but with 256 KB, it's
-    // 0.7 ms.
-    if (page_first & 63) {
-      uint64_t gpu_written_start =
-          system_page_flags_valid_and_gpu_written_[block_first];
-      gpu_written_start &= (uint64_t(1) << (page_first & 63)) - 1;
-      page_first =
-          (page_first & ~uint32_t(63)) + (64 - xe::lzcnt(gpu_written_start));
+    // Coalesce fault invalidation to an aligned 64 KB block (16 pages on 4 KB
+    // host kernels, 4 pages on 16 KB host kernels) when
+    // shm_coalesce_writewatch_pages is enabled, or 64 pages (256 KB) otherwise,
+    // stopping before any GPU-written page so GPU-authoritative data is kept.
+    const uint32_t subblock_pages =
+        cvars::shm_coalesce_writewatch_pages
+            ? std::clamp<uint32_t>(uint32_t(64 * 1024) >> page_size_log2_, 1u,
+                                   64u)
+            : 64u;
+    const uint32_t subblock_mask = subblock_pages - 1;
+    const uint32_t offset_in_subblock = page_first & subblock_mask;
+    if (offset_in_subblock != 0) {
+      const uint32_t subblock_base_in_word =
+          (page_first & 63) & ~subblock_mask;
+      const uint64_t gpu_written_before =
+          (system_page_flags_valid_and_gpu_written_[block_first] >>
+           subblock_base_in_word) &
+          ((uint64_t(1) << offset_in_subblock) - 1);
+      page_first = (page_first & ~uint32_t(63)) + subblock_base_in_word +
+                   (64 - xe::lzcnt(gpu_written_before));
     }
-    if ((page_last & 63) != 63) {
-      uint64_t gpu_written_end =
-          system_page_flags_valid_and_gpu_written_[block_last];
-      gpu_written_end &= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
-      page_last = (page_last & ~uint32_t(63)) +
-                  (std::max(xe::tzcnt(gpu_written_end), uint8_t(1)) - 1);
+    const uint32_t offset_last = page_last & subblock_mask;
+    if (offset_last != subblock_mask) {
+      const uint32_t rem = subblock_mask - offset_last;
+      uint64_t gpu_written_after =
+          system_page_flags_valid_and_gpu_written_[block_last] >>
+          ((page_last & 63) + 1);
+      gpu_written_after |= uint64_t(1) << rem;
+      page_last += uint32_t(xe::tzcnt(gpu_written_after));
     }
   }
 
@@ -895,9 +1263,27 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     if (i == block_last && (page_last & 63) != 63) {
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
-    system_page_flags_valid_[i] &= ~invalidate_bits;
+    __atomic_fetch_and(&system_page_flags_valid_[i], ~invalidate_bits,
+                       __ATOMIC_RELEASE);
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
-    system_page_flags_invalidated_in_submission_[i] |= invalidate_bits;
+    if (from_unwatch_verify && !system_page_flags_used_in_submission_.empty()) {
+      system_page_flags_invalidated_in_submission_[i] |=
+          invalidate_bits & system_page_flags_used_in_submission_[i];
+    } else {
+      system_page_flags_invalidated_in_submission_[i] |= invalidate_bits;
+    }
+    if (!dirty_this_frame_.empty()) {
+      dirty_this_frame_[i] |= invalidate_bits;
+    }
+    if (!page_upload_hash_valid_.empty()) {
+      __atomic_fetch_and(&page_upload_hash_valid_[i], ~invalidate_bits,
+                         __ATOMIC_RELAXED);
+    }
+    if (cvars::shm_unwatch_release_exclusion && !texture_watched_pages_.empty()) {
+      // FireWatches below unlinks every one-shot range watch on these pages, so
+      // they no longer need dynamic-unwatch exclusion unless re-watched later.
+      texture_watched_pages_[i] &= ~invalidate_bits;
+    }
     // Track which chunks changed for partial copying.
     dirty_blocks_mask |= (1u << (i >> 6));
   }
@@ -940,7 +1326,8 @@ void SharedMemory::PrepareForTraceDownload() {
     // SystemPageFlagsBlock& page_flags_block = system_page_flags_[i];
     uint64_t previously_valid_block = system_page_flags_valid_[i];
     uint64_t gpu_written_block = system_page_flags_valid_and_gpu_written_[i];
-    system_page_flags_valid_[i] = gpu_written_block;
+    __atomic_store_n(&system_page_flags_valid_[i], gpu_written_block,
+                     __ATOMIC_RELEASE);
 
     // Fire watches on the invalidated pages.
     uint64_t fire_watches_block = previously_valid_block & ~gpu_written_block;

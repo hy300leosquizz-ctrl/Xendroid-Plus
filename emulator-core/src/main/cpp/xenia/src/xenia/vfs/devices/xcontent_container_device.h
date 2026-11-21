@@ -12,11 +12,13 @@
 
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <string_view>
 
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/vfs/device.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
+#include "xenia/vfs/file.h"
 
 namespace xe {
 namespace vfs {
@@ -33,11 +35,21 @@ class XContentContainerDevice : public Device {
       const std::string_view mount_path,
       const std::filesystem::path& host_path);
 
+  // A device for the STFS package stored in |entry|, whose device has to
+  // outlive it.
+  static std::unique_ptr<XContentContainerDevice> CreateContentDevice(
+      const std::string_view mount_path, Entry* entry);
+
   static std::unique_ptr<XContentContainerHeader> ReadContainerHeader(
       const std::filesystem::path& file_path);
 
+  static bool IsContainerFile(const std::filesystem::path& host_path);
+
   static std::unique_ptr<XContentContainerHeader> ReadContainerHeader(
       FILE* host_file);
+
+  static std::unique_ptr<XContentContainerHeader> ReadContainerHeader(
+      File* file);
 
   ~XContentContainerDevice() override;
 
@@ -50,11 +62,13 @@ class XContentContainerDevice : public Device {
   uint32_t bytes_per_sector() const override { return 0x200; }
 
   size_t data_size() const {
-    if (header_->content_header.header_size) {
-      return files_total_size_ -
-             xe::round_up(header_->content_header.header_size, kBlockSize);
-    }
-    return files_total_size_ - sizeof(XContentContainerHeader);
+    const size_t header_bytes =
+        header_->content_header.header_size
+            ? xe::round_up<size_t>(header_->content_header.header_size,
+                                   kBlockSize)
+            : sizeof(XContentContainerHeader);
+    return files_total_size_ > header_bytes ? files_total_size_ - header_bytes
+                                            : 0;
   }
 
   uint64_t xuid() const { return header_->content_metadata.profile_id; }
@@ -75,13 +89,29 @@ class XContentContainerDevice : public Device {
   kernel::xam::XCONTENT_AGGREGATE_DATA content_header() const;
   uint32_t license_mask() const { return LicenseMaskFromHeader(*header_); }
 
+  const std::filesystem::path& GetHostPath() const { return host_path_; }
+  const Entry* package_entry() const {
+    return package_file_ ? package_file_->entry() : nullptr;
+  }
+
   const XContentContainerHeader* GetContainerHeader() const {
     return header_.get();
   }
 
  protected:
+  // |host_header| is what CreateContentDevice read of the host file, of
+  // |files_size| bytes.
+  XContentContainerDevice(const std::string_view mount_path,
+                          const std::filesystem::path& host_path,
+                          std::unique_ptr<XContentContainerHeader> host_header,
+                          size_t files_size);
+  // Legacy constructor compatibility.
   XContentContainerDevice(const std::string_view mount_path,
                           const std::filesystem::path& host_path);
+  // Takes ownership of |package_file|.
+  XContentContainerDevice(const std::string_view mount_path,
+                          File* package_file);
+
   enum class Result {
     kSuccess = 0,
     kOutOfMemory = -1,
@@ -92,15 +122,12 @@ class XContentContainerDevice : public Device {
   };
 
   virtual Result Read() = 0;
-  // Load all host files. Usually STFS is only 1 file, meanwhile SVOD is usually
-  // multiple file.
   virtual Result LoadHostFiles() = 0;
-  // Initialize container specific fields.
   virtual void SetupContainer() {};
 
   Entry* ResolvePath(const std::string_view path) override;
   void Dump(StringBuffer* string_buffer) override;
-  Result ReadHeaderAndVerify(FILE* header_file);
+  Result VerifyHeader(std::unique_ptr<XContentContainerHeader> header);
 
   void SetName(std::string name) { name_ = name; }
   const std::string& GetName() const { return name_; }
@@ -108,17 +135,17 @@ class XContentContainerDevice : public Device {
   void SetFilesSize(uint64_t files_size) { files_total_size_ = files_size; }
   const uint64_t GetFilesSize() const { return files_total_size_; }
 
-  const std::filesystem::path& GetHostPath() const { return host_path_; }
-
   std::string name_;
   std::filesystem::path host_path_;
+  File* package_file_ = nullptr;
 
   size_t files_total_size_;
   std::unique_ptr<Entry> root_entry_;
   std::unique_ptr<XContentContainerHeader> header_;
+  std::unique_ptr<XContentContainerHeader> host_header_;
 };
 
 }  // namespace vfs
 }  // namespace xe
 
-#endif
+#endif  // XENIA_VFS_DEVICES_XCONTENT_CONTAINER_DEVICE_H_

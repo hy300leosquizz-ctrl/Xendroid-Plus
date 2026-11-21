@@ -268,7 +268,7 @@ class GameCards(
                 subtitle = names.joinToString(", ").ifEmpty { stringResource(R.string.lib_no_collection) }) {
                 XdButton(stringResource(R.string.xd_data_edit), { actions.editCollections(game) }, size = XdButtonSize.SM, kind = XdButtonKind.GHOST)
             }
-            if (game.format == GameFormat.ISO) XdListRow(stringResource(R.string.lib_compress), icon = XdIcons.zip,
+            if (xendroid.compose.ui.compress.GameCompressViewModel.canCompressFormat(game.format)) XdListRow(stringResource(R.string.lib_compress), icon = XdIcons.zip,
                 subtitle = stringResource(R.string.xd_data_compress_sub)) {
                 XdButton(stringResource(R.string.xd_data_compress), { actions.compress(game) }, size = XdButtonSize.SM, kind = XdButtonKind.GHOST)
             }

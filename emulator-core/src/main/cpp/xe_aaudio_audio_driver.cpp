@@ -51,6 +51,15 @@ static constexpr uint32_t kStatsIntervalMs = 1000;
 
 // Sink depth, in blocks, below which playback slows to buy the producer time.
 static constexpr uint32_t kRateControlDepth = 3;
+// Queue depth above which post-pause / catch-up backlog gently drains at 1.005x.
+static constexpr uint32_t kHighQueueDrainDepth = 6;
+
+// Loudness Guard constants (ported from XDroid360 bf84217bb, BSD-3-Clause):
+// ~6 ms smooth ramp-in at 48 kHz after pause/resume or >250 ms callback stall,
+// plus transparent RMS ceiling (0.45f) that engages only on transient blasts.
+static constexpr uint32_t kPostStallRampFrames = 288;
+static constexpr uint64_t kCallbackStallNs = 250'000'000ULL;
+static constexpr float kLoudnessGuardMaxRms = 0.45f;
 
 AAudioAudioDriver::AAudioAudioDriver(Memory* memory,
                                      xe::threading::Semaphore* semaphore,
@@ -64,14 +73,12 @@ AAudioAudioDriver::AAudioAudioDriver(Memory* memory,
       submit_samples_(channels * (channels == 6 ? 256 : 768)),
       host_block_samples_(host_frame_channels_ *
                           (channels == 6 ? 256 : 768)),
-      renderer_(channels == 6 ? 256 : 768, channels) {
+      renderer_(channels == 6 ? 256 : 768, channels),
+      post_stall_ramp_pos_(kPostStallRampFrames) {
   assert_true(channels == 6 || channels == 2);
 }
 
-AAudioAudioDriver::~AAudioAudioDriver() {
-  assert_true(frames_queued_.empty());
-  assert_true(frames_unused_.empty());
-}
+AAudioAudioDriver::~AAudioAudioDriver() = default;
 
 bool AAudioAudioDriver::Initialize() {
   // The game's 5.1 or the media player's stereo: blocks of any other count
@@ -80,13 +87,10 @@ bool AAudioAudioDriver::Initialize() {
     XELOGE("AAudio: {} channels, not 2 or 6", frame_channels_);
     return false;
   }
-  {
-    std::unique_lock<std::mutex> guard(frames_mutex_);
-    for (int i = 0; i < 2; i++) {
-      float* buffer = new float[submit_samples_];
-      frames_unused_.push(buffer);
-    }
-  }
+
+  ring_storage_.assign(size_t(kRingCapacity) * submit_samples_, 0.0f);
+  ring_write_.store(0, std::memory_order_relaxed);
+  ring_read_.store(0, std::memory_order_relaxed);
 
   {
     std::unique_lock<std::mutex> stream_guard(stream_mutex_);
@@ -121,9 +125,6 @@ bool AAudioAudioDriver::BuildStream() {
     AAudioStreamBuilder_setPerformanceMode(builder_,
                                            AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     AAudioStreamBuilder_setSharingMode(builder_, mode);
-    // A low-latency stream is otherwise granted the shallowest buffer the
-    // device allows. AAudio requires capacity >= twice the callback size.
-    // 15j: room for the adaptive buffer to grow into, when it is on.
     AAudioStreamBuilder_setBufferCapacityInFrames(
         builder_, channel_samples_ * (cvars::apu_aaudio_adaptive_buffer
                                           ? tuner_.max_bursts()
@@ -139,9 +140,15 @@ bool AAudioAudioDriver::BuildStream() {
       continue;
     }
 
+    // Publish active_stream_ and request a smooth fade-in BEFORE starting the
+    // stream so any immediate callback or error callback sees valid state.
+    active_stream_.store(stream_, std::memory_order_release);
+    fade_request_.store(true, std::memory_order_release);
+
     result = AAudioStream_requestStart(stream_);
     if (result != AAUDIO_OK) {
       XELOGE("AAudioStream_requestStart failed: {}", result);
+      active_stream_.store(nullptr, std::memory_order_release);
       AAudioStream_close(stream_);
       stream_ = nullptr;
       AAudioStreamBuilder_delete(builder_);
@@ -167,7 +174,6 @@ bool AAudioAudioDriver::BuildStream() {
                                 : cvars::apu_aaudio_buffer_bursts));
     }
 
-    // Requested and granted config frequently differ.
     XELOGI(
         "AAudio: {} stream, rate {}, {} ch, burst {}, callback {} (asked {}), "
         "buffer {}/{} frames, perf mode {}",
@@ -197,9 +203,9 @@ void AAudioAudioDriver::Pause() {
 void AAudioAudioDriver::Resume() {
   std::unique_lock<std::mutex> stream_guard(stream_mutex_);
   // Resuming at the rate the drained queue asked for would play slow; the
-  // next callback starts the rate over (block position and resampler history
-  // carry over, so playback stays continuous).
+  // next callback starts the rate over and smoothly fades in over ~6 ms.
   rate_reset_.store(true, std::memory_order_release);
+  fade_request_.store(true, std::memory_order_release);
   stat_rate_milli_.store(1000, std::memory_order_relaxed);
   if (stream_initialized_ && stream_) {
     AAudioStream_requestStart(stream_);
@@ -207,14 +213,77 @@ void AAudioAudioDriver::Resume() {
 }
 
 size_t AAudioAudioDriver::GetQueuedFrameCount() {
-  std::unique_lock<std::mutex> guard(frames_mutex_);
-  return frames_queued_.size();
+  const uint32_t w = ring_write_.load(std::memory_order_acquire);
+  const uint32_t r = ring_read_.load(std::memory_order_acquire);
+  return static_cast<size_t>(w - r);
 }
 
 void AAudioAudioDriver::SetVolume(float volume) {
   // AAudio has no per-stream volume; applied to the samples in the callback.
   driver_volume_.store(std::clamp(volume, 0.0f, 1.0f),
                        std::memory_order_relaxed);
+}
+
+void AAudioAudioDriver::ApplyLoudnessGuardAndRamp(float* stereo_out,
+                                                  int32_t num_frames,
+                                                  uint64_t now_ns) {
+  if (num_frames <= 0) {
+    return;
+  }
+  const bool stall_detected =
+      last_callback_ns_ != 0 && (now_ns - last_callback_ns_) > kCallbackStallNs;
+  last_callback_ns_ = now_ns;
+
+  if (fade_request_.exchange(false, std::memory_order_acquire) ||
+      stall_detected) {
+    post_stall_ramp_pos_ = 0;
+  }
+
+  // Compute block RMS across stereo samples.
+  const size_t sample_count = static_cast<size_t>(num_frames) * 2;
+  float sum_sq = 0.0f;
+  for (size_t i = 0; i < sample_count; ++i) {
+    const float s = stereo_out[i];
+    sum_sq += s * s;
+  }
+  const float rms = std::sqrt(sum_sq / static_cast<float>(sample_count));
+
+  // Instant attack when RMS exceeds ceiling; gentle release back to unity.
+  float target_limiter = 1.0f;
+  if (rms > kLoudnessGuardMaxRms && rms > 1e-6f) {
+    target_limiter = kLoudnessGuardMaxRms / rms;
+  }
+  const float start_limiter = limiter_gain_;
+  if (target_limiter < limiter_gain_) {
+    limiter_gain_ = target_limiter;
+  } else {
+    limiter_gain_ += 0.05f * (target_limiter - limiter_gain_);
+    if (limiter_gain_ > 0.9995f) {
+      limiter_gain_ = 1.0f;
+    }
+  }
+
+  const bool need_limiter = (start_limiter < 0.9999f || limiter_gain_ < 0.9999f);
+  const bool need_ramp = (post_stall_ramp_pos_ < kPostStallRampFrames);
+  if (!need_limiter && !need_ramp) {
+    return;
+  }
+
+  const float inv_frames = 1.0f / static_cast<float>(num_frames);
+  const float limiter_step = (limiter_gain_ - start_limiter) * inv_frames;
+  float cur_lim = start_limiter;
+
+  for (int32_t f = 0; f < num_frames; ++f) {
+    float env = cur_lim;
+    cur_lim += limiter_step;
+    if (post_stall_ramp_pos_ < kPostStallRampFrames) {
+      env *= static_cast<float>(post_stall_ramp_pos_) /
+             static_cast<float>(kPostStallRampFrames);
+      ++post_stall_ramp_pos_;
+    }
+    stereo_out[size_t(f) * 2] *= env;
+    stereo_out[size_t(f) * 2 + 1] *= env;
+  }
 }
 
 aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
@@ -224,14 +293,14 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
     int32_t numFrames) {
   SCOPE_profile_cpu_f("apu");
   const auto callback_begin = std::chrono::steady_clock::now();
+  const uint64_t begin_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          callback_begin.time_since_epoch())
+          .count());
 
   auto driver = static_cast<AAudioAudioDriver*>(userdata);
   float* output_buffer = reinterpret_cast<float*>(audioData);
 
-  // setFramesPerDataCallback is only a request, renegotiated on the
-  // shared-mode fallback and on every rebuild. The conversion below uses
-  // channel_samples_ as its source stride, so it must run at that size
-  // whatever this callback was handed.
   if (numFrames != static_cast<int32_t>(driver->channel_samples_)) {
     driver->stat_unexpected_frames_.store(numFrames, std::memory_order_relaxed);
   }
@@ -241,20 +310,25 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
   if (driver->rate_reset_.exchange(false, std::memory_order_acquire)) {
     driver->rate_ = 1.0f;
   }
-  // Queue depth steers the resample rate, slewed to avoid zipper noise: a
-  // producer below real time bends pitch instead of gapping.
-  uint32_t depth_now;
-  {
-    std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-    depth_now = static_cast<uint32_t>(driver->frames_queued_.size());
-  }
-  // Only once the sink is close to running dry, and always below the depth the
-  // producer refills to (AudioSystem's top-up line) - bending pitch at a depth
-  // the producer is content with leaves the rate permanently modulated.
+
+  // Lock-free SPSC queue depth read (acquire pairs with SubmitFrame release).
+  const uint32_t w = driver->ring_write_.load(std::memory_order_acquire);
+  const uint32_t r = driver->ring_read_.load(std::memory_order_relaxed);
+  const uint32_t depth_now = w - r;
+
+  // Dynamic rate control:
+  // - Below kRateControlDepth (3 blocks): bend pitch down toward 0.90x instead
+  //   of gapping/clicking.
+  // - Above kHighQueueDrainDepth (6 blocks): gently drain post-pause / catch-up
+  //   backlog at 1.005x (+8.6 cents, inaudible) back to steady-state latency.
   float rate_target = 1.0f;
-  if (cvars::apu_aaudio_dynamic_rate && depth_now < kRateControlDepth) {
-    rate_target =
-        std::max(0.90f, 1.0f - 0.05f * float(kRateControlDepth - depth_now));
+  if (cvars::apu_aaudio_dynamic_rate) {
+    if (depth_now < kRateControlDepth) {
+      rate_target =
+          std::max(0.90f, 1.0f - 0.05f * float(kRateControlDepth - depth_now));
+    } else if (depth_now > kHighQueueDrainDepth) {
+      rate_target = 1.005f;
+    }
   }
   driver->rate_ +=
       std::clamp(rate_target - driver->rate_, -0.003f, 0.003f);
@@ -272,6 +346,8 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
   if (result.clipped) {
     driver->stat_clipped_.fetch_add(result.clipped, std::memory_order_relaxed);
   }
+
+  driver->ApplyLoudnessGuardAndRamp(output_buffer, numFrames, begin_ns);
 
   // One tick per block consumed, so pacing holds when the callback size is
   // not a whole block. Tick once on underrun to keep the guest engine running.
@@ -298,16 +374,10 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
 }
 
 const float* AAudioAudioDriver::NextGuestBlock() {
-  float* buffer = nullptr;
-  uint32_t depth = 0;
-  {
-    std::unique_lock<std::mutex> guard(frames_mutex_);
-    depth = static_cast<uint32_t>(frames_queued_.size());
-    if (!frames_queued_.empty()) {
-      buffer = frames_queued_.front();
-      frames_queued_.pop();
-    }
-  }
+  const uint32_t r = ring_read_.load(std::memory_order_relaxed);
+  const uint32_t w = ring_write_.load(std::memory_order_acquire);
+  const uint32_t depth = w - r;
+
   stat_queue_depth_sum_.fetch_add(depth, std::memory_order_relaxed);
   if (depth > stat_queue_depth_max_.load(std::memory_order_relaxed)) {
     stat_queue_depth_max_.store(depth, std::memory_order_relaxed);
@@ -315,12 +385,11 @@ const float* AAudioAudioDriver::NextGuestBlock() {
   if (depth < stat_queue_depth_min_.load(std::memory_order_relaxed)) {
     stat_queue_depth_min_.store(depth, std::memory_order_relaxed);
   }
-  // Before the guest's first block the device only plays startup silence: not
-  // an underrun anyone hears, so the run summary starts counting after it.
+
   if (played_once_) {
     ae::RunStats().blocks.fetch_add(1, std::memory_order_relaxed);
   }
-  if (!buffer) {
+  if (depth == 0) {
     stat_gaps_.fetch_add(1, std::memory_order_relaxed);
     if (played_once_) {
       ae::RunStats().concealed.fetch_add(1, std::memory_order_relaxed);
@@ -331,12 +400,12 @@ const float* AAudioAudioDriver::NextGuestBlock() {
     played_once_ = true;
     ae::RunStats().blocks.fetch_add(1, std::memory_order_relaxed);
   }
-  return buffer;
+  return &ring_storage_[size_t(r & kRingMask) * submit_samples_];
 }
 
-void AAudioAudioDriver::ReturnGuestBlock(const float* block) {
-  std::unique_lock<std::mutex> guard(frames_mutex_);
-  frames_unused_.push(const_cast<float*>(block));
+void AAudioAudioDriver::ReturnGuestBlock(const float* /*block*/) {
+  const uint32_t r = ring_read_.load(std::memory_order_relaxed);
+  ring_read_.store(r + 1, std::memory_order_release);
 }
 
 void AAudioAudioDriver::LogAndResetStats() {
@@ -387,9 +456,13 @@ void AAudioAudioDriver::AudioErrorCallback(
     void* userdata,
     aaudio_result_t error) {
   auto driver = static_cast<AAudioAudioDriver*>(userdata);
-  // A route change (headphones/BT) disconnects the stream; it must be reopened
-  // on the new default device. AAudio forbids closing the stream from this
-  // callback, so just flag a request for recovery_thread_.
+  // Ignore late error callbacks from an already-retired stream during BT/USB
+  // route changes so a dying stream cannot tear down its newly-opened successor
+  // (fixes Bluetooth reconnect race, XDroid360 b4cc8eb9c).
+  if (stream != driver->active_stream_.load(std::memory_order_acquire)) {
+    XELOGI("AAudio: ignoring stale error {} from retired stream", error);
+    return;
+  }
   XELOGW("AAudio stream error: {} - requesting stream rebuild", error);
   {
     std::lock_guard<std::mutex> lk(driver->recovery_mutex_);
@@ -398,16 +471,31 @@ void AAudioAudioDriver::AudioErrorCallback(
   driver->recovery_cv_.notify_one();
 }
 
+void AAudioAudioDriver::DrainWhileDisconnectedLocked(uint32_t max_blocks) {
+  // Called ONLY under stream_mutex_ when stream_initialized_ == false (so no
+  // AAudio callback thread exists), preserving single-consumer ring_read_ safety.
+  uint32_t r = ring_read_.load(std::memory_order_relaxed);
+  const uint32_t w = ring_write_.load(std::memory_order_acquire);
+  const uint32_t avail = w - r;
+  const uint32_t to_drain = std::min(avail, max_blocks);
+  if (to_drain > 0) {
+    ring_read_.store(r + to_drain, std::memory_order_release);
+    semaphore_->Release(static_cast<int>(to_drain), nullptr);
+  }
+}
+
 void AAudioAudioDriver::RecoveryThreadMain() {
   bool retry_pending = false;
+  // Blocks produced per 50 ms retry tick (~9 blocks at 48 kHz / 256 samples).
+  const uint32_t blocks_per_retry_tick =
+      std::max<uint32_t>(1u, (frame_frequency_ / 20u) / channel_samples_);
+
   for (;;) {
     {
       std::unique_lock<std::mutex> lk(recovery_mutex_);
       auto wake = [this] { return restart_requested_ || recovery_quit_; };
-      // A failed rebuild leaves no stream to re-trigger us, so poll to retry.
-      // The callback cannot log from a realtime thread, so publish for it.
       if (retry_pending) {
-        recovery_cv_.wait_for(lk, std::chrono::milliseconds(250), wake);
+        recovery_cv_.wait_for(lk, std::chrono::milliseconds(50), wake);
       } else {
         recovery_cv_.wait_for(lk, std::chrono::milliseconds(kStatsIntervalMs),
                               wake);
@@ -415,7 +503,7 @@ void AAudioAudioDriver::RecoveryThreadMain() {
       if (recovery_quit_) {
         return;
       }
-      if (!restart_requested_) {
+      if (!restart_requested_ && !retry_pending) {
         lk.unlock();
         const uint32_t fresh_xruns = PublishXRuns();
         if (cvars::apu_aaudio_adaptive_buffer) {
@@ -426,11 +514,18 @@ void AAudioAudioDriver::RecoveryThreadMain() {
         }
         continue;
       }
+      // Clear BEFORE RestartStream so a new error arriving on the freshly built
+      // stream during or immediately after BuildStream is never swallowed!
       restart_requested_ = false;
     }
-    // The old stream's last xruns, before the rebuild resets its count.
     PublishXRuns();
     retry_pending = !RestartStream();
+    if (retry_pending) {
+      std::unique_lock<std::mutex> stream_guard(stream_mutex_);
+      if (!stream_initialized_) {
+        DrainWhileDisconnectedLocked(blocks_per_retry_tick);
+      }
+    }
   }
 }
 
@@ -465,8 +560,7 @@ void AAudioAudioDriver::AdaptBuffer(uint32_t fresh_xruns) {
 bool AAudioAudioDriver::RestartStream() {
   std::unique_lock<std::mutex> stream_guard(stream_mutex_);
   XELOGW("AAudio: rebuilding stream on the current default output device");
-  // Safe here (not the callback thread): close() blocks until the data callback
-  // returns.
+  active_stream_.store(nullptr, std::memory_order_release);
   if (stream_) {
     AAudioStream_requestStop(stream_);
     AAudioStream_close(stream_);
@@ -478,13 +572,10 @@ bool AAudioAudioDriver::RestartStream() {
   }
   stream_initialized_ = false;
 
-  // Shutting down: tear down only, don't reopen.
   if (shutting_down_.load(std::memory_order_acquire)) {
     return true;
   }
 
-  // The new stream's data callback resumes the pacing semaphore on its own, so
-  // the AudioSystem worker recovers without changes.
   if (BuildStream()) {
     XELOGI("AAudio: stream rebuilt; audio output restored");
     return true;
@@ -494,28 +585,20 @@ bool AAudioAudioDriver::RestartStream() {
 }
 
 void AAudioAudioDriver::SubmitFrame(float* samples) {
-  float* output_frame;
-  {
-    std::unique_lock<std::mutex> guard(frames_mutex_);
-    if (frames_unused_.empty()) {
-      output_frame = new float[submit_samples_];
-    } else {
-      output_frame = frames_unused_.top();
-      frames_unused_.pop();
-    }
+  const uint32_t w = ring_write_.load(std::memory_order_relaxed);
+  const uint32_t r = ring_read_.load(std::memory_order_acquire);
+  if (w - r >= kRingCapacity) {
+    // Defensive guard if apu_max_queued_frames ever exceeds kRingCapacity:
+    // drop the incoming block rather than corrupting an in-flight callback read.
+    semaphore_->Release(1, nullptr);
+    return;
   }
-
-  std::memcpy(output_frame, samples, submit_samples_ * sizeof(float));
-
-  {
-    std::unique_lock<std::mutex> guard(frames_mutex_);
-    frames_queued_.push(output_frame);
-  }
+  float* dst = &ring_storage_[size_t(w & kRingMask) * submit_samples_];
+  std::memcpy(dst, samples, submit_samples_ * sizeof(float));
+  ring_write_.store(w + 1, std::memory_order_release);
 }
 
 void AAudioAudioDriver::Shutdown() {
-  // Stop and join the recovery worker before tearing down the stream, so no
-  // rebuild is in flight while we do.
   shutting_down_.store(true, std::memory_order_release);
   {
     std::lock_guard<std::mutex> lk(recovery_mutex_);
@@ -528,6 +611,7 @@ void AAudioAudioDriver::Shutdown() {
 
   {
     std::unique_lock<std::mutex> stream_guard(stream_mutex_);
+    active_stream_.store(nullptr, std::memory_order_release);
     if (stream_) {
       AAudioStream_requestStop(stream_);
       AAudioStream_close(stream_);
@@ -542,16 +626,9 @@ void AAudioAudioDriver::Shutdown() {
     stream_initialized_ = false;
   }
 
-  std::unique_lock<std::mutex> guard(frames_mutex_);
-  while (!frames_unused_.empty()) {
-    delete[] frames_unused_.top();
-    frames_unused_.pop();
-  }
-
-  while (!frames_queued_.empty()) {
-    delete[] frames_queued_.front();
-    frames_queued_.pop();
-  }
+  ring_write_.store(0, std::memory_order_relaxed);
+  ring_read_.store(0, std::memory_order_relaxed);
+  ring_storage_.clear();
 }
 
 }  // namespace aaudio

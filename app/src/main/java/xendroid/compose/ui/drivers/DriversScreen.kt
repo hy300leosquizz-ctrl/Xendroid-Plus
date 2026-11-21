@@ -41,6 +41,7 @@ import kotlinx.coroutines.withContext
 import xendroid.compose.R
 import xendroid.compose.driver.DriverInfo
 import xendroid.compose.driver.DriverPackageIO
+import xendroid.compose.driver.DriverProbeActivity
 import xendroid.compose.driver.DriverRepository
 import xendroid.compose.driver.DriverSources
 import xendroid.compose.driver.DriverSuggestion
@@ -110,6 +111,9 @@ class DriversState(private val context: Context, private val global: SettingsVie
     var selectedAt by mutableStateOf(prefs.getLong("selected_at_global_$KEY", 0L).takeIf { it > 0 })
         private set
     val gpu: String? = xendroid.compose.core.EmulatorRuntime.gpuDeviceName
+    /** Launches isolated `:driver_probe` verification before persisting a newly imported/downloaded custom driver. */
+    internal var launchProbe: ((String) -> Unit)? = null
+    private var pendingProbeTarget: Triple<String, String, Int?>? = null
 
     fun refresh() {
         scope.launch {
@@ -129,6 +133,42 @@ class DriversState(private val context: Context, private val global: SettingsVie
         prefs.edit().putString("previous_global_$KEY", current).putLong("selected_at_global_$KEY", now).apply()
         SettingsSchema.byKey[KEY]?.let { global.setRaw(it, path) }
         toast.show(context.getString(R.string.drv_next_launch, driverName(context, path)))
+    }
+
+    /** Probes [path] in `:driver_probe` before persisting selection; skips repeat probes once verified on this device. */
+    fun probeAndSelect(path: String, current: String, successToastRes: Int? = null) {
+        if (path.isBlank()) { select("", current); return }
+        if (prefs.getBoolean("probed_ok_$path", false)) {
+            select(path, current)
+            successToastRes?.let { toast.show(context.getString(it)) }
+            return
+        }
+        val launcher = launchProbe
+        if (launcher == null) {
+            select(path, current)
+            successToastRes?.let { toast.show(context.getString(it)) }
+            return
+        }
+        pendingProbeTarget = Triple(path, current, successToastRes)
+        launcher(path)
+    }
+
+    fun onProbeFinished(outcome: DriverProbeActivity.ProbeOutcome) {
+        val target = pendingProbeTarget ?: return
+        pendingProbeTarget = null
+        val (path, current, successToastRes) = target
+        when (outcome) {
+            is DriverProbeActivity.ProbeOutcome.Passed -> {
+                prefs.edit().putBoolean("probed_ok_$path", true)
+                    .putString("probed_gpu_$path", "${outcome.deviceName} (Vulkan ${outcome.apiVersion})").apply()
+                select(path, current)
+                val base = successToastRes?.let(context::getString)
+                toast.show(base ?: context.getString(R.string.drv_probe_passed, outcome.deviceName, outcome.apiVersion))
+            }
+            is DriverProbeActivity.ProbeOutcome.Failed -> {
+                toast.show(context.getString(R.string.drv_probe_failed, outcome.reason))
+            }
+        }
     }
 
     fun loadAvailable(force: Boolean = false) {
@@ -163,8 +203,11 @@ class DriversState(private val context: Context, private val global: SettingsVie
                             prefs.edit().putString("installed_${driver.url}", result.library.absolutePath)
                                 .putString("digest_${driver.url}", result.sha256).apply()
                             InstalledDrivers.forget()
-                            select(result.library.absolutePath, current)
-                            toast.show(context.getString(if (result.verifiedDownload) R.string.drv_installed_verified else R.string.drv_installed_unverified))
+                            probeAndSelect(
+                                result.library.absolutePath,
+                                current,
+                                if (result.verifiedDownload) R.string.drv_installed_verified else R.string.drv_installed_unverified,
+                            )
                         }
                         .onFailure { toast.show(context.getString(R.string.drv_install_failed, it.message)) }
                 }
@@ -182,8 +225,7 @@ class DriversState(private val context: Context, private val global: SettingsVie
             try {
                 val result = DriverPackageIO.import(context, uri)
                 InstalledDrivers.forget()
-                select(result.library.absolutePath, current)
-                toast.show(context.getString(R.string.drv_imported))
+                probeAndSelect(result.library.absolutePath, current, R.string.drv_imported)
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 toast.show(context.getString(R.string.drv_import_failed, e.message))
@@ -246,6 +288,8 @@ fun DriversScreen(
     val current = values[KEY]?.raw.orEmpty()
     var section by rememberSaveable { mutableStateOf(initialSection) }
     LaunchedEffect(section) { if (section == "drv:avail") state.loadAvailable() }
+    val probeLauncher = rememberLauncherForActivityResult(DriverProbeActivity.Contract()) { state.onProbeFinished(it) }
+    state.launchProbe = { path -> probeLauncher.launch(path) }
     val pickZip = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) state.import(uri, current) }
     var removing by remember { mutableStateOf<InstalledDriverPackage?>(null) }
     val gamesWithDriver = gameValues.filterValues { KEY in it }
@@ -342,8 +386,8 @@ private fun NowBody(
             }
         }
         val suggested = state.available?.let { DriverSuggestion.suggest(it, state.gpu) }
-        val model = DriverSuggestion.adrenoModel(state.gpu)
-        if (suggested != null && model != null) XdCard(title = stringResource(R.string.drv_suggested, model), icon = XdIcons.spark) {
+        val model = DriverSuggestion.gpuBadgeLabel(state.gpu)
+        if (suggested != null && model != null) XdCard(title = stringResource(R.string.drv_suggested_gpu, model), icon = XdIcons.spark) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(suggested.name, style = XdText.label, color = c.fg)
                 if (suggested.sha256.isNotBlank()) XdBadge(stringResource(R.string.xd_drv_badge_sha), tone = BadgeTone.OK)
@@ -399,7 +443,7 @@ private fun InstalledBody(state: DriversState, current: String, games: Map<Strin
                             if (usedByGames) XdBadge(stringResource(R.string.xd_drv_badge_games))
                         }) {
                         if (!inUse) {
-                            XdButton(stringResource(R.string.drv_use), { state.select(path, current) }, size = XdButtonSize.SM)
+                            XdButton(stringResource(R.string.drv_use), { state.probeAndSelect(path, current) }, size = XdButtonSize.SM)
                             XdButton(stringResource(R.string.common_remove), { onRemove(d) }, size = XdButtonSize.SM, kind = XdButtonKind.GHOST)
                         }
                     }
@@ -438,7 +482,7 @@ private fun AvailableBody(state: DriversState, current: String) {
                             subtitle = listOfNotNull(d.version, d.source.takeIf { it.isNotEmpty() && state.sources.size > 1 }?.let { stringResource(R.string.drv_from, it) },
                                 d.publishedAt.take(10).ifEmpty { null }).joinToString(" · "),
                             badges = {
-                                if (d == suggested) DriverSuggestion.adrenoModel(state.gpu)?.let { XdBadge(stringResource(R.string.drv_suggested, it), tone = BadgeTone.ACCENT) }
+                                if (d == suggested) DriverSuggestion.gpuBadgeLabel(state.gpu)?.let { XdBadge(stringResource(R.string.drv_suggested_gpu, it), tone = BadgeTone.ACCENT) }
                                 if (d.sha256.isNotBlank()) XdBadge(stringResource(R.string.xd_drv_badge_sha), tone = BadgeTone.OK)
                                 else XdBadge(stringResource(R.string.drv_no_checksum), tone = BadgeTone.WARN)
                             }) {

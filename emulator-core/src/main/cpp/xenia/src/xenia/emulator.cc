@@ -72,12 +72,18 @@
 #include "xenia/vfs/file.h"
 #include "xenia/vfs/virtual_file_system.h"
 #include "xenia/vfs/xex_metadata.h"
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+#include "xenia/vfs/saf_tree_device.h"
+#endif
 
 #if XE_PLATFORM_xendroid
 #include "third_party/zarchive/include/zarchive/zarchivecommon.h"
 #include "third_party/zarchive/include/zarchive/zarchivereader.h"
 #include "third_party/zarchive/include/zarchive/zarchivewriter.h"
 #include "third_party/zarchive/src/sha_256.h"
+#if defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
 #endif
 
 #if XE_ARCH_AMD64
@@ -276,6 +282,7 @@ void Emulator::Shutdown() {
   title_version_.clear();
   game_info_database_.reset();
   paused_ = false;
+  Clock::HoldGuestTime(false);
 
   XELOGI("Emulator::Shutdown: teardown complete");
 }
@@ -520,6 +527,29 @@ const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
     case FileSignatureType::XEX1:
     case FileSignatureType::XEX2:
     case FileSignatureType::ELF: {
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+      const std::string path_utf8 = xe::path_to_utf8(path);
+      if (vfs::saf::IsSafContentUri(path_utf8)) {
+        std::string parent_doc_id;
+        std::string leaf_name;
+        const bool has_parent = vfs::saf::DeriveSafParentDocumentId(
+            path_utf8, parent_doc_id, leaf_name);
+        auto xex = has_parent ? vfs::ExtractXexMetadata(path) : std::nullopt;
+        device = std::make_unique<vfs::SafTreeDevice>(
+            mount_path, path_utf8, has_parent ? parent_doc_id : std::string(),
+            xex && xex->RunsFromPackageOnly() ? "STFS" : "GDFX");
+        break;
+      }
+      std::error_code dir_ec;
+      if (std::filesystem::is_directory(path, dir_ec)) {
+        const auto default_xex = path / "default.xex";
+        auto xex = vfs::ExtractXexMetadata(default_xex);
+        device = std::make_unique<vfs::HostPathDevice>(
+            mount_path, path, !cvars::allow_game_relative_writes, false,
+            xex && xex->RunsFromPackageOnly() ? "STFS" : "GDFX");
+        break;
+      }
+#endif
       // An unpacked package's executable says where it came from, wherever
       // the files now are.
       auto xex = vfs::ExtractXexMetadata(path);
@@ -624,20 +654,103 @@ X_STATUS Emulator::MountPath(const std::filesystem::path& path,
 
 Emulator::FileSignatureType Emulator::GetFileSignature(
     const std::filesystem::path& path) {
+  constexpr int64_t header_size = 4;
+  char file_magic[header_size] = {};
+  char tail_magic[header_size] = {};
+  bool have_tail_magic = false;
+
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  const std::string path_utf8 = xe::path_to_utf8(path);
+  if (vfs::saf::IsSafContentUri(path_utf8)) {
+    const int fd = vfs::saf::OpenUriReadFd(path_utf8);
+    if (fd >= 0) {
+      struct stat st {};
+      const bool ok_stat = (::fstat(fd, &st) == 0 && !S_ISDIR(st.st_mode) &&
+                            st.st_size >= header_size);
+      bool ok_head = false;
+      if (ok_stat) {
+        ok_head = (::pread64(fd, file_magic, header_size, 0) == header_size);
+        if (::pread64(fd, tail_magic, header_size,
+                      static_cast<off64_t>(st.st_size - header_size)) ==
+            header_size) {
+          have_tail_magic = true;
+        }
+      }
+      ::close(fd);
+      if (ok_head) {
+        fourcc_t magic_value = make_fourcc(file_magic[0], file_magic[1],
+                                           file_magic[2], file_magic[3]);
+        switch (magic_value) {
+          case xe::cpu::kXEX1Signature:
+            return FileSignatureType::XEX1;
+          case xe::cpu::kXEX2Signature:
+            return FileSignatureType::XEX2;
+          case xe::vfs::kCONSignature:
+            return FileSignatureType::CON;
+          case xe::vfs::kLIVESignature:
+            return FileSignatureType::LIVE;
+          case xe::vfs::kPIRSSignature:
+            return FileSignatureType::PIRS;
+          case xe::vfs::kXSFSignature:
+            return FileSignatureType::XISO;
+          case xe::cpu::kElfSignature:
+            return FileSignatureType::ELF;
+          default:
+            break;
+        }
+        if (xe::kernel::kEXESignature ==
+            make_fourcc(file_magic[0], file_magic[1], 0, 0)) {
+          return FileSignatureType::EXE;
+        }
+        if (have_tail_magic &&
+            xe::vfs::kZarMagic == make_fourcc(tail_magic[0], tail_magic[1],
+                                              tail_magic[2], tail_magic[3])) {
+          return FileSignatureType::ZAR;
+        }
+        auto disc_dev = std::make_unique<vfs::DiscImageDevice>("", path);
+        if (disc_dev->Initialize()) {
+          return FileSignatureType::XISO;
+        }
+        return FileSignatureType::Unknown;
+      }
+    }
+    // SAF directory tree URI: probe for default.xex or any .xex at tree root.
+    auto children = vfs::saf::ListTreeChildren(path_utf8);
+    for (const auto& item : children) {
+      if (!item.is_directory &&
+          (utf8::equal_case(item.name, "default.xex") ||
+           (item.name.size() > 4 &&
+            utf8::equal_case(item.name.substr(item.name.size() - 4), ".xex")))) {
+        return FileSignatureType::XEX2;
+      }
+    }
+    return FileSignatureType::Unknown;
+  }
+
+  std::error_code dir_ec;
+  if (std::filesystem::is_directory(path, dir_ec)) {
+    const auto default_xex = path / "default.xex";
+    if (std::filesystem::exists(default_xex, dir_ec)) {
+      return GetFileSignature(default_xex);
+    }
+    return FileSignatureType::Unknown;
+  }
+#endif
+
   FILE* file = xe::filesystem::OpenFile(path, "rb");
 
   if (!file) {
     return FileSignatureType::Unknown;
   }
 
-  const uint64_t file_size = std::filesystem::file_size(path);
-  constexpr int64_t header_size = 4;
+  std::error_code fs_ec;
+  const uint64_t file_size = std::filesystem::file_size(path, fs_ec);
 
-  if (file_size < header_size) {
+  if (fs_ec || file_size < header_size) {
+    fclose(file);
     return FileSignatureType::Unknown;
   }
 
-  char file_magic[header_size];
   fread(file_magic, sizeof(file_magic), 1, file);
 
   fourcc_t magic_value =
@@ -760,11 +873,32 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
   // and then get that symlinked to game:\, so
   // -> game:\foo.xex
   // Get just the filename (foo.xex).
-  auto file_name = path.filename();
+  std::string file_name_utf8 = xe::path_to_utf8(path.filename());
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  const std::string path_utf8 = xe::path_to_utf8(path);
+  if (vfs::saf::IsSafContentUri(path_utf8)) {
+    std::string parent_doc_id;
+    std::string leaf_name;
+    if (vfs::saf::DeriveSafParentDocumentId(path_utf8, parent_doc_id,
+                                            leaf_name) &&
+        !leaf_name.empty()) {
+      file_name_utf8 = leaf_name;
+    } else {
+      file_name_utf8 =
+          cvars::launch_module.empty() ? "default.xex" : cvars::launch_module;
+    }
+  } else {
+    std::error_code dir_ec;
+    if (std::filesystem::is_directory(path, dir_ec)) {
+      file_name_utf8 =
+          cvars::launch_module.empty() ? "default.xex" : cvars::launch_module;
+    }
+  }
+#endif
 
   // Launch the game.
-  auto fs_path = fmt::format("{}\\", kDefaultGameSymbolicLink) +
-                 xe::path_to_utf8(file_name);
+  auto fs_path =
+      fmt::format("{}\\{}", kDefaultGameSymbolicLink, file_name_utf8);
   X_STATUS result = CompleteLaunch(path, fs_path);
 
   if (XFAILED(result)) {
@@ -1144,8 +1278,8 @@ X_STATUS Emulator::InstallContentPackage(
 
   vfs::VirtualFileSystem::ExtractContentHeader(device.get(), header_path);
 
-  // Lambda to handle cleanup - defined once, used in both cancellation paths
-  auto cleanup_and_fail = [&]() {
+  // Removes the partial install and reports the failure.
+  auto cleanup_and_fail = [&](X_STATUS result, std::string_view message) {
     std::error_code ec;
     bool cleanup_failed = false;
 
@@ -1165,16 +1299,16 @@ X_STATUS Emulator::InstallContentPackage(
 
     // Set state AFTER cleanup is done, so dialog doesn't pop up prematurely
     std::lock_guard<std::mutex> lock(*installation_info.mutex_);
-    installation_info.installation_result_ = X_ERROR_CANCELLED;
+    installation_info.installation_result_ = result;
     installation_info.installation_error_message_ =
-        cleanup_failed ? "Installation cancelled (cleanup failed)"
-                       : "Installation cancelled";
+        cleanup_failed ? fmt::format("{} (cleanup failed)", message)
+                       : std::string(message);
     installation_info.installation_state_ = InstallState::failed;
   };
 
   // Check for cancellation before extracting files
   if (installation_info.cancelled_.load()) {
-    cleanup_and_fail();
+    cleanup_and_fail(X_ERROR_CANCELLED, "Installation cancelled");
     return X_ERROR_CANCELLED;
   }
 
@@ -1185,13 +1319,15 @@ X_STATUS Emulator::InstallContentPackage(
 
   // Check for cancellation after extraction
   if (installation_info.cancelled_.load() || error_code == X_ERROR_CANCELLED) {
-    cleanup_and_fail();
+    cleanup_and_fail(X_ERROR_CANCELLED, "Installation cancelled");
     return X_ERROR_CANCELLED;
   }
 
+  // A partial install can't be used.
   if (error_code != X_ERROR_SUCCESS) {
-    std::lock_guard<std::mutex> lock(*installation_info.mutex_);
-    installation_info.installation_state_ = InstallState::failed;
+    cleanup_and_fail(error_code, error_code == X_STATUS_END_OF_FILE
+                                     ? "Package is damaged!"
+                                     : "Failed to extract package!");
     return error_code;
   }
 
@@ -1211,6 +1347,31 @@ X_STATUS Emulator::InstallContentPackage(
 }
 
 #if XE_PLATFORM_xendroid
+static uint32_t StreamCrc32Update(uint32_t crc, const uint8_t* data, size_t len) {
+  crc = ~crc;
+#if defined(__ARM_FEATURE_CRC32)
+  while (len >= 8) {
+    uint64_t word = 0;
+    std::memcpy(&word, data, sizeof(word));
+    crc = __crc32d(crc, word);
+    data += 8;
+    len -= 8;
+  }
+  while (len > 0) {
+    crc = __crc32b(crc, *data++);
+    --len;
+  }
+#else
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; ++b) {
+      crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+  }
+#endif
+  return ~crc;
+}
+
 // Re-open the produced .zar and confirm it reproduces the source disc walk:
 // the reader must open, and the enumerated file-count + total uncompressed
 // bytes must equal what the pack pass measured. Catches truncation /
@@ -1300,10 +1461,11 @@ X_STATUS Emulator::CompressDiscToZarchive(
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  std::vector<uint8_t> buffer(4 * 1024 * 1024);  // 4 MiB, like ExtractContentFile.
+  std::vector<uint8_t> buffer(4 * 1024 * 1024);  // 4 MiB, matching ZArchiveWriter batch.
   uint64_t total_files = 0;
   uint64_t total_bytes = 0;     // bytes actually read + appended into the archive
   uint64_t expected_bytes = 0;  // sum of the disc's declared file sizes (independent)
+  uint32_t source_crc32 = 0;    // hardware ARMv8 CRC32 across all packed stream bytes
 
   // Breadth-first walk of the mounted disc, mirroring ExtractContentFiles.
   vfs::Entry* root = device->ResolvePath("/");
@@ -1368,11 +1530,30 @@ X_STATUS Emulator::CompressDiscToZarchive(
       return X_STATUS_UNSUCCESSFUL;
     }
 
-    // Read via mmap fast-path or ReadSync, mirroring ExtractContentFile.
-    if (entry->can_map()) {
+    // Prefer streaming ReadSync so multi-GB files inside .iso / SVOD / .xex
+    // folders never require contiguous mmap; fall back to OpenMapped only if Open fails.
+    vfs::File* in = nullptr;
+    if (entry->Open(vfs::FileAccess::kFileReadData, &in) == X_STATUS_SUCCESS && in) {
+      size_t remaining = entry->size();
+      size_t offset = 0;
+      while (remaining > 0) {
+        size_t got = 0;
+        const size_t ask = std::min<size_t>(buffer.size(), remaining);
+        in->ReadSync(std::span<uint8_t>(buffer.data(), ask), offset, &got);
+        if (got == 0) {
+          break;
+        }
+        source_crc32 = StreamCrc32Update(source_crc32, buffer.data(), got);
+        zWriter.AppendData(buffer.data(), got);
+        offset += got;
+        remaining -= got;
+        total_bytes += got;
+        if (progress_done) progress_done->fetch_add(got);
+      }
+      in->Destroy();
+    } else if (entry->can_map()) {
       auto map = entry->OpenMapped(xe::MappedMemory::Mode::kRead);
       if (!map) {
-        // A 0-byte file is a valid empty archive entry, not a failure.
         if (entry->size() != 0) {
           XELOGI("Failed to map archive file {}\n", rel);
           return X_STATUS_UNSUCCESSFUL;
@@ -1382,6 +1563,7 @@ X_STATUS Emulator::CompressDiscToZarchive(
         size_t offset = 0;
         while (remaining > 0) {
           const size_t n = std::min<size_t>(buffer.size(), remaining);
+          source_crc32 = StreamCrc32Update(source_crc32, map->data() + offset, n);
           zWriter.AppendData(map->data() + offset, n);
           offset += n;
           remaining -= n;
@@ -1390,28 +1572,9 @@ X_STATUS Emulator::CompressDiscToZarchive(
         }
         map->Close();
       }
-    } else {
-      vfs::File* in = nullptr;
-      if (entry->Open(vfs::FileAccess::kFileReadData, &in) != X_STATUS_SUCCESS) {
-        XELOGI("Failed to open archive file {}\n", rel);
-        return X_STATUS_UNSUCCESSFUL;
-      }
-      size_t remaining = entry->size();
-      size_t offset = 0;
-      while (remaining > 0) {
-        size_t got = 0;
-        in->ReadSync(std::span<uint8_t>(buffer.data(), buffer.size()), offset,
-                     &got);
-        if (got == 0) {
-          break;  // short / truncated source -- verify will catch the mismatch.
-        }
-        zWriter.AppendData(buffer.data(), got);
-        offset += got;
-        remaining -= got;
-        total_bytes += got;
-        if (progress_done) progress_done->fetch_add(got);
-      }
-      in->Destroy();
+    } else if (entry->size() != 0) {
+      XELOGI("Failed to open archive file {}\n", rel);
+      return X_STATUS_UNSUCCESSFUL;
     }
 
     ++total_files;
@@ -1443,6 +1606,8 @@ X_STATUS Emulator::CompressDiscToZarchive(
     return X_STATUS_UNSUCCESSFUL;
   }
 
+  XELOGI("CompressDiscToZarchive: packed {} files ({} bytes, crc32={:08X}) -> {}",
+         total_files, total_bytes, source_crc32, xe::path_to_utf8(outputFile));
   return X_STATUS_SUCCESS;
 }
 #endif  // XE_PLATFORM_xendroid
@@ -1456,12 +1621,20 @@ void Emulator::Pause() {
     return;
   }
 
-  // Soft pause: park the progress sources and let guest threads settle on
-  // their own waits. Suspending threads mid-operation loses in-flight
-  // cross-thread completions (permanent Skate 3 deadlock). Audio first so an
-  // in-flight guest audio callback drains while the CP and vblank are live.
+  // Park the subsystems while the guest clock still runs: the vblank pacer on
+  // Android derives its deadlines from QueryGuestTickCount(), and a mid-packet
+  // WAIT_REG_MEM in the command processor can only drain while vblanks keep
+  // advancing. Holding the guest clock first freezes that pacer, so the packet
+  // never completes, CommandProcessor::Pause() never parks, and the caller
+  // (the Android main thread, for the in-game menu) blocks on the fence until
+  // the system reports an ANR. Audio first so an in-flight guest audio callback
+  // drains while the CP and vblank are live.
   audio_system_->Pause();
   graphics_system_->Pause();
+
+  // Only once every thread is parked: the guest time must not advance while
+  // paused, but it has to advance until the park has actually happened.
+  Clock::HoldGuestTime(true);
 
   XELOGI("! EMULATOR PAUSED !");
 }
@@ -1473,6 +1646,7 @@ void Emulator::Resume() {
   if (!paused_.exchange(false)) {
     return;
   }
+  Clock::HoldGuestTime(false);
   XELOGI("! EMULATOR RESUMED !");
 
   // Reverse of Pause().
@@ -1865,22 +2039,6 @@ void Emulator::MountStandardDrives() {
         fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
       }
     }
-
-    // Some (older?) games try accessing cache:\ too
-    // NOTE: this must be registered _after_ the cache0/cache1 devices, due to
-    // substring/start_with logic inside VirtualFileSystem::ResolvePath, else
-    // accesses to those devices will go here instead
-    auto cache_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE", storage_root_ / "cache", false);
-    if (!cache_device->Initialize()) {
-      XELOGE("Unable to scan cache path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache_device))) {
-        XELOGE("Unable to register cache path");
-      } else {
-        fs->RegisterSymbolicLink("cache:", "\\CACHE");
-      }
-    }
   }
 
   if (cvars::mount_memory_unit) {
@@ -1911,6 +2069,24 @@ void Emulator::MountStandardDrives() {
 
     fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
     fs->RegisterSymbolicLink("e:", "\\DEVKIT");
+  }
+}
+
+void Emulator::EmptyTitleCache() {
+  auto global_lock = global_critical_region::AcquireDirect();
+  vfs::Entry* root = file_system_->ResolvePath("\\CACHE");
+  if (!root) {
+    return;
+  }
+  std::vector<vfs::Entry*> children;
+  for (const auto& child : root->children()) {
+    children.push_back(child.get());
+  }
+  // Entries the title still has open stay.
+  for (vfs::Entry* child : children) {
+    if (!root->Delete(child)) {
+      XELOGW("Unable to delete cache:\\{} on format", child->name());
+    }
   }
 }
 
@@ -2490,7 +2666,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                      std::string("\\Cache1")};
   auto null_device =
       std::make_unique<vfs::NullDevice>("\\Device\\Harddisk0", null_paths);
+  vfs::NullDevice* raw_partitions = nullptr;
   if (null_device->Initialize()) {
+    raw_partitions = null_device.get();
     file_system_->RegisterDevice(std::move(null_device));
   }
 
@@ -2550,6 +2728,27 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     if (title_version.value != 0) {
       title_version_ = format_version(title_version);
     }
+  }
+
+  // XMountUtilityDrive creates \Device\cacheN on Harddisk0\CacheN and links
+  // cache: to it.
+  const auto cache_name = fmt::format("{:08X}", title_id_.value_or(0));
+  const auto cache_root = storage_root_ / "cache";
+  auto cache_device = std::make_unique<vfs::HostPathDevice>(
+      "\\CACHE", cache_root / cache_name, false);
+  if (cache_device->Initialize()) {
+    file_system_->RegisterDevice(std::move(cache_device));
+    file_system_->RegisterSymbolicLink("\\Device\\cache0", "\\CACHE");
+    file_system_->RegisterSymbolicLink("\\Device\\cache1", "\\CACHE");
+  } else {
+    XELOGE("Unable to scan the title's cache path");
+  }
+  // The cache table and cluster sizes sit beside the folder, as content
+  // package headers do.
+  if (raw_partitions) {
+    raw_partitions->LoadCacheHeader(cache_root / "Headers" /
+                                    (cache_name + ".header"));
+    raw_partitions->set_cache_format_handler([this]() { EmptyTitleCache(); });
   }
 
   // Before guest threads exist; quirks + per-game config already applied.

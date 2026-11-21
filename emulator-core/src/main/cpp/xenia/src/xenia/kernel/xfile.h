@@ -191,6 +191,8 @@ class XFile : public XObject {
 
   X_STATUS SetLength(size_t length);
   X_STATUS Rename(const std::filesystem::path file_path, bool replace_existing);
+  X_STATUS Rename(vfs::Entry* new_parent, std::string_view name,
+                  bool replace_existing);
 
   // False when the handle already has a port.
   bool RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);

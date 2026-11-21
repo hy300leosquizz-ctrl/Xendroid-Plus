@@ -83,6 +83,9 @@ class Clock {
   // Sets the system time of the guest.
   static void SetGuestSystemTime(uint64_t system_time);
 
+  // Freezes or resumes guest tick/system time progression while paused.
+  static void HoldGuestTime(bool hold);
+
   // Scales a time duration in milliseconds, from guest time.
   static uint32_t ScaleGuestDurationMillis(uint32_t guest_ms);
   // Scales a time duration in 100ns ticks like FILETIME, from guest time.

@@ -11,6 +11,7 @@
 #define XENIA_GPU_PRIMITIVE_PROCESSOR_H_
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -955,6 +957,32 @@ class PrimitiveProcessor {
   // Huge, so it's the last in the class.
   // Modified by both the processor and the invalidation callback.
   size_t cache_bucket_first_entries_[kCacheBucketCount];
+
+  // 8192-entry (2048 sets x 4 ways) LRU 16-bit k8in16 index preswap cache
+  // (adapted from DEGROUCHO/xendroid-mali, BSD-3-Clause).
+  static constexpr uint32_t kPreswapSets = 2048;
+  static constexpr uint32_t kPreswapWays = 4;
+  static constexpr uint32_t kPreswapTotalEntries = kPreswapSets * kPreswapWays;
+  struct PreswapEntry {
+    uint32_t guest_base = 0;
+    uint32_t count = 0;
+    uint64_t raw_hash = 0;
+    uint32_t lru_tick = 0;
+    uint16_t stale_streak = 0;
+    bool valid = false;
+    uint64_t frame_epoch = 0;
+    size_t frame_handle = SIZE_MAX;
+    std::vector<uint16_t> swapped_indices;
+  };
+  std::vector<PreswapEntry> preswap_entries_;
+  std::array<uint64_t, kPreswapSets / 64> preswap_non_empty_sets_{};
+  uint32_t preswap_lru_clock_ = 0;
+  uint64_t preswap_frame_epoch_ = 1;
+  static void ByteSwap16Indices(uint16_t* dest, const uint16_t* source,
+                                uint32_t count);
+  bool TryPreswap16BitIndices(uint32_t guest_index_base, uint32_t count,
+                              CachedResult& cacheable_io);
+
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length,
       bool exact_range);

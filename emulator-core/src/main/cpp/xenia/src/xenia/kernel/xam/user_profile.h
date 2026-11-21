@@ -18,7 +18,11 @@
 #include <vector>
 
 #include "xenia/kernel/xam/user_property.h"
+#include "xenia/base/cvar.h"
+#include "xenia/kernel/xam/user_signin_util.h"
 #include "xenia/kernel/xam/xam.h"
+
+DECLARE_bool(live_signin);
 #include "xenia/kernel/xam/xdbf/gpd_info_profile.h"
 #include "xenia/kernel/xam/xdbf/gpd_info_title.h"
 #include "xenia/kernel/xam/xdbf/xdbf_io.h"
@@ -104,30 +108,46 @@ class UserProfile {
   UserProfile(const uint64_t xuid, const X_XAMACCOUNTINFO* account_info);
 
   uint64_t xuid() const { return xuid_; }
+  uint64_t GetOnlineXUID() const {
+    return ResolveAccountOnlineXuid(xuid_, account_info_, cvars::live_signin);
+  }
+  // Titles know a user signed in to Live by the online XUID.
+  uint64_t GetLogonXUID() const {
+    return ResolveAccountLogonXuid(xuid_, account_info_, cvars::live_signin);
+  }
+
   std::string name() const { return account_info_.GetGamertagString(); }
+  // With no Live service to sign in to, a Live-enabled profile counts as
+  // signed in to Live.
   uint32_t signin_state() const {
-    return static_cast<uint32_t>(SignInState::SignedInLocally);
-  };
-  uint32_t type() const { return 1 | 2; /* local | online profile? */ }
+    return ResolveAccountSigninState(account_info_, cvars::live_signin);
+  }
 
   uint32_t GetReservedFlags() const {
-    return account_info_.GetReservedFlags();
-  };
-  uint32_t GetCachedFlags() const { return account_info_.GetCachedFlags(); };
+    return ResolveAccountReservedFlags(account_info_, cvars::live_signin);
+  }
+  uint32_t GetCachedFlags() const {
+    return ResolveAccountCachedFlags(account_info_, cvars::live_signin);
+  }
+  uint32_t GetUserFlags() const {
+    return ResolveAccountUserFlags(account_info_, cvars::live_signin);
+  }
   uint32_t GetCountry() const {
     return static_cast<uint32_t>(account_info_.GetCountry());
-  };
+  }
   uint32_t GetSubscriptionTier() const {
-    return account_info_.GetSubscriptionTier();
+    return ResolveAccountSubscriptionTier(account_info_, cvars::live_signin);
   }
   uint32_t GetLanguage() const {
     return static_cast<uint32_t>(account_info_.GetLanguage());
-  };
+  }
 
   bool IsParentalControlled() const {
     return account_info_.IsParentalControlled();
-  };
-  bool IsLiveEnabled() const { return account_info_.IsLiveEnabled(); }
+  }
+  bool IsLiveEnabled() const {
+    return ResolveAccountLiveEnabled(account_info_, cvars::live_signin);
+  }
 
   void ClearProfileIcon(XTileType icon_type) {
     profile_images_.erase(icon_type);

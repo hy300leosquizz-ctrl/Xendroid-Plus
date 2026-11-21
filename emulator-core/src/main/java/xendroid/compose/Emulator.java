@@ -78,6 +78,7 @@ public class Emulator extends xendroid.emulator.Emulator{
     public native void set_slot_connected(int slot, boolean connected, String name);
     public native long[] rumble_state();
     public native long[] presenter_work();
+    public native void set_presenter_adpf_target(long targetNs);
     public native void set_frame_generation(boolean enabled, int preset, float displayHz);
     // Requested ZeroFG mode: 0 off, 1 ReallyZero, 2 Zero. The render thread owns the switch.
     public native void set_zerofg_mode(int mode);

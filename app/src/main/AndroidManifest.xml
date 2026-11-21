@@ -20,6 +20,13 @@
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <!-- Controller rumble (host Activity, SP1-C; declared now so core code never NPEs). -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Bluetooth RFCOMM P2-P4 offline companion fallback when Wi-Fi/LAN is unavailable. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Background .zar multi-core compression service & progress notifications. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- In-app updates (R03): the system installer still asks the user to confirm each one,
          and only after they allow this app to install updates in system settings. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -88,10 +95,22 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+        <!-- Isolated Vulkan custom driver probe (vkCreateInstance + vkCreateDevice) so a
+             damaged or incompatible .zip ICD crashes only :driver_probe, never UI or :emu. -->
+        <activity
+            android:name="xendroid.compose.driver.DriverProbeActivity"
+            android:process=":driver_probe"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <!-- No android:process on purpose: must land in the main process. -->
         <service
             android:name="xendroid.compose.core.MainAliveService"
             android:exported="false" />
+        <service
+            android:name="xendroid.compose.ui.compress.ZarCompressService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <!-- Status of an in-app update's install session (shows the system confirmation). -->
         <receiver
             android:name="xendroid.compose.updater.UpdateInstallReceiver"

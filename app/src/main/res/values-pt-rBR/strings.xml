@@ -217,7 +217,7 @@
     <string name="lib_compress">Comprimir para .zar</string>
     <string name="lib_shortcut">Criar atalho</string>
     <string name="lib_compress_title">Comprimir para .zar?</string>
-    <string name="lib_compress_text">Isto empacota o disco num .zar menor. O .iso original fica intacto até o .zar ser criado e verificado, e você é consultado antes de ele ser apagado. O jogo continua na biblioteca.</string>
+    <string name="lib_compress_text">Isto empacota o disco, a pasta ou o pacote num .zar menor. Os arquivos originais ficam intactos até o .zar ser criado e verificado, e você é consultado antes de um .iso ser apagado. O jogo continua na biblioteca.</string>
     <string name="lib_compress_action">Comprimir</string>
     <string name="lib_compress_progress">%1$d%%  ·  isso pode demorar.</string>
     <string name="lib_may_take_while">Isso pode demorar.</string>
@@ -369,7 +369,7 @@
     <string name="set_cat_content">Conteúdo</string>
     <string name="set_cat_general">Geral</string>
     <string name="set_fps_unlimited">Sem limite</string>
-    <string name="set_driver_unavailable">Indisponível: drivers personalizados só carregam em GPUs Adreno (Qualcomm KGSL), e este telefone não tem. Os jogos rodam no driver do sistema.</string>
+    <string name="set_driver_unavailable">Indisponível: drivers personalizados só carregam em GPUs Adreno, Mali ou Xclipse, e este telefone não tem. Os jogos rodam no driver do sistema.</string>
     <string name="set_contract_action">Ação · não muda a configuração da emulação</string>
     <string name="set_contract_global">Salvo para todos os jogos · vale na próxima abertura de um jogo</string>
     <string name="set_contract_game">Salvo para este jogo · vale na próxima abertura dele</string>
@@ -1351,4 +1351,16 @@
     <string name="drv_from">De %1$s</string>
     <string name="menu_color_vivid">Vívido (falso HDR)</string>
     <string name="ge_group">Grupo</string>
+    <string name="pt_aspect_btn">20:9 / 21:9</string>
+    <string name="pt_aspect_title">Assistente ultrawide</string>
+    <string name="pt_aspect_desc">Gera um .patch.toml de usuário para telas modernas 19,5:9, 20:9 ou 21:9 a partir de um patch widescreen existente ou de um endereço float32 conhecido.</string>
+    <string name="pt_aspect_screen">Esta tela</string>
+    <string name="pt_aspect_addr_label">Endereço float32 opcional (se não houver patch 16:9)</string>
+    <string name="pt_aspect_create">Criar patch</string>
+    <string name="pt_aspect_no_template">Nenhum patch widescreen 16:9 encontrado para este jogo; informe um endereço float32 na memória do jogo (ex.: 0x82012340).</string>
+    <string name="pt_search_hint">Buscar patches, autores ou descrições</string>
+    <string name="pt_search_empty">Nenhum patch corresponde a este filtro.</string>
+    <string name="pt_filter_enabled">Ativados</string>
+    <string name="pt_filter_widescreen">Widescreen</string>
+    <string name="pc_bt_allow">Permitir dispositivos Bluetooth</string>
 </resources>

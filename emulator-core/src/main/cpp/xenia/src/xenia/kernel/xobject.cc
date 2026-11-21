@@ -60,6 +60,7 @@ XObject::~XObject() {
   assert_zero(pointer_ref_count_);
 
   if (allocated_guest_object_) {
+    kernel_state_->object_table()->RemoveAllocatedBody(guest_object_ptr_, this);
     uint32_t header_addr = guest_object_ptr_ - sizeof(X_OBJECT_HEADER);
     auto header = memory()->TranslateVirtual<X_OBJECT_HEADER*>(header_addr);
 
@@ -89,6 +90,15 @@ bool XObject::ReleaseHandle() {
 }
 
 void XObject::Retain() { ++pointer_ref_count_; }
+bool XObject::TryRetain() {
+  int32_t count = pointer_ref_count_.load();
+  while (count > 0) {
+    if (pointer_ref_count_.compare_exchange_weak(count, count + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 void XObject::Release() {
   if (--pointer_ref_count_ == 0) {
@@ -128,6 +138,9 @@ bool XObject::RestoreObject(ByteStream* stream) {
   // Restore our pointer to our handles in the object table.
   for (size_t i = 0; i < handles_.size(); i++) {
     kernel_state_->object_table()->RestoreHandle(handles_[i], this);
+  }
+  if (allocated_guest_object_) {
+    kernel_state_->object_table()->AddAllocatedBody(guest_object_ptr_, this);
   }
 
   return true;
@@ -911,6 +924,7 @@ uint8_t* XObject::CreateNative(uint32_t size) {
   memory()->Zero(mem, total_size);
   uint32_t header_addr = mem + kGuestObjectPrePad;
   SetNativePointer(header_addr + sizeof(X_OBJECT_HEADER), true);
+  kernel_state_->object_table()->AddAllocatedBody(guest_object_ptr_, this);
 
   auto header = memory()->TranslateVirtual<X_OBJECT_HEADER*>(header_addr);
 
@@ -993,6 +1007,9 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state,
       // place a direct write to it can be picked up.
       result->SyncFromGuest();
     }
+  } else if (auto object = kernel_state->object_table()->LookupAllocatedBody(
+                 kernel_state->memory()->HostToGuestVirtual(native_ptr))) {
+    result = object.release();
   } else {
     // First use, create new.
     // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html

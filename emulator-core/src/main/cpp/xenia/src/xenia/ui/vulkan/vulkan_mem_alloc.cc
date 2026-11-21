@@ -85,6 +85,12 @@ VmaAllocator CreateVmaAllocator(const VulkanDevice* const vulkan_device,
     vma_vulkan_functions.vkGetDeviceImageMemoryRequirements =
         dfn.vkGetDeviceImageMemoryRequirements;
   }
+  if (vulkan_device->properties().bufferDeviceAddress &&
+      (vulkan_device->extensions().ext_1_2_KHR_buffer_device_address ||
+       vulkan_device->extensions().ext_KHR_buffer_device_address)) {
+    allocator_create_info.flags |=
+        VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+  }
 
   if (externally_synchronized) {
     allocator_create_info.flags |=

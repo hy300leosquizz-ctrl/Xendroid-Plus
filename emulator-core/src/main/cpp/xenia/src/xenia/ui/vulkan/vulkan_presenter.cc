@@ -48,6 +48,7 @@
 #include "version.h"
 
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+#include <dlfcn.h>
 #include <errno.h>
 #include <poll.h>
 #include <sys/resource.h>
@@ -79,12 +80,26 @@ DECLARE_int32(vulkan_mid_frame_submission_draws);
 
 // Note: If the priorities in the description are changed, update the actual
 // present mode selection logic.
+// On Android (#123), VK_PRESENT_MODE_IMMEDIATE_KHR bypasses host display vsync
+// when exposed by the driver, burning power and heat without showing extra
+// unique frames. Keep vsynced presentation by default on Android while leaving
+// the toggle available for low-latency benchmarks.
+#if XE_PLATFORM_xendroid
+static constexpr bool kVulkanAllowPresentModeImmediateDefault = false;
+#else
+static constexpr bool kVulkanAllowPresentModeImmediateDefault = true;
+#endif
 DEFINE_bool(
-    vulkan_allow_present_mode_immediate, true,
+    vulkan_allow_present_mode_immediate,
+    kVulkanAllowPresentModeImmediateDefault,
     "When available, allow the immediate presentation mode (1st priority), "
     "offering the lowest latency with the possibility of tearing in certain "
-    "cases, and, depending on the configuration, variable refresh rate.",
+    "cases, and, depending on the configuration, variable refresh rate. Off "
+    "by default on Android (#123) to avoid uncapped power draw and heat.",
     "Vulkan");
+#if XE_PLATFORM_xendroid
+UPDATE_from_bool(vulkan_allow_present_mode_immediate, 2026, 11, 18, 1, true);
+#endif
 // On Android (HyperOS on a POCO F7), after minutes of play SurfaceFlinger took
 // the frames of a mailbox swapchain at ever longer intervals (216 -> 400 ms),
 // then none for 112 s while the emulator kept presenting ~31 a second - the
@@ -111,6 +126,17 @@ DEFINE_bool(
     "(3rd priority), which causes waiting for host display vertical sync, but "
     "may present with tearing if frames don't meet the host display refresh "
     "rate.",
+    "Vulkan");
+DEFINE_bool(
+    vulkan_swapchain_pretransform, false,
+    "Match VkSwapchainCreateInfoKHR::preTransform to the surface's "
+    "currentTransform on Android/WSI so SurfaceFlinger can scan out directly "
+    "without compositor rotation when pre-rotated.",
+    "Vulkan");
+DEFINE_bool(
+    vulkan_swapchain_hdr_scrgb, false,
+    "Prefer R16G16B16A16_SFLOAT with VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT "
+    "(scRGB HDR / wide gamut) when supported by the Vulkan surface.",
     "Vulkan");
 DEFINE_bool(zerofg_frame_generation, false,
             "Enable the independent ZeroFG presenter.", "Vulkan");
@@ -333,8 +359,131 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
   return true;
 }
 
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+namespace {
+class AndroidPresenterAdpf {
+ public:
+  static AndroidPresenterAdpf& Instance() {
+    static AndroidPresenterAdpf instance;
+    return instance;
+  }
+
+  void EnsureRegistered(xe::ui::PresentationRuntime& runtime) {
+    if (registered_.exchange(true, std::memory_order_acq_rel)) return;
+    std::lock_guard<std::mutex> lock(runtime.configuration_mutex);
+    runtime.presenter_adpf_sync = &AndroidPresenterAdpf::SyncCallback;
+  }
+
+  void OnFrame(xe::ui::PresentationRuntime& runtime, int32_t tid,
+               int64_t work_ns) {
+    const int64_t target_ns =
+        runtime.presenter_adpf_target_ns.load(std::memory_order_relaxed);
+    if (target_ns <= 0 &&
+        runtime.presenter_adpf_state.load(std::memory_order_relaxed) == 0) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    EnsureResolvedLocked();
+    const int state = tracker_.OnFrame(api_, tid, work_ns, target_ns);
+    runtime.presenter_adpf_state.store(state, std::memory_order_relaxed);
+  }
+
+  void SyncTarget(xe::ui::PresentationRuntime& runtime, int64_t target_ns) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (target_ns <= 0) {
+      tracker_.SyncTarget(api_, 0);
+      runtime.presenter_adpf_state.store(0, std::memory_order_relaxed);
+      return;
+    }
+    EnsureResolvedLocked();
+    tracker_.SyncTarget(api_, target_ns);
+    runtime.presenter_adpf_state.store(tracker_.state(),
+                                       std::memory_order_relaxed);
+  }
+
+  void Reset(xe::ui::PresentationRuntime& runtime) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tracker_.Close(api_);
+    runtime.presenter_adpf_state.store(0, std::memory_order_relaxed);
+  }
+
+ private:
+  static void SyncCallback(int64_t target_ns) {
+    Instance().SyncTarget(xe::ui::RuntimePresentation(), target_ns);
+  }
+
+  static void* CreateSessionCb(void* ctx, int32_t tid, int64_t target_ns) {
+    auto* self = static_cast<AndroidPresenterAdpf*>(ctx);
+    if (!self->manager_ || !self->create_session_) return nullptr;
+    return self->create_session_(self->manager_, &tid, 1,
+                                 std::max<int64_t>(1, target_ns));
+  }
+  static void UpdateTargetCb(void* ctx, void* session, int64_t target_ns) {
+    auto* self = static_cast<AndroidPresenterAdpf*>(ctx);
+    if (self->update_target_) {
+      self->update_target_(session, std::max<int64_t>(1, target_ns));
+    }
+  }
+  static void ReportActualCb(void* ctx, void* session, int64_t actual_ns) {
+    auto* self = static_cast<AndroidPresenterAdpf*>(ctx);
+    if (self->report_actual_) {
+      self->report_actual_(session, std::max<int64_t>(1, actual_ns));
+    }
+  }
+  static void CloseSessionCb(void* ctx, void* session) {
+    auto* self = static_cast<AndroidPresenterAdpf*>(ctx);
+    if (self->close_session_) {
+      self->close_session_(session);
+    }
+  }
+
+  void EnsureResolvedLocked() {
+    if (resolved_) return;
+    resolved_ = true;
+    api_.context = this;
+    void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!lib) lib = dlopen("libandroid.so", RTLD_NOW);
+    if (!lib) return;
+    auto get_manager = reinterpret_cast<void* (*)()>(
+        dlsym(lib, "APerformanceHint_getManager"));
+    create_session_ =
+        reinterpret_cast<void* (*)(void*, const int32_t*, size_t, int64_t)>(
+            dlsym(lib, "APerformanceHint_createSession"));
+    report_actual_ = reinterpret_cast<int (*)(void*, int64_t)>(
+        dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+    update_target_ = reinterpret_cast<int (*)(void*, int64_t)>(
+        dlsym(lib, "APerformanceHint_updateTargetWorkDuration"));
+    close_session_ = reinterpret_cast<void (*)(void*)>(
+        dlsym(lib, "APerformanceHint_closeSession"));
+    manager_ = get_manager ? get_manager() : nullptr;
+    if (manager_ && create_session_ && report_actual_ && update_target_ &&
+        close_session_) {
+      api_.create_session = &CreateSessionCb;
+      api_.update_target = &UpdateTargetCb;
+      api_.report_actual = &ReportActualCb;
+      api_.close_session = &CloseSessionCb;
+    }
+  }
+
+  std::mutex mutex_;
+  std::atomic<bool> registered_{false};
+  bool resolved_ = false;
+  void* manager_ = nullptr;
+  void* (*create_session_)(void*, const int32_t*, size_t, int64_t) = nullptr;
+  int (*report_actual_)(void*, int64_t) = nullptr;
+  int (*update_target_)(void*, int64_t) = nullptr;
+  void (*close_session_)(void*) = nullptr;
+  xe::ui::PresenterAdpfApi api_{};
+  xe::ui::PresenterAdpfTracker tracker_;
+};
+}  // namespace
+#endif
+
 VulkanPresenter::~VulkanPresenter() {
   StopFrameGenerationThread();
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  AndroidPresenterAdpf::Instance().Reset(RuntimePresentation());
+#endif
   ResetColorFilter();
   ResetFrameGeneration();
   xe::RequestFrameTelemetryReset();
@@ -1140,6 +1289,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
     // A's swapchain exists again: A owns the Surface (handback complete).
     zerofg_independent_presenter_->NoteMainSurfaceProducedByA();
   }
+  RequestGpuPowerControl("surface_connect");
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
   if (zerofg_independent_presenter_ &&
       zerofg_bound_selection_.load(std::memory_order_acquire) != ZeroFGSelection::kOff &&
@@ -1192,6 +1342,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
 }
 
 void VulkanPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
+  ReleaseGpuPowerControl("surface_disconnect");
   ResetColorFilter();
   ResetFrameGeneration();
   xe::RequestFrameTelemetryReset();
@@ -1389,14 +1540,51 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     return VK_NULL_HANDLE;
   }
 
-  // TODO(Triang3l): Support transforms.
-  if (!(surface_capabilities.supportedTransforms &
-        (VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR |
-         VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR))) {
+  VkSurfaceTransformFlagBitsKHR pre_transform =
+      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  if (cvars::vulkan_swapchain_pretransform &&
+      (surface_capabilities.supportedTransforms &
+       surface_capabilities.currentTransform)) {
+    pre_transform = surface_capabilities.currentTransform;
+  } else if (surface_capabilities.supportedTransforms &
+             VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+    pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  } else if (surface_capabilities.supportedTransforms &
+             VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR) {
+    pre_transform = VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR;
+  } else if (surface_capabilities.supportedTransforms &
+             surface_capabilities.currentTransform) {
+    pre_transform = surface_capabilities.currentTransform;
+  } else {
     XELOGE(
-        "VulkanPresenter: The surface doesn't support identity or "
-        "window-system-controlled transform");
+        "VulkanPresenter: The surface doesn't support identity, inherit, or "
+        "currentTransform");
     return VK_NULL_HANDLE;
+  }
+  if (pre_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+      pre_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR ||
+      pre_transform == VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR ||
+      pre_transform ==
+          VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR) {
+    // Per Vulkan VUID-VkSwapchainCreateInfoKHR-imageExtent-01274, when matching
+    // a 90/270-degree currentTransform on Android, swapchain imageExtent is in
+    // pre-rotated physical panel coordinates.
+    if (surface_capabilities.currentExtent.width != UINT32_MAX &&
+        surface_capabilities.currentExtent.height != UINT32_MAX) {
+      image_extent = surface_capabilities.currentExtent;
+    } else {
+      std::swap(image_extent.width, image_extent.height);
+    }
+    image_extent.width =
+        std::min(std::max(image_extent.width,
+                          surface_capabilities.minImageExtent.width),
+                 std::min(max_framebuffer_extent.width,
+                          surface_capabilities.maxImageExtent.width));
+    image_extent.height =
+        std::min(std::max(image_extent.height,
+                          surface_capabilities.minImageExtent.height),
+                 std::min(max_framebuffer_extent.height,
+                          surface_capabilities.maxImageExtent.height));
   }
 
   // Get the surface format.
@@ -1443,6 +1631,18 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     image_format.format = kFormat8888Primary;
     image_format.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
   } else {
+    // Optional scRGB HDR / wide-gamut swapchain selection (xenia-edge 203b9bb92).
+    auto scrgb_hdr_it = surface_formats.cend();
+    if (cvars::vulkan_swapchain_hdr_scrgb) {
+      for (auto it = surface_formats.cbegin(); it != surface_formats.cend();
+           ++it) {
+        if (it->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+            it->colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+          scrgb_hdr_it = it;
+          break;
+        }
+      }
+    }
     // Pick the sRGB 8888 format preferred by the OS, fall back to any sRGB
     // 8888, then to 8888 with an unknown color space, and then to the first
     // sRGB available, and then to the first.
@@ -1474,7 +1674,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
         preferred_8888_it = it;
       }
     }
-    if (format_8888_primary_it != surface_formats.cend() &&
+    if (scrgb_hdr_it != surface_formats.cend()) {
+      image_format = *scrgb_hdr_it;
+    } else if (format_8888_primary_it != surface_formats.cend() &&
         format_8888_secondary_it != surface_formats.cend()) {
       // Both the primary and the secondary 8888 formats are available - prefer
       // sRGB, if both are sRGB or not, prefer the primary format.
@@ -1581,11 +1783,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.queueFamilyIndexCount = 0;
     swapchain_create_info.pQueueFamilyIndices = nullptr;
   }
-  swapchain_create_info.preTransform =
-      (surface_capabilities.supportedTransforms &
-       VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
-          ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
-          : VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR;
+  swapchain_create_info.preTransform = pre_transform;
   // Prefer opaque to avoid blending in the window system, or let that be
   // specified via the window system if it can't be forced. As a last resort,
   // just pick any - guest output will write alpha of 1 anyway.
@@ -2095,15 +2293,24 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   fg_actual_synthetic_ = false;
   struct WorkSample {
     std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+    int32_t tid = 0;
     WorkSample() {
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
-      RuntimePresentation().presenter_tid = int(syscall(SYS_gettid));
+      tid = int32_t(syscall(SYS_gettid));
+      auto& runtime = RuntimePresentation();
+      runtime.presenter_tid = tid;
+      AndroidPresenterAdpf::Instance().EnsureRegistered(runtime);
 #endif
     }
     ~WorkSample() {
-      RuntimePresentation().presenter_work_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      auto& runtime = RuntimePresentation();
+      const int64_t work_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - begin).count();
-      RuntimePresentation().presenter_work_sequence.fetch_add(1, std::memory_order_release);
+      runtime.presenter_work_ns = work_ns;
+      runtime.presenter_work_sequence.fetch_add(1, std::memory_order_release);
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+      AndroidPresenterAdpf::Instance().OnFrame(runtime, tid, work_ns);
+#endif
     }
   } work_sample;
   if (paint_context_.swapchain_frame_generation_policy != RuntimePresentation().frame_generation_requested.load()) {

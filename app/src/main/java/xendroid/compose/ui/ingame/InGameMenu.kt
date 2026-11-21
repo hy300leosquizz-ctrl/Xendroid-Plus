@@ -661,6 +661,7 @@ internal fun InGameAction.title(): String = stringResource(
         InGameAction.EDIT_TOUCH_LAYOUT -> R.string.menu_t_edit_layout
         InGameAction.SPLIT_SCREEN -> R.string.menu_split_title
         InGameAction.CONTROLLER_RUMBLE -> R.string.menu_rumble
+        InGameAction.KEY_MAPPING -> R.string.lib_menu_keymap
         InGameAction.PHONE_CONTROLLERS -> R.string.menu_phone_controllers
         InGameAction.UNBUFFERED_INPUT -> R.string.menu_unbuffered_title
         InGameAction.GYRO_CAMERA -> R.string.menu_gyro_camera

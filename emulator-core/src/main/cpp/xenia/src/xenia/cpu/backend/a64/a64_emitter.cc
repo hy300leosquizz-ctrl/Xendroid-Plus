@@ -84,10 +84,13 @@ static uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
 static constexpr size_t kMaxCodeSize = 4_MiB;
 
 // Register maps:
-// GPR allocatable registers: x22, x23, x24, x25, x26, x27, x28
-// (x19=backend context, x20=context, x21=membase are reserved)
+// GPR allocatable registers:
+//   0-6:  x22-x28 (callee-saved)
+//   7-15: x5-x13  (caller-saved volatile, gated by RegisterAllocationPass)
+// (x19=backend context, x20=context, x21=membase are reserved;
+//  x0-x4 and x14-x17 remain dedicated emitter/sequence scratch)
 const uint32_t A64Emitter::gpr_reg_map_[GPR_COUNT] = {
-    22, 23, 24, 25, 26, 27, 28,
+    22, 23, 24, 25, 26, 27, 28, 5, 6, 7, 8, 9, 10, 11, 12, 13,
 };
 
 // VEC allocatable registers: v4-v15, v16-v31
@@ -735,6 +738,34 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
           });
       b(HS, resolve_natively);
     }
+    // Without dynamic code, a target the table doesn't cover goes to the
+    // resolve thunk, since its slot would be read from outside the table.
+    // Returns, the most common sites, aren't checked.
+    Label* slot_ready = nullptr;
+    if (!processor()->dynamic_code_enabled() &&
+        !(instr->flags & hir::CALL_POSSIBLE_RETURN)) {
+      slot_ready = &NewCachedLabel();
+      const uint64_t resolve_thunk =
+          reinterpret_cast<uint64_t>(backend()->resolve_function_thunk());
+      Label& uncovered =
+          AddToTail([slot_ready, resolve_thunk](A64Emitter& e, Label&) {
+            e.mov(e.x9, resolve_thunk);
+            e.b(*slot_ready);
+          });
+      if (code_cache_->indirection_guest_base() == 0x80000000u &&
+          code_cache_->indirection_guest_size() == 0x1FFFFFFFu) {
+        // The table covers the addresses whose top three bits are 100.
+        eor(w14, w16, 0x80000000u);
+        tst(w14, 0xE0000000u);
+        b(NE, uncovered);
+      } else {
+        mov(w14, code_cache_->indirection_guest_base());
+        sub(w14, w16, w14);
+        mov(w15, code_cache_->indirection_guest_size());
+        cmp(w14, w15);
+        b(HS, uncovered);
+      }
+    }
     if (!code_cache_->encoded_indirection()) {
       // Fast path: table mapped at host VA == guest addr; slot holds raw
       // 32-bit host target.
@@ -767,6 +798,9 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
       ldr(x9, ptr(x14, static_cast<uint32_t>(0)));
 
       L(indirection_ready);
+    }
+    if (slot_ready) {
+      L(*slot_ready);
     }
     if (target_ready) {
       L(*target_ready);
@@ -1072,12 +1106,12 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address) {
     // Diagnostic only: costs a materialize + store on every loop back-edge, so
     // it stays off unless a wedge is being chased.
     static_assert(offsetof(ppc::PPCContext, last_safepoint_pc) < 16384);
-    mov(w9, guest_address);
-    str(w9, ptr(x20, static_cast<uint32_t>(
-                         offsetof(ppc::PPCContext, last_safepoint_pc))));
+    mov(w17, guest_address);
+    str(w17, ptr(x20, static_cast<uint32_t>(
+                          offsetof(ppc::PPCContext, last_safepoint_pc))));
   }
-  ldrb(w8, ptr(x20, flag_offset));
-  cbnz(w8, do_yield);
+  ldrb(w16, ptr(x20, flag_offset));
+  cbnz(w16, do_yield);
   L(after);
 }
 

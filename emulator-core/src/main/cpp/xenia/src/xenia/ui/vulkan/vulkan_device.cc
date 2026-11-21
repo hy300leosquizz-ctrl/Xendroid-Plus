@@ -19,14 +19,22 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+#include <dirent.h>
+#include "third_party/libadrenotools/include/adrenotools/bcenabler.h"
 #include "third_party/libadrenotools/include/adrenotools/driver.h"
 #endif
+
+DEFINE_string(
+    vulkan_mali_driver_override, "",
+    "Diagnostics: override the parsed Arm Mali proprietary driver version "
+    "string (e.g. 'r43p0' or 'r49p0') when applying the Mali errata table.",
+    "Vulkan");
 
 DEFINE_int32(
     vulkan_clamp_storage_buffer_range, 0,
@@ -234,6 +242,44 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   VkPhysicalDeviceFeatures supported_features = {};
   ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
+  bool bcn_patched_for_device = false;
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  // Older stock Qualcomm Adreno 6xx drivers (512.<514) support BCn texture
+  // decompression in hardware but mask format properties in software. Patch
+  // vkGetPhysicalDeviceFormatProperties once per process when running on the
+  // system driver with vulkan_adreno_bcenabler enabled.
+  if (with_gpu_emulation && vulkan_instance->custom_driver_path().empty() &&
+      cvars::vulkan_adreno_bcenabler &&
+      !supported_features.textureCompressionBC &&
+      properties.vendorID == 0x5143 && ifn.vkGetPhysicalDeviceFormatProperties) {
+    const uint32_t drv_major = VK_VERSION_MAJOR(properties.driverVersion);
+    const uint32_t drv_minor = VK_VERSION_MINOR(properties.driverVersion);
+    if (adrenotools_get_bcn_type(drv_major, drv_minor, properties.vendorID) ==
+        ADRENOTOOLS_BCN_PATCH) {
+      static std::mutex bcn_patch_mutex;
+      static bool bcn_patch_attempted = false;
+      static bool bcn_patch_succeeded = false;
+      std::lock_guard<std::mutex> lock(bcn_patch_mutex);
+      if (!bcn_patch_attempted) {
+        bcn_patch_attempted = true;
+        bcn_patch_succeeded = adrenotools_patch_bcn(
+            reinterpret_cast<void*>(ifn.vkGetPhysicalDeviceFormatProperties));
+        if (bcn_patch_succeeded) {
+          XELOGI(
+              "VulkanDevice: Patched stock Adreno 6xx driver ({}.{}) via "
+              "adrenotools bcenabler to expose hardware BCn formats",
+              drv_major, drv_minor);
+        } else {
+          XELOGW(
+              "VulkanDevice: adrenotools bcenabler patch failed on Adreno "
+              "driver {}.{}",
+              drv_major, drv_minor);
+        }
+      }
+      bcn_patched_for_device = bcn_patch_succeeded;
+    }
+  }
+#endif
   if (presenter_device &&
       (vulkan_instance->api_version() < VK_API_VERSION_1_3 ||
        properties.apiVersion < VK_API_VERSION_1_3)) {
@@ -331,10 +377,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #414.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_maintenance4, 1, 3)
   }
-  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
-    // #55. Dynamic rendering removes render pass/framebuffer overhead.
-    XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
-  }
 
   bool ext_GOOGLE_display_timing = false;
   if (with_swapchain) {
@@ -360,7 +402,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_1_2_KHR_shader_float_controls = false;
   bool ext_EXT_fragment_shader_interlock = false;
   bool ext_1_3_EXT_shader_demote_to_helper_invocation = false;
-  bool ext_1_3_KHR_dynamic_rendering = false;
   bool ext_EXT_non_seamless_cube_map = false;
   bool ext_EXT_custom_border_color = false;
   bool ext_1_3_EXT_subgroup_size_control = false;
@@ -403,14 +444,33 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_robustness2)
       // #252.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
-      // #55.
-      XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
-      // #233. In-pass reads of current attachments for tiler-native resolves.
-      XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering_local_read,
-                                             1, 4)
+      // #343. Ordered attachment access on tile-based GPUs (Mali / Adreno).
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_rasterization_order_attachment_access)
+      XE_UI_VULKAN_STRUCT_EXTENSION(ARM_rasterization_order_attachment_access)
+      // #55 / #233 / #258. VK_KHR_dynamic_rendering requires depth_stencil_resolve,
+      // create_renderpass2, multiview, and maintenance2, all promoted to
+      // Vulkan 1.2 core. Vulkan 1.0/1.1 drivers (such as Adreno 610) use
+      // standard render passes and framebuffers instead.
+      if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+        XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
+        // In-pass reads of current attachments for tiler-native resolves.
+        XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering_local_read,
+                                               1, 4)
+        // #258. Buffer device address (promoted to Vulkan 1.2).
+        XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_buffer_device_address, 1, 2)
+      }
       // #277.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(
           EXT_shader_demote_to_helper_invocation, 1, 3)
+      // #284. Exact float24 constant depth bias units.
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_depth_bias_control)
+      // #291 + #321. Graphics pipeline libraries for fast partial linking.
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_library)
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_graphics_pipeline_library)
+      // #483. Shader objects for zero-PSO draw binding with dynamic rendering.
+      if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
+        XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_object)
+      }
       // #423.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_non_seamless_cube_map)
       // #288. Custom sampler border colors (for YCbCr border colors).
@@ -422,8 +482,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_LOCAL_EXTENSION(KHR_fragment_shader_barycentric)
       XE_UI_VULKAN_LOCAL_EXTENSION(NV_fragment_shader_barycentric)
       // #456. Per-sub-feature dynamic state used to collapse pipeline key
-      // permutations. EDS1/EDS2 are core in 1.3; only EDS3 needs an extension.
-      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_extended_dynamic_state3)
+      // permutations. EDS1/EDS2 are core in 1.3; only request EDS3 when 1.3
+      // dynamic state is usable.
+      if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+        XE_UI_VULKAN_STRUCT_EXTENSION(EXT_extended_dynamic_state3)
+      }
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       // #237.
@@ -566,6 +629,49 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         }
       }
     }
+    for (const auto& requested_extension : requested_extensions) {
+      if (!*requested_extension.second) {
+        XELOGI("Vulkan device extension not available: {}",
+               requested_extension.first);
+      }
+    }
+  }
+  const auto erase_enabled_extension = [&](const char* ext_name) {
+    enabled_extensions.erase(
+        std::remove_if(
+            enabled_extensions.begin(), enabled_extensions.end(),
+            [ext_name](const char* name) { return !std::strcmp(name, ext_name); }),
+        enabled_extensions.end());
+  };
+  // VK_EXT_graphics_pipeline_library requires VK_KHR_pipeline_library.
+  if (device->extensions_.ext_EXT_graphics_pipeline_library &&
+      !device->extensions_.ext_KHR_pipeline_library) {
+    device->extensions_.ext_EXT_graphics_pipeline_library = false;
+    erase_enabled_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+  }
+  // VK_EXT_shader_object requires VK_KHR_dynamic_rendering (or Vulkan 1.3).
+  if (device->extensions_.ext_EXT_shader_object &&
+      properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0) &&
+      !device->extensions_.ext_1_3_KHR_dynamic_rendering) {
+    device->extensions_.ext_EXT_shader_object = false;
+    erase_enabled_extension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
+  }
+
+  // VK_KHR_dynamic_rendering_local_read requires VK_KHR_dynamic_rendering (or
+  // Vulkan 1.3 core). Drop it if dynamic rendering is unavailable.
+  if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0) &&
+      !device->extensions_.ext_1_3_KHR_dynamic_rendering &&
+      device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read) {
+    device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read = false;
+    enabled_extensions.erase(
+        std::remove_if(enabled_extensions.begin(), enabled_extensions.end(),
+                       [](const char* ext_name) {
+                         return std::strcmp(
+                                    ext_name,
+                                    VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME) ==
+                                0;
+                       }),
+        enabled_extensions.end());
   }
 
   if (with_swapchain && !device->extensions_.ext_KHR_swapchain) {
@@ -696,6 +802,28 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VkPhysicalDeviceFragmentShadingRatePropertiesKHR
       properties_KHR_fragment_shading_rate = {
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+  VulkanFeatures<
+      VkPhysicalDeviceBufferDeviceAddressFeaturesKHR,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR>
+      features_1_2_KHR_buffer_device_address;
+  VulkanFeatures<
+      VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT>
+      features_EXT_rasterization_order_attachment_access;
+  VulkanFeatures<
+      VkPhysicalDeviceDepthBiasControlFeaturesEXT,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT>
+      features_EXT_depth_bias_control;
+  VulkanFeatures<VkPhysicalDeviceShaderObjectFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT>
+      features_EXT_shader_object;
+  VulkanFeatures<
+      VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT>
+      features_EXT_graphics_pipeline_library;
+  VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT
+      properties_EXT_graphics_pipeline_library = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
 
   // All QCOM probe structures are linked for supported queries only. v2,
   // cubic weights/clamp are never linked to device creation in this batch.
@@ -773,6 +901,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         features_KHR_timeline_semaphore.Link(supported_features_2,
                                              device_create_info);
       }
+      if (device->extensions_.ext_1_2_KHR_buffer_device_address) {
+        features_1_2_KHR_buffer_device_address.Link(supported_features_2,
+                                                    device_create_info);
+      }
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
       features_1_3.Link(supported_features_2, device_create_info);
@@ -781,7 +913,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         features_1_3_EXT_shader_demote_to_helper_invocation.Link(
             supported_features_2, device_create_info);
       }
-      if (ext_1_3_KHR_dynamic_rendering) {
+      if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
         features_1_3_KHR_dynamic_rendering.Link(supported_features_2,
                                                 device_create_info);
       }
@@ -858,6 +990,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
                                               device_create_info);
       properties_KHR_fragment_shading_rate.pNext = properties_2.pNext;
       properties_2.pNext = &properties_KHR_fragment_shading_rate;
+    }
+    if (device->extensions_.ext_EXT_rasterization_order_attachment_access ||
+        device->extensions_.ext_ARM_rasterization_order_attachment_access) {
+      features_EXT_rasterization_order_attachment_access.Link(
+          supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_depth_bias_control) {
+      features_EXT_depth_bias_control.Link(supported_features_2,
+                                           device_create_info);
+    }
+    if (device->extensions_.ext_EXT_shader_object) {
+      features_EXT_shader_object.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_graphics_pipeline_library) {
+      features_EXT_graphics_pipeline_library.Link(supported_features_2,
+                                                  device_create_info);
+      properties_EXT_graphics_pipeline_library.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_EXT_graphics_pipeline_library;
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -1218,6 +1368,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxImageDimension3D)
   XE_UI_VULKAN_LIMIT(maxImageDimensionCube)
   XE_UI_VULKAN_LIMIT(maxImageArrayLayers)
+  XE_UI_VULKAN_LIMIT(maxDrawIndirectCount)
   XE_UI_VULKAN_LIMIT(maxStorageBufferRange)
   if (cvars::vulkan_clamp_storage_buffer_range > 0) {
     device->properties_.maxStorageBufferRange =
@@ -1261,6 +1412,47 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(optimalBufferCopyRowPitchAlignment)
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
 
+  // Parse Arm Mali proprietary driver version (r<M>p<N>) for the SDEN-3735689
+  // errata table across Valhall / CSF / Immortalis generations (r32..r52+).
+  bool is_arm_proprietary =
+      device->properties_.driverID == VK_DRIVER_ID_ARM_PROPRIETARY ||
+      (device->properties_.driverID == VkDriverId(0) &&
+       properties.vendorID == 0x13B5);
+  if (is_arm_proprietary || !cvars::vulkan_mali_driver_override.empty()) {
+    const char* version_source =
+        !cvars::vulkan_mali_driver_override.empty()
+            ? cvars::vulkan_mali_driver_override.c_str()
+            : properties_1_2_KHR_driver_properties.driverInfo;
+    int32_t mali_major_r = 0;
+    int32_t mali_minor_p = 0;
+    for (const char* p = version_source; p && *p; ++p) {
+      if (*p == 'r' && p[1] >= '0' && p[1] <= '9') {
+        unsigned int r_val = 0;
+        unsigned int p_val = 0;
+        if (std::sscanf(p, "r%up%u", &r_val, &p_val) == 2) {
+          mali_major_r = int32_t(r_val);
+          mali_minor_p = int32_t(p_val);
+          break;
+        }
+      }
+    }
+    device->properties_.maliDriverMajorR = mali_major_r;
+    device->properties_.maliDriverMinorP = mali_minor_p;
+    if (!cvars::vulkan_mali_driver_override.empty()) {
+      is_arm_proprietary = true;
+    }
+    XELOGI("* Mali driver version: r{}p{} (raw='{}')", mali_major_r,
+           mali_minor_p, version_source ? version_source : "");
+    if (with_gpu_emulation && (mali_major_r <= 0 || mali_major_r < 47)) {
+      device->properties_.maliCapSpirv13 = true;
+      device->properties_.maliRewriteScalarSelect = true;
+      XELOGI(
+          "* Mali errata (r{}p{} < r47p0): capping guest SPIR-V to 1.3 and "
+          "rewriting scalar OpSelect",
+          mali_major_r, mali_minor_p);
+    }
+  }
+
   if (with_gpu_emulation) {
     XE_UI_VULKAN_FEATURE(robustBufferAccess)
     XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
@@ -1271,6 +1463,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(depthClamp)
     XE_UI_VULKAN_FEATURE(fillModeNonSolid)
     XE_UI_VULKAN_FEATURE(samplerAnisotropy)
+    XE_UI_VULKAN_FEATURE(textureCompressionETC2)
+    XE_UI_VULKAN_FEATURE(textureCompressionASTC_LDR)
+    XE_UI_VULKAN_FEATURE(textureCompressionBC)
+    if (!device->properties_.textureCompressionBC && bcn_patched_for_device) {
+      // Do not set enabled_features.textureCompressionBC when the unpatched
+      // feature table reported VK_FALSE (or vkCreateDevice would fail);
+      // VulkanTextureCache queries vkGetPhysicalDeviceFormatProperties per BCn
+      // format, which adrenotools_patch_bcn has enabled.
+      device->properties_.textureCompressionBC = true;
+      XELOGI("* textureCompressionBC (adrenotools bcenabler)");
+    }
     XE_UI_VULKAN_FEATURE(occlusionQueryPrecise)
     XE_UI_VULKAN_FEATURE(vertexPipelineStoresAndAtomics)
     XE_UI_VULKAN_FEATURE(fragmentStoresAndAtomics)
@@ -1307,6 +1510,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, shaderFloat16);
       XE_UI_VULKAN_FEATURE_2(features_1_2, vulkanMemoryModel);
       XE_UI_VULKAN_FEATURE_2(features_1_2, vulkanMemoryModelDeviceScope);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
     }
   } else {
     if (ext_1_2_KHR_timeline_semaphore) {
@@ -1322,7 +1526,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (ext_1_2_KHR_shader_float16_int8 && with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_KHR_shader_float16_int8, shaderFloat16);
     }
+    if (device->extensions_.ext_1_2_KHR_buffer_device_address &&
+        with_gpu_emulation) {
+      XE_UI_VULKAN_FEATURE_2(features_1_2_KHR_buffer_device_address,
+                             bufferDeviceAddress);
+    }
   }
+  device->extensions_.ext_1_2_KHR_buffer_device_address =
+      device->properties_.bufferDeviceAddress;
+  device->extensions_.ext_KHR_buffer_device_address =
+      device->properties_.bufferDeviceAddress;
   device->extensions_.ext_1_2_EXT_host_query_reset =
       ext_1_2_EXT_host_query_reset;
   if (ext_EXT_robustness2 && with_gpu_emulation) {
@@ -1343,10 +1556,27 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  // Arm Mali SDEN-3735689 errata: VK_KHR_dynamic_rendering has secondary CB,
+  // occlusion query, and depth/stencil suspension bugs across r32..r51; keep
+  // Mali < r52 on classic VkRenderPass so AFBC + subpass tile fusion stay safe.
+  const bool mali_block_dynamic_rendering =
+      is_arm_proprietary &&
+      (device->properties_.maliDriverMajorR <= 0 ||
+       device->properties_.maliDriverMajorR < 52);
+  if (mali_block_dynamic_rendering && with_gpu_emulation) {
+    XELOGI(
+        "* Mali errata (r{}p{} < r52p0): disabling dynamicRendering in favor "
+        "of classic VkRenderPass",
+        device->properties_.maliDriverMajorR,
+        device->properties_.maliDriverMinorP);
+  }
+
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_1_3, shaderDemoteToHelperInvocation);
-      XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
+      if (!mali_block_dynamic_rendering) {
+        XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
+      }
     }
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
     if (with_gpu_emulation || presenter_device) {
@@ -1361,18 +1591,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
             shaderDemoteToHelperInvocation);
       }
     }
-    if (ext_1_3_KHR_dynamic_rendering) {
-      if (with_gpu_emulation) {
+    if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
+      if (with_gpu_emulation && !mali_block_dynamic_rendering) {
         XE_UI_VULKAN_FEATURE_2(features_1_3_KHR_dynamic_rendering,
                                dynamicRendering);
       }
     }
   }
+  if (!device->properties_.dynamicRendering &&
+      properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+    device->extensions_.ext_1_3_KHR_dynamic_rendering = false;
+  }
 
   if (device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read &&
-      with_gpu_emulation) {
+      with_gpu_emulation && device->properties_.dynamicRendering) {
     XE_UI_VULKAN_FEATURE_2(features_1_4_KHR_dynamic_rendering_local_read,
                            dynamicRenderingLocalRead);
+  } else if (!device->properties_.dynamicRendering) {
+    device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read = false;
   }
 
   if (ext_KHR_portability_subset) {
@@ -1509,8 +1745,26 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   // actually makes dynamic into the enabled struct (leaving the rest disabled
   // avoids requesting unsupported sub-features at device creation).
   if (with_gpu_emulation) {
+    const int32_t mali_rp = device->properties_.maliDriverMajorR * 100 +
+                            device->properties_.maliDriverMinorP;
+    const bool mali_job_manager = device->properties_.maxDrawIndirectCount <= 1;
+    const bool mali_block_eds =
+        is_arm_proprietary &&
+        (device->properties_.maliDriverMajorR <= 0 || mali_rp < 4401 ||
+         device->properties_.maliDriverMajorR == 44 ||
+         (mali_job_manager && device->properties_.maliDriverMajorR >= 46 &&
+          device->properties_.maliDriverMajorR <= 50));
     device->properties_.extendedDynamicState =
-        properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0);
+        properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0) &&
+        !mali_block_eds;
+    if (mali_block_eds &&
+        properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+      XELOGI(
+          "* Mali errata (r{}p{}, job_manager={}): disabling "
+          "extendedDynamicState",
+          device->properties_.maliDriverMajorR,
+          device->properties_.maliDriverMinorP, mali_job_manager);
+    }
     if (device->properties_.extendedDynamicState) {
       XELOGI("* extendedDynamicState (core 1.3)");
     }
@@ -1532,10 +1786,69 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   // feature to enable - read it from the properties structure (valid only when
   // the extension is present and queried above). When false, dynamic topology
   // must stay within its class, so the class is kept in the pipeline key.
-  if (device->extensions_.ext_EXT_extended_dynamic_state3) {
+  if (device->extensions_.ext_EXT_extended_dynamic_state3 &&
+      device->properties_.extendedDynamicState) {
     device->properties_.extendedDynamicState3PrimitiveTopologyUnrestricted =
         properties_EXT_extended_dynamic_state3
             .dynamicPrimitiveTopologyUnrestricted;
+  } else {
+    device->extensions_.ext_EXT_extended_dynamic_state3 = false;
+  }
+
+  if ((device->extensions_.ext_EXT_rasterization_order_attachment_access ||
+       device->extensions_.ext_ARM_rasterization_order_attachment_access) &&
+      with_gpu_emulation) {
+    XE_UI_VULKAN_FEATURE_2(
+        features_EXT_rasterization_order_attachment_access,
+        rasterizationOrderColorAttachmentAccess);
+    XE_UI_VULKAN_FEATURE_2(
+        features_EXT_rasterization_order_attachment_access,
+        rasterizationOrderDepthAttachmentAccess);
+    XE_UI_VULKAN_FEATURE_2(
+        features_EXT_rasterization_order_attachment_access,
+        rasterizationOrderStencilAttachmentAccess);
+    if (!device->properties_.rasterizationOrderColorAttachmentAccess &&
+        !device->properties_.rasterizationOrderDepthAttachmentAccess &&
+        !device->properties_.rasterizationOrderStencilAttachmentAccess) {
+      device->extensions_.ext_EXT_rasterization_order_attachment_access = false;
+      device->extensions_.ext_ARM_rasterization_order_attachment_access = false;
+    }
+  }
+
+  if (device->extensions_.ext_EXT_depth_bias_control && with_gpu_emulation) {
+    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, depthBiasControl);
+    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control,
+                           leastRepresentableValueForceUnormRepresentation);
+    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, depthBiasExact);
+    if (!device->properties_.depthBiasControl) {
+      device->extensions_.ext_EXT_depth_bias_control = false;
+    }
+  }
+
+  if (device->extensions_.ext_EXT_graphics_pipeline_library &&
+      with_gpu_emulation) {
+    XE_UI_VULKAN_FEATURE_2(features_EXT_graphics_pipeline_library,
+                           graphicsPipelineLibrary);
+    if (device->properties_.graphicsPipelineLibrary) {
+      XE_UI_VULKAN_PROPERTY_2(properties_EXT_graphics_pipeline_library,
+                              graphicsPipelineLibraryFastLinking);
+      XE_UI_VULKAN_PROPERTY_2(
+          properties_EXT_graphics_pipeline_library,
+          graphicsPipelineLibraryIndependentInterpolationDecoration);
+    } else {
+      device->extensions_.ext_EXT_graphics_pipeline_library = false;
+    }
+  }
+
+  // VK_EXT_shader_object requires dynamicRendering to be enabled.
+  if (device->extensions_.ext_EXT_shader_object && with_gpu_emulation &&
+      device->properties_.dynamicRendering) {
+    XE_UI_VULKAN_FEATURE_2(features_EXT_shader_object, shaderObject);
+    if (!device->properties_.shaderObject) {
+      device->extensions_.ext_EXT_shader_object = false;
+    }
+  } else {
+    device->extensions_.ext_EXT_shader_object = false;
   }
 
 #undef XE_UI_VULKAN_LIMIT
@@ -1731,7 +2044,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #include "xenia/ui/vulkan/functions/device_1_2_ext_host_query_reset.inc"
   }
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
-#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
 #include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
     // VK_EXT_extended_dynamic_state (#268) + VK_EXT_extended_dynamic_state2
     // (#378) setters and the core topology/restart setters, all promoted to
@@ -1740,9 +2052,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #include "xenia/ui/vulkan/functions/device_ext_extended_dynamic_state.inc"
 #include "xenia/ui/vulkan/functions/device_1_3_core_dynamic_topology.inc"
     }
-  }
-  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 4, 0)) {
-#include "xenia/ui/vulkan/functions/device_1_4_khr_dynamic_rendering_local_read.inc"
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
@@ -1769,14 +2078,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (device->extensions_.ext_1_3_KHR_maintenance4) {
 #include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
     }
-    if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
-#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
-    }
-  }
-  if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 4, 0)) {
-    if (device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read) {
-#include "xenia/ui/vulkan/functions/device_1_4_khr_dynamic_rendering_local_read.inc"
-    }
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include "xenia/ui/vulkan/functions/device_khr_swapchain.inc"
@@ -1784,6 +2085,72 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION
+
+  // Dynamic rendering (#55) and local read (#233) are optional fast paths -
+  // load them non-fatally and fall back to VkRenderPass if entry points are
+  // missing on the active driver/wrapper instead of leaving null pointers or
+  // failing device initialization.
+  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0) ||
+      device->extensions_.ext_1_3_KHR_dynamic_rendering) {
+    bool dr_functions_loaded = true;
+    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  dr_functions_loaded &=                                          \
+      (dfn.core_name = PFN_##core_name(                           \
+           ifn.vkGetDeviceProcAddr(device->device_, #core_name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+    } else {
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  dr_functions_loaded &=                                          \
+      (dfn.core_name = PFN_##core_name(ifn.vkGetDeviceProcAddr(   \
+           device->device_, #extension_name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+    }
+    if (!dr_functions_loaded) {
+      XELOGW(
+          "VulkanDevice: Dynamic rendering entry points missing on '{}', "
+          "falling back to render passes",
+          properties.deviceName);
+      device->extensions_.ext_1_3_KHR_dynamic_rendering = false;
+      device->properties_.dynamicRendering = false;
+      device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read = false;
+      device->properties_.dynamicRenderingLocalRead = false;
+    }
+  } else {
+    device->properties_.dynamicRendering = false;
+    device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read = false;
+    device->properties_.dynamicRenderingLocalRead = false;
+  }
+
+  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 4, 0) ||
+      device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read) {
+    bool dr_local_read_loaded = true;
+    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 4, 0)) {
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  dr_local_read_loaded &=                                         \
+      (dfn.core_name = PFN_##core_name(                           \
+           ifn.vkGetDeviceProcAddr(device->device_, #core_name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_1_4_khr_dynamic_rendering_local_read.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+    } else {
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  dr_local_read_loaded &=                                         \
+      (dfn.core_name = PFN_##core_name(ifn.vkGetDeviceProcAddr(   \
+           device->device_, #extension_name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_1_4_khr_dynamic_rendering_local_read.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+    }
+    if (!dr_local_read_loaded) {
+      XELOGW(
+          "VulkanDevice: Dynamic rendering local read entry points missing on "
+          "'{}', disabling local read",
+          properties.deviceName);
+      device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read = false;
+      device->properties_.dynamicRenderingLocalRead = false;
+    }
+  }
 
   // VK_EXT_extended_dynamic_state3 (#456) is optional and never promoted - load
   // its EXT-named setters non-fatally (like vkGetDeviceFaultInfoEXT). If any are
@@ -1858,6 +2225,121 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
             device->device_, "vkGetMemoryHostPointerPropertiesEXT"));
     if (!device->vkGetMemoryHostPointerPropertiesEXT_) {
       device->extensions_.ext_EXT_external_memory_host = false;
+    }
+  }
+
+  // Optional VK_KHR_buffer_device_address (promoted to Vulkan 1.2).
+  if (device->properties_.bufferDeviceAddress) {
+    dfn.vkGetBufferDeviceAddress = PFN_vkGetBufferDeviceAddress(
+        ifn.vkGetDeviceProcAddr(
+            device->device_,
+            properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)
+                ? "vkGetBufferDeviceAddress"
+                : "vkGetBufferDeviceAddressKHR"));
+    if (!dfn.vkGetBufferDeviceAddress) {
+      dfn.vkGetBufferDeviceAddress = PFN_vkGetBufferDeviceAddress(
+          ifn.vkGetDeviceProcAddr(device->device_,
+                                  "vkGetBufferDeviceAddressKHR"));
+    }
+    dfn.vkGetBufferDeviceAddressKHR = PFN_vkGetBufferDeviceAddressKHR(
+        ifn.vkGetDeviceProcAddr(device->device_,
+                                "vkGetBufferDeviceAddressKHR"));
+    if (!dfn.vkGetBufferDeviceAddressKHR) {
+      dfn.vkGetBufferDeviceAddressKHR = dfn.vkGetBufferDeviceAddress;
+    }
+    if (!dfn.vkGetBufferDeviceAddress) {
+      device->properties_.bufferDeviceAddress = false;
+      device->extensions_.ext_1_2_KHR_buffer_device_address = false;
+      device->extensions_.ext_KHR_buffer_device_address = false;
+    }
+  }
+
+  // Optional VK_EXT_depth_bias_control (#284).
+  if (device->extensions_.ext_EXT_depth_bias_control) {
+    dfn.vkCmdSetDepthBias2EXT = PFN_vkCmdSetDepthBias2EXT(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkCmdSetDepthBias2EXT"));
+    if (!dfn.vkCmdSetDepthBias2EXT) {
+      device->extensions_.ext_EXT_depth_bias_control = false;
+      device->properties_.depthBiasControl = false;
+      device->properties_.leastRepresentableValueForceUnormRepresentation =
+          false;
+      device->properties_.depthBiasExact = false;
+    }
+  }
+
+  // Optional VK_EXT_shader_object (#483) and its required dynamic state
+  // setters (core 1.3 entry points with EXT fallbacks).
+  if (device->properties_.shaderObject) {
+    const auto load_proc = [&](const char* primary, const char* fallback) {
+      PFN_vkVoidFunction fn =
+          ifn.vkGetDeviceProcAddr(device->device_, primary);
+      if (!fn && fallback) {
+        fn = ifn.vkGetDeviceProcAddr(device->device_, fallback);
+      }
+      return fn;
+    };
+    dfn.vkCreateShadersEXT =
+        PFN_vkCreateShadersEXT(load_proc("vkCreateShadersEXT", nullptr));
+    dfn.vkDestroyShaderEXT =
+        PFN_vkDestroyShaderEXT(load_proc("vkDestroyShaderEXT", nullptr));
+    dfn.vkGetShaderBinaryDataEXT = PFN_vkGetShaderBinaryDataEXT(
+        load_proc("vkGetShaderBinaryDataEXT", nullptr));
+    dfn.vkCmdBindShadersEXT =
+        PFN_vkCmdBindShadersEXT(load_proc("vkCmdBindShadersEXT", nullptr));
+    dfn.vkCmdSetVertexInputEXT = PFN_vkCmdSetVertexInputEXT(
+        load_proc("vkCmdSetVertexInputEXT", nullptr));
+    dfn.vkCmdSetViewportWithCount = PFN_vkCmdSetViewportWithCount(load_proc(
+        "vkCmdSetViewportWithCount", "vkCmdSetViewportWithCountEXT"));
+    dfn.vkCmdSetScissorWithCount = PFN_vkCmdSetScissorWithCount(
+        load_proc("vkCmdSetScissorWithCount", "vkCmdSetScissorWithCountEXT"));
+    dfn.vkCmdSetRasterizerDiscardEnable = PFN_vkCmdSetRasterizerDiscardEnable(
+        load_proc("vkCmdSetRasterizerDiscardEnable",
+                  "vkCmdSetRasterizerDiscardEnableEXT"));
+    dfn.vkCmdSetDepthBiasEnable = PFN_vkCmdSetDepthBiasEnable(
+        load_proc("vkCmdSetDepthBiasEnable", "vkCmdSetDepthBiasEnableEXT"));
+    dfn.vkCmdSetRasterizationSamplesEXT = PFN_vkCmdSetRasterizationSamplesEXT(
+        load_proc("vkCmdSetRasterizationSamplesEXT", nullptr));
+    dfn.vkCmdSetSampleMaskEXT =
+        PFN_vkCmdSetSampleMaskEXT(load_proc("vkCmdSetSampleMaskEXT", nullptr));
+    dfn.vkCmdSetAlphaToCoverageEnableEXT = PFN_vkCmdSetAlphaToCoverageEnableEXT(
+        load_proc("vkCmdSetAlphaToCoverageEnableEXT", nullptr));
+    dfn.vkCmdSetAlphaToOneEnableEXT = PFN_vkCmdSetAlphaToOneEnableEXT(
+        load_proc("vkCmdSetAlphaToOneEnableEXT", nullptr));
+    dfn.vkCmdSetLogicOpEnableEXT = PFN_vkCmdSetLogicOpEnableEXT(
+        load_proc("vkCmdSetLogicOpEnableEXT", nullptr));
+    dfn.vkCmdSetDepthBoundsTestEnable = PFN_vkCmdSetDepthBoundsTestEnable(
+        load_proc("vkCmdSetDepthBoundsTestEnable",
+                  "vkCmdSetDepthBoundsTestEnableEXT"));
+    // Ensure EDS1/2/3 setters required while binding VkShaderEXT are populated
+    // even if VK_EXT_extended_dynamic_state3 itself was not advertised.
+    if (!dfn.vkCmdSetDepthClampEnableEXT) {
+      dfn.vkCmdSetDepthClampEnableEXT = PFN_vkCmdSetDepthClampEnableEXT(
+          load_proc("vkCmdSetDepthClampEnableEXT", nullptr));
+    }
+    if (!dfn.vkCmdSetPolygonModeEXT) {
+      dfn.vkCmdSetPolygonModeEXT = PFN_vkCmdSetPolygonModeEXT(
+          load_proc("vkCmdSetPolygonModeEXT", nullptr));
+    }
+    if (!dfn.vkCmdSetColorBlendEnableEXT) {
+      dfn.vkCmdSetColorBlendEnableEXT = PFN_vkCmdSetColorBlendEnableEXT(
+          load_proc("vkCmdSetColorBlendEnableEXT", nullptr));
+    }
+    if (!dfn.vkCmdSetColorBlendEquationEXT) {
+      dfn.vkCmdSetColorBlendEquationEXT = PFN_vkCmdSetColorBlendEquationEXT(
+          load_proc("vkCmdSetColorBlendEquationEXT", nullptr));
+    }
+    if (!dfn.vkCmdSetColorWriteMaskEXT) {
+      dfn.vkCmdSetColorWriteMaskEXT = PFN_vkCmdSetColorWriteMaskEXT(
+          load_proc("vkCmdSetColorWriteMaskEXT", nullptr));
+    }
+    if (!dfn.vkCreateShadersEXT || !dfn.vkDestroyShaderEXT ||
+        !dfn.vkCmdBindShadersEXT || !dfn.vkCmdSetVertexInputEXT ||
+        !dfn.vkCmdSetViewportWithCount || !dfn.vkCmdSetScissorWithCount ||
+        !dfn.vkCmdSetRasterizerDiscardEnable || !dfn.vkCmdSetDepthBiasEnable ||
+        !dfn.vkCmdSetRasterizationSamplesEXT || !dfn.vkCmdSetSampleMaskEXT ||
+        !dfn.vkCmdSetAlphaToCoverageEnableEXT) {
+      device->properties_.shaderObject = false;
+      device->extensions_.ext_EXT_shader_object = false;
     }
   }
 
@@ -2068,6 +2550,28 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       }
     }
   }
+  // On Arm Mali proprietary drivers, vkInvalidateMappedMemoryRanges executes
+  // ARM64 DC CIVAC (Clean & Invalidate), which can overwrite fresh GPU readback
+  // bytes if the CPU dirtied any byte in the same 64B cacheline. Restrict
+  // host-visible/UMA buffer selection to HOST_COHERENT types when available.
+  if (is_arm_proprietary &&
+      (device->memory_types_.host_visible &
+       device->memory_types_.host_coherent) != 0) {
+    const uint32_t non_coherent =
+        device->memory_types_.host_visible &
+        ~device->memory_types_.host_coherent;
+    if (non_coherent) {
+      device->memory_types_.host_visible &=
+          device->memory_types_.host_coherent;
+      device->memory_types_.host_cached &= device->memory_types_.host_coherent;
+      device->memory_types_.device_local_host_visible &=
+          device->memory_types_.host_coherent;
+      XELOGI(
+          "VulkanDevice: Enforcing HOST_COHERENT on Mali UMA/readback memory "
+          "(masked non-coherent types 0x{:X})",
+          non_coherent);
+    }
+  }
 
   XELOGI("ZeroFGProbe: VK_GOOGLE_display_timing available={}",
          zerofg_display_timing_available ? "YES" : "NO");
@@ -2174,6 +2678,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 }
 
 VulkanDevice::~VulkanDevice() {
+  if (!is_zerofg_presenter_device()) {
+    ReleaseGpuPowerControl("device_shutdown");
+  }
   if (device_) {
     vulkan_instance_->functions().vkDestroyDevice(device_, nullptr);
   }
@@ -2260,23 +2767,133 @@ void VulkanDevice::LogFaultInfo() {
 
 std::optional<uint32_t> VulkanDevice::QueryGpuBusyPermille() const {
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
-  // Adreno only: KGSL's busy and total time over its last update period.
-  if (properties_.vendorID != 0x5143) {
+  auto parse_busy_line = [](const char* line) -> std::optional<uint32_t> {
+    if (!line || !*line) {
+      return std::nullopt;
+    }
+    // Format 1: devfreq "util@freq" (e.g. "42@850000000Hz").
+    unsigned long long util_at = 0;
+    unsigned long long freq_at = 0;
+    if (std::sscanf(line, "%llu@%llu", &util_at, &freq_at) == 2) {
+      return uint32_t(std::min<unsigned long long>(util_at, 100ULL) * 10ULL);
+    }
+    // Format 2: KGSL / pair "busy total" (two counters) vs single percentage.
+    unsigned long long first = 0;
+    unsigned long long second = 0;
+    const int fields = std::sscanf(line, "%llu %llu", &first, &second);
+    if (fields == 2) {
+      return second
+                 ? uint32_t(std::min(first, second) * 1000ULL / second)
+                 : 0u;
+    }
+    if (fields == 1) {
+      return uint32_t(std::min<unsigned long long>(first, 100ULL) * 10ULL);
+    }
     return std::nullopt;
+  };
+
+  auto try_read_permille = [&](const char* path) -> std::optional<uint32_t> {
+    if (!path || !*path) {
+      return std::nullopt;
+    }
+    std::FILE* file = std::fopen(path, "r");
+    if (!file) {
+      return std::nullopt;
+    }
+    char buf[128] = {};
+    const bool ok = std::fgets(buf, sizeof(buf), file) != nullptr;
+    std::fclose(file);
+    if (!ok) {
+      return std::nullopt;
+    }
+    return parse_busy_line(buf);
+  };
+
+  // Fast path on Qualcomm Adreno KGSL.
+  if (properties_.vendorID == 0x5143) {
+    if (auto kgsl = try_read_permille("/sys/class/kgsl/kgsl-3d0/gpubusy")) {
+      return kgsl;
+    }
   }
-  std::FILE* file = std::fopen("/sys/class/kgsl/kgsl-3d0/gpubusy", "r");
-  if (!file) {
-    return std::nullopt;
+
+  // Discover and cache a readable GPU utilization sysfs node once per process
+  // across Android GKI (/sys/kernel/gpu/gpu_busy), Arm Mali / Immortalis,
+  // MediaTek GED, and Samsung Exynos / Xclipse.
+  static std::once_flag probe_once;
+  static std::string cached_busy_path;
+  std::call_once(probe_once, [&]() {
+    static constexpr const char* kFixedCandidates[] = {
+        "/sys/kernel/gpu/gpu_busy",
+        "/sys/class/kgsl/kgsl-3d0/gpubusy",
+        "/sys/class/misc/mali0/device/utilization",
+        "/sys/devices/platform/mali.0/utilization",
+        "/sys/module/ged/parameters/gpu_loading",
+    };
+    for (const char* candidate : kFixedCandidates) {
+      if (try_read_permille(candidate).has_value()) {
+        cached_busy_path = candidate;
+        return;
+      }
+    }
+    static constexpr const char* kPlatformDirs[] = {
+        "/sys/devices/platform/soc",
+        "/sys/devices/platform",
+    };
+    for (const char* base_dir : kPlatformDirs) {
+      DIR* dir = opendir(base_dir);
+      if (!dir) {
+        continue;
+      }
+      while (struct dirent* entry = readdir(dir)) {
+        if (entry->d_name[0] == '.') {
+          continue;
+        }
+        const std::string name(entry->d_name);
+        if (name.find("mali") == std::string::npos &&
+            name.find("gpu") == std::string::npos &&
+            name.find("g3d") == std::string::npos) {
+          continue;
+        }
+        for (const char* leaf : {"utilization", "gpu_busy", "load"}) {
+          const std::string candidate =
+              std::string(base_dir) + "/" + name + "/" + leaf;
+          if (try_read_permille(candidate.c_str()).has_value()) {
+            cached_busy_path = candidate;
+            closedir(dir);
+            return;
+          }
+        }
+      }
+      closedir(dir);
+    }
+    if (DIR* devfreq_dir = opendir("/sys/class/devfreq")) {
+      while (struct dirent* entry = readdir(devfreq_dir)) {
+        if (entry->d_name[0] == '.') {
+          continue;
+        }
+        const std::string name(entry->d_name);
+        if (name.find("mali") == std::string::npos &&
+            name.find("gpu") == std::string::npos &&
+            name.find("g3d") == std::string::npos &&
+            name.find("kgsl") == std::string::npos) {
+          continue;
+        }
+        const std::string candidate =
+            std::string("/sys/class/devfreq/") + name + "/load";
+        if (try_read_permille(candidate.c_str()).has_value()) {
+          cached_busy_path = candidate;
+          closedir(devfreq_dir);
+          return;
+        }
+      }
+      closedir(devfreq_dir);
+    }
+  });
+
+  if (!cached_busy_path.empty()) {
+    return try_read_permille(cached_busy_path.c_str());
   }
-  unsigned long long busy = 0;
-  unsigned long long total = 0;
-  const int fields = std::fscanf(file, "%llu %llu", &busy, &total);
-  std::fclose(file);
-  if (fields != 2) {
-    return std::nullopt;
-  }
-  // 0 0 while the GPU is powered down: idle, not unavailable.
-  return total ? uint32_t(std::min(busy, total) * 1000 / total) : 0u;
+  return std::nullopt;
 #else
   return std::nullopt;
 #endif

@@ -8,6 +8,9 @@
  */
 
 #include "xenia/vfs/devices/xcontent_devices/stfs_container_device.h"
+
+#include <algorithm>
+
 #include "xenia/base/logging.h"
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/vfs/devices/xcontent_devices/stfs_container_entry.h"
@@ -15,9 +18,21 @@
 namespace xe {
 namespace vfs {
 
+StfsContainerDevice::StfsContainerDevice(
+    const std::string_view mount_path, const std::filesystem::path& host_path,
+    std::unique_ptr<XContentContainerHeader> header, size_t files_size,
+    std::unique_ptr<xe::filesystem::FileHandle> host_file)
+    : XContentContainerDevice(mount_path, host_path, std::move(header),
+                              files_size),
+      blocks_per_hash_table_(1),
+      block_step_{0, 0},
+      host_file_(std::move(host_file)) {
+  SetName("STFS");
+}
+
 StfsContainerDevice::StfsContainerDevice(const std::string_view mount_path,
-                                         const std::filesystem::path& host_path)
-    : XContentContainerDevice(mount_path, host_path),
+                                         File* package_file)
+    : XContentContainerDevice(mount_path, package_file),
       blocks_per_hash_table_(1),
       block_step_{0, 0} {
   SetName("STFS");
@@ -26,7 +41,6 @@ StfsContainerDevice::StfsContainerDevice(const std::string_view mount_path,
 StfsContainerDevice::~StfsContainerDevice() {}
 
 void StfsContainerDevice::SetupContainer() {
-  // Additional part specific to STFS container.
   const XContentContainerHeader* header = GetContainerHeader();
   blocks_per_hash_table_ = header->is_package_readonly() ? 1 : 2;
 
@@ -41,23 +55,16 @@ XContentContainerDevice::Result StfsContainerDevice::LoadHostFiles() {
   if (header->content_metadata.data_file_count > 0) {
     XELOGW("STFS container is not a single file. Loading might fail!");
   }
-
-  data_ = MappedMemory::Open(host_path_, MappedMemory::Mode::kRead);
-  if (!data_) {
-    return Result::kOutOfMemory;
-  }
-
-  return Result::kSuccess;
+  return package_file_ || host_file_ ? Result::kSuccess : Result::kReadError;
 }
 
 StfsContainerDevice::Result StfsContainerDevice::Read() {
-  auto root_entry = new StfsContainerEntry(this, nullptr, "", data_.get());
+  auto root_entry = new StfsContainerEntry(this, nullptr, "");
   root_entry->attributes_ = kFileAttributeDirectory;
   root_entry_ = std::unique_ptr<Entry>(root_entry);
 
   std::vector<StfsContainerEntry*> all_entries;
 
-  // Load all listings.
   StfsDirectoryBlock directory;
 
   auto& descriptor =
@@ -66,17 +73,16 @@ StfsContainerDevice::Result StfsContainerDevice::Read() {
   size_t n = 0;
   for (n = 0; n < descriptor.file_table_block_count; n++) {
     const size_t offset = BlockToOffset(table_block_index);
-    if (offset + sizeof(StfsDirectoryBlock) > data_->size()) {
-      XELOGE("STFS directory block offset out of bounds (corrupt)");
+    if (!ReadData(offset, {reinterpret_cast<uint8_t*>(&directory),
+                           sizeof(directory)})) {
+      XELOGE("STFS failed to read file table block {}", table_block_index);
       return Result::kReadError;
     }
-    directory = *reinterpret_cast<StfsDirectoryBlock*>(data_->data() + offset);
 
     for (size_t m = 0; m < kEntriesPerDirectoryBlock; m++) {
       const StfsDirectoryEntry& dir_entry = directory.entries[m];
 
       if (dir_entry.name[0] == 0) {
-        // Done.
         break;
       }
 
@@ -92,22 +98,21 @@ StfsContainerDevice::Result StfsContainerDevice::Read() {
 
       std::unique_ptr<StfsContainerEntry> entry =
           ReadEntry(parent_entry, &dir_entry);
+      if (!entry) {
+        return Result::kReadError;
+      }
       all_entries.push_back(entry.get());
       parent_entry->children_.emplace_back(std::move(entry));
     }
 
     const StfsHashEntry* block_hash = GetBlockHash(table_block_index);
+    if (!block_hash) {
+      return Result::kReadError;
+    }
     table_block_index = block_hash->level0_next_block();
     if (table_block_index == kEndOfChain) {
       break;
     }
-  }
-
-  // A truncated package's hash table can map past EOF; the read is clamped
-  // (zero-filled) below, so surface it here instead of building a garbage tree.
-  if (hash_table_out_of_bounds_) {
-    XELOGE("STFS hash table out of bounds (corrupt)");
-    return Result::kReadError;
   }
 
   if (n + 1 != descriptor.file_table_block_count) {
@@ -121,17 +126,14 @@ StfsContainerDevice::Result StfsContainerDevice::Read() {
 
 std::unique_ptr<StfsContainerEntry> StfsContainerDevice::ReadEntry(
     Entry* parent, const StfsDirectoryEntry* dir_entry) {
-  // Filename is stored as Windows-1252, convert it to UTF-8.
   std::string ansi_name(reinterpret_cast<const char*>(dir_entry->name),
                         dir_entry->flags.name_length & 0x3F);
   std::string name = xe::win1252_to_utf8(ansi_name);
-  // Fallback to normal name if for whatever reason conversion from 1252 code
-  // page failed.
   if (name.empty()) {
     name = ansi_name;
   }
 
-  auto entry = StfsContainerEntry::Create(this, parent, name, data_.get());
+  auto entry = StfsContainerEntry::Create(this, parent, name);
 
   if (dir_entry->flags.directory) {
     entry->attributes_ = kFileAttributeDirectory;
@@ -149,25 +151,37 @@ std::unique_ptr<StfsContainerEntry> StfsContainerDevice::ReadEntry(
       decode_fat_timestamp(dir_entry->modified_date, dir_entry->modified_time);
   entry->access_timestamp_ = entry->write_timestamp_;
 
-  // Fill in all block records.
-  // It's easier to do this now and just look them up later, at the cost
-  // of some memory. Nasty chain walk.
-  // TODO(benvanik): optimize if flags.contiguous is set.
   if (entry->attributes() & X_FILE_ATTRIBUTE_NORMAL) {
     uint32_t block_index = dir_entry->start_block_number();
     size_t remaining_size = dir_entry->length;
+    size_t block_count = 0;
     while (remaining_size && block_index != kEndOfChain) {
       size_t block_size =
           std::min(static_cast<size_t>(kBlockSize), remaining_size);
       size_t offset = BlockToOffset(block_index);
-      entry->block_list_.push_back({0, offset, block_size});
+      // Blocks adjacent in the package share one record (8b1ddd073).
+      auto& block_list = entry->block_list_;
+      if (!block_list.empty() &&
+          block_list.back().offset + block_list.back().length == offset) {
+        block_list.back().length += block_size;
+      } else {
+        block_list.push_back({0, offset, block_size});
+      }
+      ++block_count;
       remaining_size -= block_size;
+      // A read-only package numbers a contiguous file's blocks consecutively.
+      if (dir_entry->flags.contiguous && header_->is_package_readonly()) {
+        ++block_index;
+        continue;
+      }
       auto block_hash = GetBlockHash(block_index);
+      if (!block_hash) {
+        return nullptr;
+      }
       block_index = block_hash->level0_next_block();
     }
 
     if (remaining_size) {
-      // Loop above must have exited prematurely, bad hash tables?
       XELOGW(
           "STFS file {} only found {} bytes for file, expected {} ({} "
           "bytes missing)",
@@ -176,14 +190,11 @@ std::unique_ptr<StfsContainerEntry> StfsContainerDevice::ReadEntry(
       assert_always();
     }
 
-    // Check that the number of blocks retrieved from hash entries matches
-    // the block count read from the file entry
-    if (entry->block_list_.size() != dir_entry->allocated_data_blocks()) {
+    if (block_count != dir_entry->allocated_data_blocks()) {
       XELOGW(
           "STFS failed to read correct block-chain for entry {}, read {} "
           "blocks, expected {}",
-          entry->name_, entry->block_list_.size(),
-          dir_entry->allocated_data_blocks());
+          entry->name_, block_count, dir_entry->allocated_data_blocks());
       assert_always();
     }
   }
@@ -192,11 +203,6 @@ std::unique_ptr<StfsContainerEntry> StfsContainerDevice::ReadEntry(
 }
 
 size_t StfsContainerDevice::BlockToOffset(uint64_t block_index) const {
-  // For every level there is a hash table
-  // Level 0: hash table of next 170 blocks
-  // Level 1: hash table of next 170 hash tables
-  // Level 2: hash table of next 170 level 1 hash tables
-  // And so on...
   uint64_t block = block_index;
   for (uint32_t i = 0; i < kBlocksHashLevelAmount; i++) {
     const uint32_t level_base = kBlocksPerHashLevel[i];
@@ -255,22 +261,19 @@ const uint8_t StfsContainerDevice::GetAmountOfHashLevelsToCheck(
   return 0;
 }
 
-void StfsContainerDevice::UpdateCachedHashTable(
+bool StfsContainerDevice::UpdateCachedHashTable(
     uint32_t block_index, uint8_t hash_level,
     uint32_t& secondary_table_offset) {
   const size_t hash_offset = BlockToHashBlockOffset(block_index, hash_level);
-  // Do nothing. It's already there.
   if (!cached_hash_tables_.count(hash_offset)) {
-    const size_t read_offset = hash_offset + secondary_table_offset;
-    if (read_offset + sizeof(StfsHashTable) > data_->size()) {
-      // Hash table past EOF: cache a zeroed table (next-block 0 keeps the walk
-      // in bounds; Read() turns the flag into a read error) rather than deref.
-      hash_table_out_of_bounds_ = true;
-      cached_hash_tables_[hash_offset] = {};
-    } else {
-      cached_hash_tables_[hash_offset] =
-          *reinterpret_cast<StfsHashTable*>(data_->data() + read_offset);
+    StfsHashTable table;
+    if (!ReadData(hash_offset + secondary_table_offset,
+                  {reinterpret_cast<uint8_t*>(&table), sizeof(table)})) {
+      XELOGE("STFS failed to read hash table at {:X}",
+             hash_offset + secondary_table_offset);
+      return false;
     }
+    cached_hash_tables_[hash_offset] = table;
   }
 
   uint32_t record = block_index % kBlocksPerHashLevel[0];
@@ -281,21 +284,24 @@ void StfsContainerDevice::UpdateCachedHashTable(
   const StfsHashEntry* record_data =
       &cached_hash_tables_[hash_offset].entries[record];
   secondary_table_offset = record_data->levelN_active_index() ? kBlockSize : 0;
+  return true;
 }
 
-void StfsContainerDevice::UpdateCachedHashTables(
+bool StfsContainerDevice::UpdateCachedHashTables(
     uint32_t block_index, uint8_t highest_hash_level_to_update,
     uint32_t& secondary_table_offset) {
   for (int8_t level = highest_hash_level_to_update; level >= 0; level--) {
-    UpdateCachedHashTable(block_index, level, secondary_table_offset);
+    if (!UpdateCachedHashTable(block_index, level, secondary_table_offset)) {
+      return false;
+    }
   }
+  return true;
 }
 
 const StfsHashEntry* StfsContainerDevice::GetBlockHash(uint32_t block_index) {
   const StfsVolumeDescriptor& descriptor =
       header_->content_metadata.volume_descriptor.stfs;
 
-  // Offset for selecting the secondary hash block, in packages that have them
   uint32_t secondary_table_offset =
       descriptor.flags.bits.root_active_index ? kBlockSize : 0;
 
@@ -304,16 +310,45 @@ const StfsHashEntry* StfsContainerDevice::GetBlockHash(uint32_t block_index) {
 
   if (header_->is_package_readonly()) {
     secondary_table_offset = 0;
-    // Because we have read only package we only need to check first hash level.
     hash_levels_to_process = 0;
   }
 
-  UpdateCachedHashTables(block_index, hash_levels_to_process,
-                         secondary_table_offset);
+  if (!UpdateCachedHashTables(block_index, hash_levels_to_process,
+                              secondary_table_offset)) {
+    return nullptr;
+  }
 
   const size_t hash_offset = BlockToHashBlockOffset(block_index, 0);
   const uint32_t record = block_index % kBlocksPerHashLevel[0];
   return &cached_hash_tables_[hash_offset].entries[record];
+}
+
+size_t StfsContainerDevice::ReadDataUpTo(size_t offset,
+                                         std::span<uint8_t> buffer) const {
+  if (offset >= files_total_size_ || buffer.empty()) {
+    return 0;
+  }
+  const size_t clamped = std::min(buffer.size(), files_total_size_ - offset);
+  size_t bytes_read = 0;
+  if (host_file_) {
+    if (!host_file_->Read(offset, buffer.data(), clamped, &bytes_read)) {
+      return 0;
+    }
+    return bytes_read;
+  }
+  if (package_file_) {
+    if (package_file_->ReadSync(buffer.subspan(0, clamped), offset,
+                                &bytes_read) != X_STATUS_SUCCESS) {
+      return 0;
+    }
+    return bytes_read;
+  }
+  return 0;
+}
+
+bool StfsContainerDevice::ReadData(size_t offset,
+                                   std::span<uint8_t> buffer) const {
+  return ReadDataUpTo(offset, buffer) == buffer.size();
 }
 
 const uint8_t StfsContainerDevice::GetBlocksPerHashTableFromContainerHeader()
@@ -321,17 +356,11 @@ const uint8_t StfsContainerDevice::GetBlocksPerHashTableFromContainerHeader()
   const XContentContainerHeader* header = GetContainerHeader();
   if (!header) {
     XELOGE(
-        "VFS: SetBlocksPerHashTableBasedOnContainerHeader - Missing "
-        "Container "
+        "VFS: SetBlocksPerHashTableBasedOnContainerHeader - Missing Container "
         "Header!");
     return 0;
   }
-
-  if (header->is_package_readonly()) {
-    return 1;
-  }
-
-  return 2;
+  return header->is_package_readonly() ? 1 : 2;
 }
 
 }  // namespace vfs

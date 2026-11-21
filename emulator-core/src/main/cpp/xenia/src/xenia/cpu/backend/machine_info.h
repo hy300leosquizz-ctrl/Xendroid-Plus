@@ -29,6 +29,10 @@ struct MachineInfo {
     char name[4];
     uint32_t types;
     uint32_t count;
+    // Bitmask of register indices in [0, count) that are caller-saved volatile
+    // registers (only safe for values whose live range does not touch or cross
+    // any call/helper-call instruction).
+    uint32_t volatile_mask;
   } register_sets[8];
 };
 

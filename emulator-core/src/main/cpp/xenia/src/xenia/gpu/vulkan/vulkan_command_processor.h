@@ -491,9 +491,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // The key of the current depth surface: depth base | pitch << 16.
   uint32_t GetMsaa4xDepthSurface() const;
   std::unordered_set<uint32_t> msaa_4x_scene_depth_surfaces_;
-  // vulkan_samples_as_pixels_simple_ps when msaa_4x_scene_depth_surfaces_ was
-  // filled.
-  bool msaa_4x_scene_depth_surfaces_simple_ps_ = false;
+  // vulkan_samples_as_pixels_simple_ps and vulkan_samples_as_pixels_coarse when
+  // msaa_4x_scene_depth_surfaces_ was filled.
+  uint32_t msaa_4x_scene_depth_surfaces_options_ = 0;
+  // vulkan_samples_as_pixels_coarse: this draw is shaded once per 2x2 pixels.
+  bool draw_samples_as_pixels_coarse_ = false;
 
   void InitializeTrace() override;
 
@@ -566,11 +568,18 @@ class VulkanCommandProcessor final : public CommandProcessor {
    public:
     explicit PipelineLayout(
         VkPipelineLayout pipeline_layout,
+        VkDescriptorSetLayout
+            descriptor_set_layout_shared_memory_and_edram_ref,
+        VkDescriptorSetLayout descriptor_set_layout_constants_ref,
         VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref,
         VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref,
         uint32_t texture_count_vertex, uint32_t sampler_count_vertex,
         uint32_t texture_count_pixel, uint32_t sampler_count_pixel)
         : pipeline_layout_(pipeline_layout),
+          descriptor_set_layout_shared_memory_and_edram_ref_(
+              descriptor_set_layout_shared_memory_and_edram_ref),
+          descriptor_set_layout_constants_ref_(
+              descriptor_set_layout_constants_ref),
           descriptor_set_layout_textures_vertex_ref_(
               descriptor_set_layout_textures_vertex_ref),
           descriptor_set_layout_textures_pixel_ref_(
@@ -581,6 +590,18 @@ class VulkanCommandProcessor final : public CommandProcessor {
           sampler_count_pixel_(sampler_count_pixel) {}
     VkPipelineLayout GetPipelineLayout() const override {
       return pipeline_layout_;
+    }
+    uint32_t GetDescriptorSetLayouts(
+        VkDescriptorSetLayout layouts_out[4]) const override {
+      layouts_out[SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram] =
+          descriptor_set_layout_shared_memory_and_edram_ref_;
+      layouts_out[SpirvShaderTranslator::kDescriptorSetConstants] =
+          descriptor_set_layout_constants_ref_;
+      layouts_out[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
+          descriptor_set_layout_textures_vertex_ref_;
+      layouts_out[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+          descriptor_set_layout_textures_pixel_ref_;
+      return SpirvShaderTranslator::kDescriptorSetCount;
     }
     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref() const {
       return descriptor_set_layout_textures_vertex_ref_;
@@ -597,6 +618,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
    private:
     VkPipelineLayout pipeline_layout_;
+    VkDescriptorSetLayout descriptor_set_layout_shared_memory_and_edram_ref_;
+    VkDescriptorSetLayout descriptor_set_layout_constants_ref_;
     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref_;
     VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref_;
     uint32_t texture_count_vertex_;
@@ -663,9 +686,26 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // command_processor_memexport.inc: the submission of the last export, not the
   // whole queue. Always inlined for VkAwaitSites too.
   XE_FORCEINLINE bool AwaitMemexportSubmission(uint64_t submission) {
+    if (memexport_compute_batch_.size && !memexport_batch_flushing_) {
+      FlushMemExportBatch();
+    }
     CheckSubmissionCompletionAndDeviceLoss(submission);
     return !device_lost_ && GetCompletedSubmission() >= submission;
   }
+
+  uint64_t TakeMemexportSignalSubmission() override;
+  void EndSubmissionForHeldSignals(uint64_t submission) override;
+  void AwaitSubmissionForHeldSignals(uint64_t submission) override;
+  void AwaitVIZQueryResolve(uint64_t submission) override;
+
+  // Open-pass upload splice guard (adapted from XDroid360 6e54a1f6f,
+  // BSD-3-Clause): allows hoisting safe uploads ahead of the active pass while
+  // rejecting ranges overlapping memexport or GPU-written shared memory.
+  bool CanSpliceBeforeActivePass(uint32_t base_bytes,
+                                 uint32_t size_bytes) const;
+  bool BeginPrePassSplice();
+  void EndPrePassSplice();
+  void ClosePrePassSpliceSegment();
 
   void ClearTransientDescriptorPools();
 
@@ -805,6 +845,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint64_t submissions = 0;
     uint64_t resolves = 0;  // EDRAM resolves issued (churn magnitude)
     uint64_t memexport_awaits = 0;
+    // Draws with memory export, and what each draw's barrier was.
+    uint64_t memexport_draws = 0;
+    uint64_t memexport_draw_barriers[size_t(
+        VulkanSharedMemory::DrawBarrier::kCount)] = {};
     uint64_t readback_awaits = 0;
     // Host-side latency from vkQueueSubmit to the fence being observed
     // completed - includes GPU queue wait, render time and detection delay.
@@ -974,6 +1018,23 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // log_gpu_frame_time_breakdown for the awaits).
   std::string memexport_log_value_;
   uint32_t memexport_log_left_ = 0;
+  // debug.xendroid.memexport_trace: logs the next exporting draws.
+  std::string memexport_trace_value_;
+  uint32_t memexport_trace_left_ = 0;
+  // vulkan_memexport_barriers_by_range: this draw's ranges, kept to reuse their
+  // storage.
+  std::vector<std::pair<uint32_t, uint32_t>> memexport_barrier_reads_;
+  std::vector<std::pair<uint32_t, uint32_t>> memexport_barrier_exports_;
+  bool memexport_barriers_by_range_last_ = false;
+  // The batch of exporting draws going on (DrawExportTracker), and what a draw
+  // has to match to be a part of it.
+  uint64_t memexport_batch_ = 0;
+  uint64_t memexport_batch_vertex_shader_ = 0;
+  uint64_t memexport_batch_pixel_shader_ = 0;
+  uint64_t memexport_batch_next_draw_ = 0;
+  uint64_t memexport_batch_sync_count_ = 0;
+  // All guest draws so far, also those with no effect here.
+  uint64_t guest_draw_count_ = 0;
 
   struct SubmissionWork {
     uint32_t draws = 0;
@@ -1625,6 +1686,69 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  // Vertex shaders with memory export translated to compute shaders
+  // (kMemExportCompute) for GPUs without vertexPipelineStoresAndAtomics, plus
+  // vulkan_memexport_batch multi-draw compute batching (adapted from
+  // DEGROUCHO/xendroid-mali, BSD-3-Clause).
+  struct MemExportComputePipelineKey {
+    const void* translation;
+    VkPipelineLayout pipeline_layout;
+    bool operator==(const MemExportComputePipelineKey& other) const {
+      return translation == other.translation &&
+             pipeline_layout == other.pipeline_layout;
+    }
+    struct Hasher {
+      size_t operator()(const MemExportComputePipelineKey& key) const {
+        return std::hash<const void*>{}(key.translation) ^
+               (std::hash<const void*>{}(
+                    reinterpret_cast<const void*>(key.pipeline_layout))
+                << 1);
+      }
+    };
+  };
+  std::unordered_map<MemExportComputePipelineKey, VkPipeline,
+                     MemExportComputePipelineKey::Hasher>
+      memexport_compute_pipelines_;
+  VkPipeline GetMemExportComputePipeline(
+      VulkanShader& vertex_shader,
+      SpirvShaderTranslator::Modification vertex_shader_modification,
+      VkPipelineLayout pipeline_layout, bool batched);
+
+  struct MemExportBatch {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet sets[SpirvShaderTranslator::kDescriptorSetCount] = {};
+    uint32_t set_count = 0;
+    uint32_t size = 0;
+    uint32_t capacity = 0;
+    uint32_t float_stride = 0;
+    uint32_t fetch_stride = 0;
+    bool fetch_decoded = false;
+    uint32_t max_vertex_count = 0;
+    std::vector<uint8_t> system, float_vertex, bool_loop, fetch;
+    std::vector<std::pair<uint32_t, uint32_t>> exported_ranges;
+  };
+  MemExportBatch memexport_compute_batch_;
+  bool memexport_batch_flushing_ = false;
+  bool memexport_batch_supported_ = false;
+  uint64_t memexport_batched_draws_ = 0;
+  uint64_t memexport_batch_dispatches_ = 0;
+  void PushMemexportBeforeBarrier();
+  void PushMemexportAfterBarrier();
+  void AddToMemExportBatch(VkPipeline pipeline, VkPipelineLayout layout,
+                           uint32_t set_count, uint32_t float_constant_count,
+                           uint32_t vertex_count,
+                           const uint32_t* vfetch_addresses,
+                           const uint32_t* vfetch_sizes, uint32_t vfetch_count,
+                           uint32_t guest_index_base, uint32_t index_bytes);
+  void FlushMemExportBatch();
+
+  size_t pass_splice_placeholder_ = SIZE_MAX;
+  bool pass_splice_open_ = false;
+  uint32_t pass_splice_depth_ = 0;
+  bool dynamic_depth_bias_exact_unorm_ = false;
+  bool current_shader_objects_bound_ = false;
 
   // memexport_enable without guest RAM import (the readback fallback in
   // IssueDraw): the GPU copies the export ranges of the shared memory buffer

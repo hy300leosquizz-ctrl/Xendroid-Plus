@@ -12,7 +12,9 @@
 #include <algorithm>
 
 #include "xenia/base/logging.h"
+#include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/disc_image_entry.h"
+
 namespace xe {
 namespace vfs {
 
@@ -29,22 +31,30 @@ X_STATUS DiscImageFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
     return X_STATUS_END_OF_FILE;
   }
 
-  const size_t mmap_size = entry_->mmap()->size();
-  if (entry_->data_offset() >= mmap_size) {
+  auto* disc_device = static_cast<DiscImageDevice*>(entry_->device());
+  const uint64_t image_size = disc_device->image_size();
+  if (static_cast<uint64_t>(entry_->data_offset()) >= image_size) {
     xe::FatalError("This ISO image is corrupted and cannot be played.");
     return X_STATUS_END_OF_FILE;
   }
 
-  size_t real_offset = entry_->data_offset() + byte_offset;
-  if (real_offset >= mmap_size) {
+  const uint64_t real_offset =
+      static_cast<uint64_t>(entry_->data_offset()) + byte_offset;
+  if (real_offset >= image_size) {
     // Truncated image, the file starts inside it but ends past its end.
     return X_STATUS_END_OF_FILE;
   }
-  size_t real_length =
-      std::min({buffer.size(), entry_->data_size() - byte_offset,
-                mmap_size - real_offset});
-  std::memcpy(buffer.data(), entry_->mmap()->data() + real_offset, real_length);
-  *out_bytes_read = real_length;
+
+  const size_t max_entry_len = entry_->data_size() - byte_offset;
+  const size_t real_length = static_cast<size_t>(std::min<uint64_t>(
+      {static_cast<uint64_t>(buffer.size()),
+       static_cast<uint64_t>(max_entry_len), image_size - real_offset}));
+  const size_t got =
+      disc_device->ReadImageAt(real_offset, buffer.data(), real_length);
+  if (got == 0 && real_length > 0) {
+    return X_STATUS_END_OF_FILE;
+  }
+  *out_bytes_read = got;
   return X_STATUS_SUCCESS;
 }
 

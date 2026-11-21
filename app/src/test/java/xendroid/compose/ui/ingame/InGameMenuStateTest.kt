@@ -44,7 +44,7 @@ class InGameMenuStateTest {
         assertTrue(inGamePageActions.getValue(InGamePage.HUD).containsAll(listOf(InGameAction.PERFORMANCE_HUD, InGameAction.HUD_LAYOUT,
             InGameAction.HUD_METRICS, InGameAction.HUD_OPACITY, InGameAction.HUD_COLORS)))
         assertTrue(inGamePageActions.getValue(InGamePage.CONTROLS).containsAll(listOf(InGameAction.CONTROL_STYLE,
-            InGameAction.EDIT_TOUCH_LAYOUT, InGameAction.PHONE_CONTROLLERS, InGameAction.GYRO_CAMERA)))
+            InGameAction.EDIT_TOUCH_LAYOUT, InGameAction.KEY_MAPPING, InGameAction.PHONE_CONTROLLERS, InGameAction.GYRO_CAMERA)))
         assertTrue(inGamePageActions.getValue(InGamePage.SESSION).containsAll(listOf(InGameAction.PAUSE_ON_OPEN, InGameAction.AUTO_SAVE,
             InGameAction.UNDO_SESSION, InGameAction.MAKE_GLOBAL, InGameAction.SHARE_LOGS, InGameAction.QUIT)))
     }
@@ -86,6 +86,7 @@ class InGameMenuStateTest {
         assertEquals(7, graphicsOpen.advancedCount())
         assertTrue(graphicsOpen.actions().none { it in developerActions })
         assertTrue(InGameAction.STRETCH in graphicsOpen.actions())
+        assertTrue(InGameAction.KEY_MAPPING in player.actions(InGamePage.CONTROLS))
         assertTrue(InGameAction.PHONE_CONTROLLERS in player.actions(InGamePage.CONTROLS))
         // Performance's advanced options are all developer ones: no "More options" there in Player.
         assertTrue(InGameAction.MORE_OPTIONS !in player.actions(InGamePage.SYSTEM))

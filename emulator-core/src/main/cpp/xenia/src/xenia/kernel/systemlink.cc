@@ -543,6 +543,11 @@ void QosRelease(const uint8_t kid[8]) {
   listeners.erase(KidValue(kid));
 }
 
+void Shutdown() {
+  std::lock_guard<std::mutex> lock(qos_mutex);
+  listeners.clear();
+}
+
 QosResult QosProbe(uint32_t address, const uint8_t kid[8], unsigned probes) {
   QosResult result;
   probes = std::clamp(probes, 1u, kQosProbesMax);

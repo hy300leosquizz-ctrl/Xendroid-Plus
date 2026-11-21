@@ -217,7 +217,7 @@
     <string name="lib_compress">Compress to .zar</string>
     <string name="lib_shortcut">Create shortcut</string>
     <string name="lib_compress_title">Compress to .zar?</string>
-    <string name="lib_compress_text">This packs the disc into a smaller .zar. The original .iso is left alone until the .zar is created and verified, and you are asked before it is deleted. The game stays in your library.</string>
+    <string name="lib_compress_text">This packs the disc, folder or package into a smaller .zar. The original files stay untouched until the .zar is created and verified, and you are asked before an .iso is deleted. The game stays in your library.</string>
     <string name="lib_compress_action">Compress</string>
     <string name="lib_compress_progress">%1$d%%  ·  this may take a while.</string>
     <string name="lib_may_take_while">This may take a while.</string>
@@ -369,7 +369,7 @@
     <string name="set_cat_content">Content</string>
     <string name="set_cat_general">General</string>
     <string name="set_fps_unlimited">Unlimited</string>
-    <string name="set_driver_unavailable">Unavailable: custom drivers load only on Adreno GPUs (Qualcomm KGSL), and this phone has none. Games run on the system driver.</string>
+    <string name="set_driver_unavailable">Unavailable: custom drivers load only on Adreno, Mali or Xclipse GPUs, and this phone has none. Games run on the system driver.</string>
     <string name="set_contract_action">Action · does not change emulation configuration</string>
     <string name="set_contract_global">Saved globally · applies next game launch</string>
     <string name="set_contract_game">Saved for this game · applies next game launch</string>
@@ -1312,4 +1312,16 @@
     <string name="drv_from">From %1$s</string>
     <string name="menu_color_vivid">Vivid (fake HDR)</string>
     <string name="ge_group">Group</string>
+    <string name="pt_aspect_btn">20:9 / 21:9</string>
+    <string name="pt_aspect_title">Ultrawide aspect helper</string>
+    <string name="pt_aspect_desc">Generates a user .patch.toml for modern 19.5:9, 20:9 or 21:9 phone displays from an existing widescreen patch or a known float32 aspect address.</string>
+    <string name="pt_aspect_screen">This screen</string>
+    <string name="pt_aspect_addr_label">Optional float32 address (when no 16:9 patch exists)</string>
+    <string name="pt_aspect_create">Create patch</string>
+    <string name="pt_aspect_no_template">No 16:9 widescreen patch found for this game; enter a float32 guest address (e.g. 0x82012340).</string>
+    <string name="pt_search_hint">Search patches, authors or descriptions</string>
+    <string name="pt_search_empty">No patches match this filter.</string>
+    <string name="pt_filter_enabled">Enabled</string>
+    <string name="pt_filter_widescreen">Widescreen</string>
+    <string name="pc_bt_allow">Allow Bluetooth devices</string>
 </resources>

@@ -61,6 +61,12 @@ bool VulkanZPDQueryPool::EnsureInitialized(
     resolve_batch_indices_.clear();
     fsi_counter_resolve_batch_pending_.assign(requested_capacity, 0);
     fsi_counter_resolve_batch_indices_.clear();
+    counter_dirty_.assign(requested_capacity, 1);
+    counter_dirty_indices_.clear();
+    counter_dirty_indices_.reserve(requested_capacity);
+    for (uint32_t i = 0; i < requested_capacity; ++i) {
+      counter_dirty_indices_.push_back(i);
+    }
   };
 
   auto initialize_host_query_path = [&]() -> bool {
@@ -354,6 +360,10 @@ void VulkanZPDQueryPool::Shutdown() {
     resolve_batch_indices_.clear();
     fsi_counter_resolve_batch_pending_.clear();
     fsi_counter_resolve_batch_indices_.clear();
+    counter_dirty_.clear();
+    counter_dirty_indices_.clear();
+    counter_clear_ranges_.clear();
+    counter_clear_barriers_.clear();
     resolve_batch_ranges_.clear();
     fsi_resolve_barrier_scratch_.clear();
     fsi_resolve_copy_scratch_.clear();
@@ -369,6 +379,10 @@ void VulkanZPDQueryPool::Shutdown() {
   resolve_batch_indices_.clear();
   fsi_counter_resolve_batch_pending_.clear();
   fsi_counter_resolve_batch_indices_.clear();
+  counter_dirty_.clear();
+  counter_dirty_indices_.clear();
+  counter_clear_ranges_.clear();
+  counter_clear_barriers_.clear();
   resolve_batch_ranges_.clear();
   fsi_resolve_barrier_scratch_.clear();
   fsi_resolve_copy_scratch_.clear();
@@ -466,6 +480,10 @@ void VulkanZPDQueryPool::ReleaseQueryIndex(uint32_t query_index,
     dfn.vkResetQueryPool(device, query_pool_, query_index, 1);
   }
 
+  // Queue released FSI counter slots for batched vkCmdFillBuffer clear before
+  // the next render pass.
+  MarkCounterDirty(query_index);
+
   free_indices_.push_back(query_index);
 }
 
@@ -476,16 +494,16 @@ bool VulkanZPDQueryPool::GenerationMatches(uint32_t query_index,
 }
 
 void VulkanZPDQueryPool::BeginQuery(
-    DeferredCommandBuffer& deferred_command_buffer,
-    uint32_t query_index) const {
+    DeferredCommandBuffer& deferred_command_buffer, uint32_t query_index,
+    bool precise) const {
   if (query_pool_ == VK_NULL_HANDLE || query_index >= capacity_) {
     return;
   }
 
-  // Precise bit is crucial. Most titles tested actually care about the sample
-  // counts, not just 0 vs non-zero.
-  deferred_command_buffer.CmdVkBeginQuery(query_pool_, query_index,
-                                          VK_QUERY_CONTROL_PRECISE_BIT);
+  // Precise bit is crucial for ZPD sample counts; VIZ_QUERY visibility surveys
+  // only need coarse boolean visibility and can pass precise = false.
+  deferred_command_buffer.CmdVkBeginQuery(
+      query_pool_, query_index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
 }
 
 void VulkanZPDQueryPool::EndQuery(
@@ -518,10 +536,99 @@ void VulkanZPDQueryPool::QueueQueryResolve(uint32_t query_index,
   }
 }
 
+void VulkanZPDQueryPool::MarkCounterDirty(uint32_t query_index) {
+  if (query_index >= counter_dirty_.size()) {
+    return;
+  }
+  if (!counter_dirty_[query_index]) {
+    counter_dirty_[query_index] = 1;
+    counter_dirty_indices_.push_back(query_index);
+  }
+}
+
+void VulkanZPDQueryPool::FlushCounterClears(
+    DeferredCommandBuffer& deferred_command_buffer) {
+  if (counter_dirty_indices_.empty()) {
+    return;
+  }
+  if (!fsi_counter_initialized()) {
+    for (uint32_t idx : counter_dirty_indices_) {
+      if (idx < counter_dirty_.size()) {
+        counter_dirty_[idx] = 0;
+      }
+    }
+    counter_dirty_indices_.clear();
+    return;
+  }
+
+  std::sort(counter_dirty_indices_.begin(), counter_dirty_indices_.end());
+  counter_clear_ranges_.clear();
+  uint32_t range_start = 0;
+  uint32_t range_count = 0;
+  for (uint32_t idx : counter_dirty_indices_) {
+    counter_dirty_[idx] = 0;
+    if (range_count == 0) {
+      range_start = idx;
+      range_count = 1;
+    } else if (idx == range_start + range_count) {
+      ++range_count;
+    } else if (idx > range_start + range_count) {
+      counter_clear_ranges_.push_back({range_start, range_count});
+      range_start = idx;
+      range_count = 1;
+    }
+  }
+  if (range_count != 0) {
+    counter_clear_ranges_.push_back({range_start, range_count});
+  }
+  counter_dirty_indices_.clear();
+
+  counter_clear_barriers_.clear();
+  counter_clear_barriers_.reserve(counter_clear_ranges_.size());
+  for (const ResolveRange& range : counter_clear_ranges_) {
+    VkBufferMemoryBarrier drain_barrier = {};
+    drain_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    drain_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                                  VK_ACCESS_TRANSFER_READ_BIT |
+                                  VK_ACCESS_TRANSFER_WRITE_BIT;
+    drain_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    drain_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    drain_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    drain_barrier.buffer = fsi_counter_buffer_;
+    drain_barrier.offset = VkDeviceSize(range.start) * sizeof(uint32_t);
+    drain_barrier.size = VkDeviceSize(range.count) * sizeof(uint32_t);
+    counter_clear_barriers_.push_back(drain_barrier);
+  }
+  deferred_command_buffer.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+      uint32_t(counter_clear_barriers_.size()),
+      counter_clear_barriers_.data(), 0, nullptr);
+
+  for (const ResolveRange& range : counter_clear_ranges_) {
+    deferred_command_buffer.CmdVkFillBuffer(
+        fsi_counter_buffer_, VkDeviceSize(range.start) * sizeof(uint32_t),
+        VkDeviceSize(range.count) * sizeof(uint32_t), 0);
+  }
+
+  for (VkBufferMemoryBarrier& ready_barrier : counter_clear_barriers_) {
+    ready_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ready_barrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  }
+  deferred_command_buffer.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+      0, nullptr, uint32_t(counter_clear_barriers_.size()),
+      counter_clear_barriers_.data(), 0, nullptr);
+}
+
 void VulkanZPDQueryPool::ClearFSICounter(
-    DeferredCommandBuffer& deferred_command_buffer,
-    uint32_t query_index) const {
+    DeferredCommandBuffer& deferred_command_buffer, uint32_t query_index) {
   if (!fsi_counter_initialized() || query_index >= capacity_) {
+    return;
+  }
+  if (query_index < counter_dirty_.size() && counter_dirty_[query_index]) {
+    FlushCounterClears(deferred_command_buffer);
     return;
   }
 

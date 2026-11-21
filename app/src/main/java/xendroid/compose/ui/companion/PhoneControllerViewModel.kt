@@ -18,6 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import xendroid.compose.companion.CompanionBluetooth
 import xendroid.compose.companion.CompanionClient
 import xendroid.compose.companion.CompanionPadLink
 import xendroid.compose.gamepad.RumbleIntensity
@@ -59,6 +60,16 @@ class PhoneControllerViewModel(app: Application) : AndroidViewModel(app) {
         onRumble = { motors ->
             lastMotors = motors
             viewModelScope.launch(Dispatchers.Main) { vibrate(rumbleAmplitude(motors, intensityNow)) }
+        },
+        newBluetoothClient = { btMac, code, name, onRumble, onClosed ->
+            CompanionClient(
+                streamOpener = { CompanionBluetooth.connectClientStream(app, btMac) },
+                code = code,
+                name = name,
+                clientId = clientId,
+                onRumble = onRumble,
+                onClosed = onClosed,
+            )
         },
     )
     @Volatile private var lastMotors = 0L

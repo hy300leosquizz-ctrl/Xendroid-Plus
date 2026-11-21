@@ -38,6 +38,7 @@ import xendroid.compose.core.LaunchOptions
 import xendroid.compose.data.CollectionRefusedException
 import xendroid.compose.data.Game
 import xendroid.compose.data.GameCollections
+import xendroid.compose.data.MultiXexScanner
 import xendroid.compose.data.ProfilePick
 import xendroid.compose.sessions.RunReport
 import xendroid.compose.ui.compress.GameCompressViewModel
@@ -85,6 +86,8 @@ class GameActions internal constructor(
     var preparing by mutableStateOf(false)
         private set
     internal var playAs by mutableStateOf<Pair<Game, ProfilePick.Decision.Ask>?>(null)
+    /** Multi-XEX compilation / folder picker before booting when no explicit `launchModule` was chosen. */
+    internal var xexPick by mutableStateOf<Triple<Game, List<MultiXexScanner.XexTarget>, LaunchOptions?>?>(null)
     /** Content still on the disc: the game, how many packages, and the launch it holds back. */
     internal var discInstall by mutableStateOf<Triple<Game, Int, LaunchOptions?>?>(null)
     internal var compressConfirm by mutableStateOf<Game?>(null)
@@ -135,11 +138,20 @@ class GameActions internal constructor(
         }
     }
 
-    private fun prepareAndLaunch(game: Game, options: LaunchOptions?) {
+    private fun prepareAndLaunch(game: Game, options: LaunchOptions?, xexChosen: Boolean = false) {
         if (preparing) return
         preparing = true
         scope.launch {
             try {
+                if (!xexChosen && options?.launchModule == null) {
+                    val targets = withContext(Dispatchers.IO) {
+                        MultiXexScanner.discover(game.launchUri, game.titleId)
+                    }
+                    if (targets.size > 1) {
+                        xexPick = Triple(game, targets, options)
+                        return@launch
+                    }
+                }
                 val pending = vm.uninstalledDiscContent(game)
                 if (pending.isNotEmpty()) discInstall = Triple(game, pending.size, options) else launch(game, options)
             } catch (e: Exception) {
@@ -148,6 +160,12 @@ class GameActions internal constructor(
                 toast.show(context.getString(R.string.lib_launch_prepare_failed))
             } finally { preparing = false }
         }
+    }
+
+    internal fun launchWithXex(game: Game, baseOptions: LaunchOptions?, modulePath: String) {
+        xexPick = null
+        val merged = (baseOptions ?: LaunchOptions()).copy(launchModule = modulePath.trim().ifEmpty { null })
+        prepareAndLaunch(game, merged.takeIf { !it.isEmpty }, xexChosen = true)
     }
 
     /** Reaps a stale :emu first (single-shot core); the new one links itself to the launcher. */
@@ -231,7 +249,7 @@ class GameActions internal constructor(
         }
     }
 
-    internal fun startCompress(game: Game) { compressConfirm = null; compressVm.compress(game.launchUri) }
+    internal fun startCompress(game: Game) { compressConfirm = null; compressVm.compress(game.launchUri, game.name) }
     internal val compressor: GameCompressViewModel get() = compressVm
     internal val library: GameLibraryViewModel get() = vm
 }
@@ -258,6 +276,25 @@ fun GameActionDialogs(actions: GameActions) {
             onDismiss = { actions.playAs = null },
             gameName = game.name,
         )
+    }
+    actions.xexPick?.let { (game, targets, options) ->
+        XdSheet(
+            onDismiss = { actions.xexPick = null },
+            title = stringResource(R.string.xd_launch_xex_pick),
+            subtitle = game.name,
+            actions = { XdButton(stringResource(R.string.common_cancel), { actions.xexPick = null }, kind = XdButtonKind.GHOST) },
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                for (target in targets) {
+                    XdMenuItem(
+                        target.displayLabel,
+                        onClick = { actions.launchWithXex(game, options, target.modulePath) },
+                        icon = XdIcons.play,
+                        subtitle = target.modulePath.ifBlank { "default.xex" },
+                    )
+                }
+            }
+        }
     }
     actions.discInstall?.let { (game, count, options) ->
         XdSheet(onDismiss = { actions.discInstall = null }, title = stringResource(R.string.lib_install_disc_title),

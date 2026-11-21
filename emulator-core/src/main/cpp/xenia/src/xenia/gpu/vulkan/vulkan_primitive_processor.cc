@@ -21,14 +21,16 @@
 DEFINE_bool(
     vulkan_avoid_geometry_shaders, true,
     "Route guest primitives that would otherwise need a geometry shader through "
-    "cheaper host paths on tile-based GPUs (Adreno/Turnip), where the "
-    "geometry-shader stage serializes the binning pass. Applies to point "
-    "sprites (expanded in the vertex shader as a triangle strip) and quad lists "
-    "(expanded on the CPU to a triangle list). Rectangle lists always stay on "
-    "the geometry shader. Read once at GPU "
-    "initialization, so a change takes effect on emulator restart. Disable for "
-    "byte-identical pre-optimization (geometry-shader) behavior and A/B "
-    "debugging.",
+    "cheaper host paths on tile-based GPUs (Adreno/Turnip/Mali/Xclipse), where "
+    "the geometry-shader stage serializes the binning pass.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_rectangle_lists_vs_expansion, true,
+    "Expand Xenos kRectangleList primitives in the vertex shader as triangle "
+    "strips instead of using a geometry shader (mandatory on GPUs without "
+    "geometryShader and faster on mobile tile-based GPUs such as Mali, PanVK, "
+    "Xclipse, and Adreno).",
     "Vulkan");
 
 namespace xe {
@@ -71,8 +73,13 @@ bool VulkanPrimitiveProcessor::Initialize() {
           // point_sprites_supported_without_vs_expansion (gated -> VS path):
           device_properties.geometryShader &&
               !cvars::vulkan_avoid_geometry_shaders,
-          // rectangle_lists_supported_without_vs_expansion (always GS):
-          device_properties.geometryShader)) {
+          // rectangle_lists_supported_without_vs_expansion (unlocked for VS
+          // expansion on tilers / GPUs without GS, Mali, PanVK):
+          device_properties.geometryShader &&
+              !cvars::vulkan_avoid_geometry_shaders &&
+              !cvars::vulkan_rectangle_lists_vs_expansion &&
+              device_properties.vendorID != 0x13B5 &&
+              device_properties.driverID != VK_DRIVER_ID_MESA_PANVK)) {
     Shutdown();
     return false;
   }
@@ -227,7 +234,7 @@ bool VulkanPrimitiveProcessor::InitializeBuiltinIndexBuffer(
   }
   fill_callback(mapping);
   ui::vulkan::util::FlushMappedMemoryRange(
-      vulkan_device, builtin_index_buffer_memory_, upload_memory_type);
+      vulkan_device, builtin_index_buffer_upload_memory_, upload_memory_type);
   dfn.vkUnmapMemory(device, builtin_index_buffer_upload_memory_);
 
   // Schedule uploading in the first submission.

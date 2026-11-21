@@ -16,6 +16,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/systemlink.h"
 #include "xenia/kernel/xam/xam_private.h"
 
 namespace xe {
@@ -87,6 +88,8 @@ StartupParams XamModule::xnet_startup_params() {
   std::lock_guard lock(xnet_mutex_);
   return xnet_startup_params_;
 }
+
+void XamModule::ShutdownSystemLink() { systemlink::Shutdown(); }
 
 }  // namespace xam
 }  // namespace kernel

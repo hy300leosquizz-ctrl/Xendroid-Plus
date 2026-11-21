@@ -49,6 +49,8 @@ class XamModule : public KernelModule {
   // XNetCleanup, or WSACleanup with |wsa|.
   void CleanupXNet(bool wsa);
   StartupParams xnet_startup_params();
+  // Stops System Link sessions before kernel teardown resets the object table.
+  void ShutdownSystemLink();
 
  private:
   LoaderData loader_data_;

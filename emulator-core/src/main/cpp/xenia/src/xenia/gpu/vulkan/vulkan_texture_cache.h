@@ -17,11 +17,14 @@
 #include <utility>
 #include <vector>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/hash.h"
 #include "xenia/gpu/texture_cache.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/ui/vulkan/vulkan_mem_alloc.h"
+
+DECLARE_bool(vulkan_xclipse_bc_transcode);
 
 namespace xe {
 namespace gpu {
@@ -93,6 +96,27 @@ class VulkanTextureCache final : public TextureCache {
   // With the whole guest memory invalidated (no watch fires then): no image
   // may be taken as matching the memory any more.
   void InvalidateResolveStoreTracking();
+
+  // Direct 1x EDRAM resolve -> resident mip-chain / unpromoted VkImage copy
+  // linking (preserves AFBC/UBWC without VK_IMAGE_USAGE_STORAGE_BIT).
+  struct ResolveLinkTarget {
+    Texture* texture = nullptr;
+    VkImage dst_image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t level = 0;
+    uint32_t x = 0;
+    uint32_t y = 0;
+  };
+  void BeginResolveLink(uint32_t dest_base, uint32_t pitch_tiles,
+                        uint32_t dest_x0, uint32_t dest_y0, uint32_t width,
+                        uint32_t height, xenos::ColorFormat dest_format,
+                        xenos::Endian dest_endian,
+                        const void* skip_promoted_texture,
+                        std::vector<ResolveLinkTarget>& targets_out);
+  void RecordResolveLinkCopy(VkImage src_image, VkImageLayout src_layout,
+                             uint32_t src_x, uint32_t src_y, uint32_t width,
+                             uint32_t height, const ResolveLinkTarget& target);
+  void EndResolveLink(const std::vector<ResolveLinkTarget>& targets);
 
   // Diagnostics: the textures waiting to be recreated for promotion at the
   // last submission, and since the previous call, the attempts that recreated
@@ -209,8 +233,9 @@ class VulkanTextureCache final : public TextureCache {
       // Force the border color alpha to 1.0 (only meaningful with a border
       // clamp mode).
       uint32_t force_bc_w_to_max : 1;  // 23
-      // Maximum mip level is in the texture resource itself, but mip_base_map
-      // limits fetching to mip_min_level (level 0 when the base is available).
+      uint32_t mip_max_level : 4;      // 27
+      // Maximum mip level is clamped in the sampler too so mip-chain sharing
+      // (chain_max_levels_) never exposes coarser levels than the fetch asked.
     };
 
     SamplerParameters() : value(0) { static_assert_size(*this, sizeof(value)); }

@@ -89,6 +89,8 @@ constexpr uint16_t kQosPort = 13074;
 void QosSetEnabled(const uint8_t kid[8], bool enabled);
 void QosSetData(const uint8_t kid[8], const uint8_t* data, size_t size);
 void QosRelease(const uint8_t kid[8]);
+// Clears all published sessions on kernel teardown.
+void Shutdown();
 
 struct QosResult {
   bool contacted = false;

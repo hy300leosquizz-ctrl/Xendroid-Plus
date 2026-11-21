@@ -16,8 +16,12 @@
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/string.h"
 #include "xenia/kernel/util/xex2_info.h"
 #include "xenia/kernel/util/xex2_util.h"
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+#include "xenia/vfs/saf_tree_device.h"
+#endif
 
 namespace xe {
 namespace vfs {
@@ -194,6 +198,37 @@ std::optional<XexMetadata> ExtractXexMetadata(const uint8_t* data,
 
 std::optional<XexMetadata> ExtractXexMetadata(
     const std::filesystem::path& path) {
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  const std::string path_utf8 = xe::path_to_utf8(path);
+  if (saf::IsSafContentUri(path_utf8)) {
+    auto handle = saf::OpenUriFileHandle(path_utf8);
+    if (!handle) {
+      return std::nullopt;
+    }
+    xex2_header base_header;
+    size_t got = 0;
+    if (!handle->Read(0, &base_header, sizeof(base_header), &got) ||
+        got != sizeof(base_header)) {
+      return std::nullopt;
+    }
+    const uint32_t magic = base_header.magic;
+    if (magic != kXex2Signature && magic != kXex1Signature) {
+      return std::nullopt;
+    }
+    const uint32_t header_size = base_header.header_size;
+    const uint64_t file_size = saf::QueryUriFileSize(path_utf8);
+    if (header_size < sizeof(xex2_header) || header_size > file_size) {
+      return std::nullopt;
+    }
+    std::vector<uint8_t> header_data(header_size);
+    if (!handle->Read(0, header_data.data(), header_size, &got) ||
+        got != header_size) {
+      return std::nullopt;
+    }
+    return ExtractXexMetadata(header_data.data(), header_data.size());
+  }
+#endif
+
   std::ifstream file(path, std::ios::binary);
   if (!file) {
     return std::nullopt;

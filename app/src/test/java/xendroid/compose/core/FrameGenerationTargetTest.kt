@@ -14,6 +14,8 @@ class FrameGenerationTargetTest {
         assertEquals(Plan(120, 2, 60, limitedByDisplay = false, belowTarget = false), FrameGenerationTarget.plan(120, 120f, 60))
         // Limited to 30: 60 and 40 are above its limit; ×4 from 30.
         assertEquals(Plan(120, 4, 30, false, false), FrameGenerationTarget.plan(120, 120f, 30))
+        // Limited to 40 on 120 Hz: exact ×3 from 40 without down-capping.
+        assertEquals(Plan(120, 3, 40, false, false), FrameGenerationTarget.plan(120, 120f, 40))
         // Limited to 45: ×3 from 40 (capped from 45).
         assertEquals(Plan(120, 3, 40, false, false), FrameGenerationTarget.plan(120, 120f, 45))
         // 90 from a 60 FPS game: capped at 45, ×2.
@@ -39,6 +41,14 @@ class FrameGenerationTargetTest {
         assertEquals(80, plan.output)
         assertTrue(plan.lowBase)
         assertFalse(FrameGenerationTarget.plan(120, 120f, 60)!!.lowBase)
+    }
+
+    @Test fun twentyFpsLimitPlansCleanlyAt60Hz() {
+        assertEquals(
+            Plan(60, 3, 20, limitedByDisplay = false, belowTarget = false),
+            FrameGenerationTarget.plan(60, 60f, 20),
+        )
+        assertTrue(FrameGenerationTarget.plan(60, 60f, 20)!!.lowBase)
     }
 
     @Test fun offIsTheMultiplier() {

@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstring>
 #include <future>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -758,11 +759,13 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
 
   asio::error_code ec;
 
-  // Accept a new connection
-  asio::ip::tcp::socket new_socket(GetIoContext());
+  // On the heap since a fiber reclaimed while it waits here never unwinds and
+  // a socket on its stack would stay linked into the io_context.
+  auto new_socket = std::make_unique<asio::ip::tcp::socket>(GetIoContext());
   asio::ip::tcp::endpoint peer_endpoint;
-  RunCooperatively(ec, RetryMode::kAccept,
-                   [&]() { acceptor_->accept(new_socket, peer_endpoint, ec); });
+  RunCooperatively(ec, RetryMode::kAccept, [&]() {
+    acceptor_->accept(*new_socket, peer_endpoint, ec);
+  });
 
   if (ec) {
     last_error_ = AsioErrorToWSAError(ec);
@@ -778,7 +781,7 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
 
   // Create a kernel object to represent the new socket
   auto socket =
-      object_ref<XSocket>(new XSocket(kernel_state_, std::move(new_socket)));
+      object_ref<XSocket>(new XSocket(kernel_state_, std::move(*new_socket)));
   socket->bound_ = true;
   // An accepted socket starts in the listener's non-blocking mode.
   if (guest_non_blocking_) {

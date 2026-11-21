@@ -74,9 +74,12 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
  public:
   // Reserved: sp, x19 (backend context), x20 (context), x21 (membase)
-  // Scratch: x0-x18 (caller-saved), v0-v3
-  // Available GPRs for register allocator: x22-x28
-  static constexpr int GPR_COUNT = 7;
+  // Scratch: x0-x4, x14-x18 (caller-saved), v0-v3
+  // Available GPRs for register allocator:
+  //   indices 0-6:  x22-x28 (callee-saved, safe across calls)
+  //   indices 7-15: x5-x13  (caller-saved volatile, non-call intervals only)
+  static constexpr int GPR_COUNT = 16;
+  static constexpr uint32_t kVolatileGprMask = 0xFF80u;
   // Available VEC regs: v4-v15, v16-v31
   static constexpr int VEC_COUNT = 28;
   static constexpr size_t kStashOffset = 32;

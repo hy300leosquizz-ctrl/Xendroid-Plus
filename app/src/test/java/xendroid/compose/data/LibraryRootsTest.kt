@@ -24,6 +24,22 @@ class LibraryRootsTest {
         assertEquals(roots, LibraryRoots.remove(roots, "/missing"))
     }
 
+    @Test fun replacingAFolderKeepsItsPositionAndNeverDuplicates() {
+        val roots = listOf("/install", "/sd/Games", "/usb/Games")
+        // Editing the install folder keeps the replacement at index 0.
+        assertEquals(listOf("/newInstall", "/sd/Games", "/usb/Games"), LibraryRoots.replace(roots, "/install", "/newInstall"))
+        // Editing a middle folder replaces it in place.
+        assertEquals(listOf("/install", "/sd/Xbox360", "/usb/Games"), LibraryRoots.replace(roots, "/sd/Games", "/sd/Xbox360"))
+        // Replacing a secondary folder with an already-listed root collapses the duplicate without moving the install slot.
+        assertEquals(listOf("/install", "/usb/Games"), LibraryRoots.replace(roots, "/sd/Games", "/install"))
+        // Replacing the install folder with an already-listed secondary root promotes that root to index 0.
+        assertEquals(listOf("/sd/Games", "/usb/Games"), LibraryRoots.replace(roots, "/install", "/sd/Games"))
+        // Blank, identical, or unknown paths are no-ops.
+        assertEquals(roots, LibraryRoots.replace(roots, "/install", " "))
+        assertEquals(roots, LibraryRoots.replace(roots, "/install", "/install"))
+        assertEquals(roots, LibraryRoots.replace(roots, "/missing", "/other"))
+    }
+
     @Test fun theFolderThatReceivesInstallsMovesToTheTop() {
         val roots = listOf("/a", "/b", "/c")
         assertEquals(listOf("/c", "/a", "/b"), LibraryRoots.first(roots, "/c"))

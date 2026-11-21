@@ -130,6 +130,7 @@ fun GameLibraryScreen(
     val gridState = rememberLazyGridState()
 
     var showBrowser by rememberSaveable { mutableStateOf(false) }
+    var changingFolder by rememberSaveable { mutableStateOf<String?>(null) }
     // Declared before the browser's early return below: while the browser shows, flags declared
     // after it leave the composition and would start over (the assistant at its first step).
     var foldersOpen by rememberSaveable { mutableStateOf(false) }
@@ -185,10 +186,34 @@ fun GameLibraryScreen(
             }
         }
     })
+    val folders by viewModel.folders.collectAsStateWithLifecycle()
     if (showBrowser) {
         FolderBrowserScreen(
             onFolderChosen = { path -> showBrowser = false; viewModel.onRealPathFolderPicked(path) },
             onCancel = { showBrowser = false },
+        )
+        return
+    }
+    changingFolder?.let { oldPath ->
+        FolderBrowserScreen(
+            onFolderChosen = { newPath ->
+                val before = folders
+                changingFolder = null
+                if (newPath != oldPath) {
+                    viewModel.replaceFolder(oldPath, newPath) {
+                        toast.show(
+                            context.getString(
+                                R.string.xd_fd_changed,
+                                StoragePaths.display(newPath, storageRoots),
+                                StoragePaths.display(oldPath, storageRoots),
+                            ),
+                            context.getString(R.string.xd_undo),
+                        ) { viewModel.restoreFolders(before) }
+                    }
+                }
+            },
+            onCancel = { changingFolder = null },
+            start = folderBrowserStartFor(oldPath),
         )
         return
     }
@@ -209,33 +234,11 @@ fun GameLibraryScreen(
         return
     }
 
-    // L03, lote 6: the library's game folders (add, remove, where installs go; files are never touched).
-    val folders by viewModel.folders.collectAsStateWithLifecycle()
+    // L03, lote 6: the library's game folders (add, change, remove, where installs go; files are never touched).
     val scanProgress by viewModel.scanProgress.collectAsStateWithLifecycle()
     val openFolders = { viewModel.loadFolders(); foldersOpen = true }
     if (foldersOpen) {
-        GameFoldersScreen(
-            folders = folders,
-            unavailable = (state as? LibraryUiState.Loaded)?.unavailableRoots.orEmpty(),
-            games = (state as? LibraryUiState.Loaded)?.games.orEmpty(),
-            scanning = scanProgress != null || isRefreshing,
-            onAdd = startRealPathMode,
-            onCreateStandard = createStandard,
-            standardGames = remember { xendroid.compose.data.StandardFolders.under(android.os.Environment.getExternalStorageDirectory(),
-                context.getString(R.string.xd_fd_std_games)).games.absolutePath },
-            onRemove = { folder ->
-                val before = folders
-                viewModel.removeFolder(folder)
-                toast.show(context.getString(R.string.xd_fd_removed, StoragePaths.display(folder, storageRoots)),
-                    context.getString(R.string.xd_undo)) { viewModel.restoreFolders(before) }
-            },
-            onMakeInstallFolder = { folder ->
-                viewModel.makeInstallFolder(folder)
-                toast.show(context.getString(R.string.xd_fd_install_moved))
-            },
-            onRescan = { viewModel.refresh() },
-            onBack = { foldersOpen = false },
-        )
+        ManagedGameFoldersScreen(viewModel = viewModel, onBack = { foldersOpen = false })
         return
     }
 
@@ -268,6 +271,18 @@ fun GameLibraryScreen(
             folderReady = state is LibraryUiState.Loaded,
             onChooseFolder = startRealPathMode,
             onCreateStandard = createStandard,
+            onChangeFolder = { folder ->
+                if (AllFilesAccess.isGranted()) changingFolder = folder
+                else AllFilesAccess.requestAccess(context)
+            },
+            onRemoveFolder = { folder ->
+                val before = folders
+                viewModel.removeFolder(folder)
+                toast.show(
+                    context.getString(R.string.xd_fd_removed, StoragePaths.display(folder, storageRoots)),
+                    context.getString(R.string.xd_undo),
+                ) { viewModel.restoreFolders(before) }
+            },
             onOpenProfiles = onOpenProfiles,
             onClose = {
                 FirstRunStore.markDone(context)
@@ -320,7 +335,7 @@ fun GameLibraryScreen(
             LibraryController(
                 data, tab, { tabKey = it.key }, focused?.stableId, { selectedId = it }, art, lastFps, patchesOf,
                 onPlay = actions::play, onOpen = { onOpenGame(it, null) }, onFavorite = actions::toggleFavorite,
-                gamertag = activeProfile, preparing = actions.preparing,
+                gamertag = activeProfile, preparing = actions.preparing, onMenu = { menuOpen = true },
             )
         } else {
             val defaultFilter = if (collectionsArea) collections.firstOrNull()?.let { LibraryFilter.Collection(it.name) } ?: LibraryFilter.All else LibraryFilter.All
@@ -439,6 +454,9 @@ private fun LibraryEmpty(
                     is LibraryUiState.Loaded -> {
                         LibraryNotices(state, missing, viewModel, onFolders, onMissing)
                         EmptyAction(stringResource(R.string.lib_no_games), stringResource(R.string.lib_choose_another), startRealPathMode)
+                        if (AllFilesAccess.isSupported) {
+                            XdButton(stringResource(R.string.lib_menu_folders), onFolders, kind = XdButtonKind.SECONDARY, icon = XdIcons.folder)
+                        }
                     }
                     else -> {}
                 }

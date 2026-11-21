@@ -44,6 +44,8 @@ DECLARE_int32(occlusion_query_fake_upper_threshold);
 
 DECLARE_bool(occlusion_query_log);
 
+DECLARE_bool(occlusion_query_viz);
+
 DECLARE_int32(occlusion_query_querybatch_range);
 
 DECLARE_double(occlusion_query_saturation);
@@ -86,6 +88,16 @@ DECLARE_bool(use_fuzzy_alpha_epsilon);
 DECLARE_bool(texture_gradient_exp_bias);
 
 DECLARE_bool(alu_round_toward_zero);
+
+DECLARE_bool(texture_point_snap);
+
+DECLARE_bool(force_depth_clamp);
+
+DECLARE_bool(spirv_texture_iscale_specialization);
+
+DECLARE_bool(vulkan_fable2_float24_depth);
+
+DECLARE_bool(vulkan_shared_memory_bda);
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
 

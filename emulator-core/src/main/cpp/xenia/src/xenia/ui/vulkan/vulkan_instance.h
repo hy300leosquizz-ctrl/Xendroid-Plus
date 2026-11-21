@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/platform.h"
 #include "xenia/ui/renderdoc_api.h"
 #include "xenia/ui/vulkan/vulkan_api.h"
@@ -21,6 +22,8 @@
 #if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
 #endif
+
+DECLARE_bool(vulkan_adreno_bcenabler);
 
 namespace xe {
 namespace ui {
@@ -31,6 +34,10 @@ namespace vulkan {
 // creation; logs with the reason if one is given, failures always. False
 // where it is not in use or the kernel refuses.
 bool RequestGpuPowerControl(const char* reason);
+
+// Releases forced KGSL GPU power control back to the kernel governor (e.g. on
+// surface disconnect / app pause, device teardown, or stock-driver startup).
+bool ReleaseGpuPowerControl(const char* reason);
 
 class VulkanInstance {
  public:

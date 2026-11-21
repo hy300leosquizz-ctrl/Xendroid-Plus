@@ -12,6 +12,7 @@
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/threading.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
@@ -224,6 +225,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
 }
 
 void XFile::PostIo(XThread* thread, std::function<void(bool cancelled)> fn) {
+  thread->AddPostedIo();
   {
     std::lock_guard<std::mutex> lock(posted_lock_);
     posted_.emplace_back(thread, std::move(fn));
@@ -245,6 +247,7 @@ void XFile::RunPostedIo() {
     posted_running_thread_ = thread;
     lock.unlock();
     fn(false);
+    thread->RemovePostedIo();
     lock.lock();
     posted_running_thread_ = nullptr;
   }
@@ -266,6 +269,7 @@ void XFile::CancelPostedIo(XThread* thread) {
   }
   for (auto& fn : cancelled) {
     fn(true);
+    thread->RemovePostedIo();
   }
 }
 
@@ -475,8 +479,18 @@ X_STATUS XFile::SetLength(size_t length) {
 X_STATUS XFile::Rename(const std::filesystem::path file_path,
                        bool replace_existing) {
   X_STATUS result = X_STATUS_SUCCESS;
+  RunSynchronousIo([&]() {
+    result = kernel_state()->file_system()->RenameEntry(
+        entry(), xe::path_to_utf8(file_path), replace_existing);
+  });
+  return result;
+}
+
+X_STATUS XFile::Rename(vfs::Entry* new_parent, std::string_view name,
+                       bool replace_existing) {
+  X_STATUS result = X_STATUS_SUCCESS;
   RunSynchronousIo(
-      [&]() { result = entry()->Rename(file_path, replace_existing); });
+      [&]() { result = entry()->Rename(new_parent, name, replace_existing); });
   return result;
 }
 

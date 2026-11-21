@@ -179,4 +179,7 @@
     <string name="xd_hud_battery_time">Autonomia</string>
     <string name="menu_chip_charge">Carga</string>
     <string name="menu_chip_battery_time">Autonomia</string>
+    <string name="xd_hud_controller_battery">Controle</string>
+    <string name="menu_chip_controller_battery">Bat. controle</string>
+    <string name="host_glitch_saved">Instantâneo de diagnóstico de 6 s salvo</string>
 </resources>

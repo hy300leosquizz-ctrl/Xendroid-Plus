@@ -11,6 +11,7 @@
 #include <charconv>
 #include <functional>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
@@ -25,6 +26,13 @@
 #include "xenia/kernel/xthread.h"
 #include "xenia/vfs/device.h"
 #include "xenia/xbox.h"
+
+DEFINE_bool(
+    file_read_no_apc_inline, false,
+    "Do not force asynchronous file reads with APC completion routines to "
+    "complete inline when issued from inside a user APC callback (fixes "
+    "streaming freezes in titles such as Peter Jackson's King Kong).",
+    "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -99,16 +107,21 @@ static X_STATUS SubmitRequest(const object_ref<XFile>& file,
                               uint32_t apc_routine, uint32_t apc_context,
                               X_IO_STATUS_BLOCK* status_block,
                               uint32_t status_block_address, bool pends,
-                              std::function<X_STATUS(uint32_t*)> transfer) {
+                              std::function<X_STATUS(uint32_t*)> transfer,
+                              bool is_write = false) {
   auto thread = retain_object(XThread::GetCurrentThread());
   // A completion routine upstream queues as a kernel APC (bit 0 clear) is a
   // user APC here. Pending a request issued from a user APC routine would
   // queue it after the delivery that issued the request had ended, for a title
   // that then only sleeps non-alertably (Cars chains its reads that way), so
-  // such a request completes inline.
+  // such a request completes inline unless disabled for titles (e.g. Peter
+  // Jackson's King Kong, 0x555307D3) whose streaming APC expects PENDING.
   auto* scheduler = kernel_state()->guest_scheduler();
-  if (pends && QueuesApc(apc_routine, apc_context) && !(apc_routine & 1) &&
-      thread->in_user_apc()) {
+  const bool disable_read_apc_inline =
+      !is_write && (cvars::file_read_no_apc_inline ||
+                    kernel_state()->title_id() == 0x555307D3u);
+  if (pends && !disable_read_apc_inline && QueuesApc(apc_routine, apc_context) &&
+      !(apc_routine & 1) && thread->in_user_apc()) {
     pends = false;
     scheduler->NoteFileRequest(GuestScheduler::FileRequestEvent::kApcInline);
   }
@@ -148,10 +161,7 @@ static X_STATUS SubmitRequest(const object_ref<XFile>& file,
   };
   if (pends) {
     scheduler->NoteFileRequest(GuestScheduler::FileRequestEvent::kPended);
-    if (status_block) {
-      status_block->status = X_STATUS_PENDING;
-      status_block->information = 0;
-    }
+    // The status block is left alone until the request completes.
     file->PostIo(thread.get(),
                  [complete = std::move(complete)](bool cancelled) {
                    complete(true, cancelled);
@@ -453,7 +463,8 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
             }
           }
           return status;
-        });
+        },
+        true);
   }
 
   return result;
@@ -789,6 +800,17 @@ dword_result_t StfsControlDevice_entry(lpvoid_t device, dword_t control_code,
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(StfsControlDevice, kFileSystem, kStub);
+
+// A volume is dismounted by the DismountVolume routine of its device's driver.
+// The XDK cache drive's routine closes an event and deletes the device. It
+// isn't called here. The drive leaves both behind each time it's closed.
+dword_result_t IoDismountVolume_entry(lpvoid_t device_object) {
+  if (!device_object) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolume, kFileSystem, kStub);
 // device_extension_size = additional bytes of data (aligned up to 8 byte
 // granularity) that will be allocated at the tail of the resulting device
 // object. although it is allocated at the tail, it is accessed through a
@@ -872,6 +894,17 @@ void IoDeleteDevice_entry(dword_t device_ptr, const ppc_context_t& ctx) {
 }
 
 DECLARE_XBOXKRNL_EXPORT1(IoDeleteDevice, kFileSystem, kStub);
+
+// A handle xenia opened sits on a host backed file system with no guest
+// volume to dismount. A valid one is all that is checked.
+dword_result_t IoDismountVolumeByFileHandle_entry(dword_t file_handle) {
+  auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  if (!file) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByFileHandle, kFileSystem, kStub);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

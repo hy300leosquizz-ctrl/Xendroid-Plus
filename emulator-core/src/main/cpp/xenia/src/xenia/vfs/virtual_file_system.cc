@@ -34,7 +34,10 @@ VirtualFileSystem::~VirtualFileSystem() {
 }
 
 void VirtualFileSystem::Clear() {
-  devices_.clear();
+  // Newest first so a device reading through another's file goes before it.
+  while (!devices_.empty()) {
+    devices_.pop_back();
+  }
   retired_devices_.clear();
   symlinks_.clear();
 }
@@ -156,7 +159,7 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path,
     // Found symlink!
     auto target_path = (*it).second;
     auto relative_path = result.substr((*it).first.size());
-    result = target_path + relative_path;
+    result = xe::utf8::fix_guest_path_separators(target_path + relative_path);
     was_resolved = true;
   }
   return was_resolved;
@@ -222,6 +225,48 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   auto relative_path = normalized_path.substr(
       std::min(normalized_path.size(), device->mount_path().size()));
   return device->ResolvePath(relative_path);
+}
+
+X_STATUS VirtualFileSystem::RenameEntry(Entry* entry,
+                                        const std::string_view target_path,
+                                        bool replace_existing) {
+  // One lock, so the new folder can't go away before the entry moves into it.
+  auto global_lock = global_critical_region_.Acquire();
+  if (!entry) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const auto path_parts = xe::utf8::split_path(target_path);
+  if (path_parts.empty()) {
+    return X_STATUS_OBJECT_NAME_INVALID;
+  }
+  if (path_parts.size() == 1 && !target_path.starts_with('\\')) {
+    if (path_parts[0].find(':') != std::string_view::npos) {
+      return X_STATUS_OBJECT_NAME_INVALID;
+    }
+    return entry->Rename(entry->parent(), path_parts[0], replace_existing);
+  }
+  return entry->Rename(ResolvePath(xe::utf8::find_base_guest_path(target_path)),
+                       xe::utf8::find_name_from_guest_path(target_path),
+                       replace_existing);
+}
+
+Entry* VirtualFileSystem::ResolveMountRoot(const std::string_view path) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto normalized_path(xe::utf8::canonicalize_guest_path(path));
+  std::string resolved_path;
+  if (ResolveSymbolicLink(normalized_path, resolved_path)) {
+    normalized_path = resolved_path;
+  }
+  for (const auto& d : devices_) {
+    std::string_view mount_path = d->mount_path();
+    if (!mount_path.empty() && mount_path.back() == '\\') {
+      mount_path.remove_suffix(1);
+    }
+    if (xe::utf8::equal_case(normalized_path, mount_path)) {
+      return d->ResolvePath("");
+    }
+  }
+  return nullptr;
 }
 
 Entry* VirtualFileSystem::CreatePath(const std::string_view path,
@@ -317,6 +362,20 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
 
     auto file_name = xe::utf8::find_name_from_guest_path(path);
     entry = parent_entry->GetChild(file_name);
+    // A device mounted on a folder of a host device is what the folder's path
+    // names. A raw partition's stand-in in a NullDevice stays what it is.
+    if (!root_entry && dynamic_cast<HostPathEntry*>(parent_entry)) {
+      if (Entry* mount_root = ResolveMountRoot(path)) {
+        // Replacing it would delete the whole device.
+        if (creation_disposition == FileDisposition::kSuperscede ||
+            creation_disposition == FileDisposition::kOverwrite ||
+            creation_disposition == FileDisposition::kOverwriteIf) {
+          *out_action = FileAction::kDoesNotExist;
+          return X_STATUS_ACCESS_DENIED;
+        }
+        entry = mount_root;
+      }
+    }
   } else if (path.empty() && root_entry) {
     // An empty relative path is the root entry itself. Replacing it would
     // delete what the root handle still refers to.
@@ -340,8 +399,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
       return X_STATUS_NOT_A_DIRECTORY;
     }
 
-    // If the entry does not exist on the host then remove the cached entry
-    if (parent_entry) {
+    // If the entry does not exist on the host then remove the cached entry. A
+    // device mounted there has its own folder.
+    if (parent_entry && entry->device() == parent_entry->device()) {
       const xe::vfs::HostPathEntry* host_path =
           dynamic_cast<const xe::vfs::HostPathEntry*>(parent_entry);
 
@@ -426,6 +486,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
         *out_action = creation_disposition == FileDisposition::kSuperscede
                           ? FileAction::kSuperseded
                           : FileAction::kOverwritten;
+        if (creation_disposition != FileDisposition::kSuperscede &&
+            entry->Overwrite()) {
+          break;
+        }
         if (entry->has_open_files()) {
           // Other handles keep it open, so it can't be deleted and recreated
           // under them (their entry would be freed). NT truncates it in place
@@ -584,7 +648,7 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
     std::error_code remove_ec;
     std::filesystem::remove(dest_name, remove_ec);
     if (read_failed) {
-      return X_STATUS_INVALID_PARAMETER;
+      return X_STATUS_END_OF_FILE;
     }
     return write_errno == ENOSPC ? X_STATUS_DISK_FULL : X_STATUS_ACCESS_DENIED;
   }

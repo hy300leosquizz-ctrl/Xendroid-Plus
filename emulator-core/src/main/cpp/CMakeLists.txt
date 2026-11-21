@@ -10,10 +10,22 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Global compile options applied to every target in this build.
-add_compile_options(-march=armv8-a)
+# Baseline ARMv8.2-A + LSE atomics + SDOT/UDOT + FP16 + LDAPR (RCPC) + CRC32
+# (Snapdragon 855+ / Cortex-A75+ / Dimensity 1000+ / Exynos 9820+).
+add_compile_options(-march=armv8.2-a+lse+dotprod+fp16+rcpc+crc)
 add_compile_options(-stdlib=libc++)
 add_compile_options(-fno-omit-frame-pointer)
 add_compile_options(-funwind-tables)
+
+# Cross-TU ThinLTO for Release and RelWithDebInfo builds.
+option(XENDROID_ENABLE_THINLTO "Enable ThinLTO in Release and RelWithDebInfo" ON)
+if(XENDROID_ENABLE_THINLTO)
+  add_compile_options($<$<CONFIG:Release,RelWithDebInfo>:-flto=thin>)
+  add_link_options(
+    $<$<CONFIG:Release,RelWithDebInfo>:-flto=thin>
+    $<$<CONFIG:Release,RelWithDebInfo>:-fuse-ld=lld>
+  )
+endif()
 
 # 16 KB max page size: required for Android 15+ on arm64.
 add_link_options(-Wl,-z,max-page-size=16384)

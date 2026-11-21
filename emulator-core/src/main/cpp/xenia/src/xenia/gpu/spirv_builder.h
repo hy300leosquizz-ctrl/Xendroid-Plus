@@ -33,6 +33,17 @@ class SpirvBuilder : public spv::Builder {
   void SetAllowContraction(bool allow) { allow_contraction_ = allow; }
   bool AllowsContraction() const { return allow_contraction_; }
 
+  // When true (or when targeting SPIR-V < 1.4), scalar boolean conditions in
+  // vector OpSelect instructions are smeared via OpCompositeConstruct to bvecN.
+  // Works around Mali Valhall (< r47) compiler crashes on scalar-bool vector
+  // OpSelect introduced in SPIR-V 1.4.
+  void SetRewriteScalarVectorSelect(bool rewrite) {
+    rewrite_scalar_vector_select_ = rewrite;
+  }
+  bool RewritesScalarVectorSelect() const {
+    return rewrite_scalar_vector_select_;
+  }
+
   // Make public rather than protected.
   using spv::Builder::createSelectionMerge;
 
@@ -77,6 +88,8 @@ class SpirvBuilder : public spv::Builder {
     return result;
   }
 
+  spv::Id createTriOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
+                      spv::Id operand2, spv::Id operand3);
   spv::Id createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                        spv::Id operand2, spv::Id operand3, spv::Id operand4);
 
@@ -202,6 +215,7 @@ class SpirvBuilder : public spv::Builder {
 
  private:
   bool allow_contraction_ = false;
+  bool rewrite_scalar_vector_select_ = false;
 };
 
 }  // namespace gpu

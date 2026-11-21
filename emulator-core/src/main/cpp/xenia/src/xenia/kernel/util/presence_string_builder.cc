@@ -8,8 +8,10 @@
  */
 
 #include "xenia/kernel/util/presence_string_builder.h"
-#include "third_party/fmt/include/fmt/format.h"
 
+#include <charconv>
+
+#include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/string.h"
 
 namespace xe {
@@ -79,10 +81,25 @@ AttributeStringFormatter::GetAttributeTypeFromSpecifier(
 std::optional<uint32_t> AttributeStringFormatter::GetAttributeIdFromSpecifier(
     const std::string& specifier,
     const AttributeStringFormatter::AttributeType specifier_type) const {
-  std::smatch string_match;
-  if (std::regex_search(specifier, string_match,
-                        presence_id_extract_from_specifier)) {
-    return std::make_optional<uint32_t>(stoi(string_match[1].str()));
+  (void)specifier_type;
+  const size_t open = specifier.find("{c");
+  if (open != std::string::npos) {
+    const size_t digits_begin = open + 2;
+    size_t digits_end = digits_begin;
+    while (digits_end < specifier.size() && specifier[digits_end] >= '0' &&
+           specifier[digits_end] <= '9') {
+      ++digits_end;
+    }
+    if (digits_end > digits_begin && digits_end < specifier.size() &&
+        specifier[digits_end] == '}') {
+      uint32_t parsed = 0;
+      const auto res =
+          std::from_chars(specifier.data() + digits_begin,
+                          specifier.data() + digits_end, parsed, 10);
+      if (res.ec == std::errc() && res.ptr == specifier.data() + digits_end) {
+        return parsed;
+      }
+    }
   }
 
   return std::nullopt;
@@ -136,17 +153,28 @@ std::string AttributeStringFormatter::GetStringFromSpecifier(
 std::queue<std::string> AttributeStringFormatter::GetPresenceFormatSpecifiers()
     const {
   std::queue<std::string> format_specifiers;
-
-  std::smatch match;
-
-  std::string attribute_string = attribute_string_;
-
-  while (std::regex_search(attribute_string, match,
-                           format_specifier_replace_fragment_regex_)) {
-    for (const auto& presence : match) {
-      format_specifiers.emplace(presence);
+  const size_t len = attribute_string_.size();
+  for (size_t i = 0; i < len; ++i) {
+    if (attribute_string_[i] != '{') {
+      continue;
     }
-    attribute_string = match.suffix().str();
+    size_t digits_begin = 0;
+    if (i + 3 < len && attribute_string_[i + 1] == 'c') {
+      digits_begin = i + 2;
+    } else if (i + 5 < len && attribute_string_.compare(i + 1, 3, "p0x") == 0) {
+      digits_begin = i + 4;
+    } else {
+      continue;
+    }
+    size_t j = digits_begin;
+    while (j < len && attribute_string_[j] >= '0' &&
+           attribute_string_[j] <= '9') {
+      ++j;
+    }
+    if (j > digits_begin && j < len && attribute_string_[j] == '}') {
+      format_specifiers.emplace(attribute_string_.substr(i, j - i + 1));
+      i = j;
+    }
   }
   return format_specifiers;
 }
