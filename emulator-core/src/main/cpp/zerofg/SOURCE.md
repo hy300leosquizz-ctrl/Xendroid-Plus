@@ -1,6 +1,6 @@
 # ZeroFG source snapshot
 
-This directory contains the ZeroFG engine of the MFG development branch `mfg/core` (local, at `84bca07`). It is not published yet. It sits on top of v1.1.0 and the
+This directory contains the ZeroFG engine of the MFG development branch `mfg/core` (local, at `9dbb6e3`). It is not published yet. It sits on top of v1.1.0 and the
 license commit `10e68b6`. ZeroFG is `Apache-2.0 OR GPL-2.0-or-later` since that commit; it is used here under Apache-2.0, `LICENSE`.
 
 The branch adds:
