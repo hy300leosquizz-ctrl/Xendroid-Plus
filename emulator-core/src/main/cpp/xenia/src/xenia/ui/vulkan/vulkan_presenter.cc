@@ -114,7 +114,7 @@ DEFINE_bool(
     "Vulkan");
 DEFINE_bool(zerofg_frame_generation, false,
             "Enable the independent ZeroFG presenter.", "Vulkan");
-DEFINE_string(zerofg_mode, "off", "ZeroFG: off, zero (RC7), reallyzero (the dense flow).", "Vulkan");
+DEFINE_string(zerofg_mode, "off", "ZeroFG: off, reallyzero (shown as Zero: RZ+, the product), zero (shown as Heavy Zero: the layered RC7 in full, for tests).", "Vulkan");
 DEFINE_bool(zerofg_guest_vblank_pull, true, "Use the validated guest vblank pull while ZeroFG is live.", "Vulkan");
 DEFINE_bool(zerofg_vsync_tight_reach, false, "Optional tight reach; disabled by default.", "Vulkan");
 DEFINE_bool(
@@ -158,19 +158,6 @@ DEFINE_bool(
     "phase is pushed (or for the second output in a row) is not shown, and "
     "the phase steps one refresh back. Reals are never dropped. Read when "
     "ZeroFG's output starts (switch frame generation off and on to apply).",
-    "Vulkan");
-DEFINE_bool(
-    zerofg_zero_light, true,
-    "Zero light (MFG test branch): one background surface, one render pass "
-    "and the lattice's mattes without the guided filter. The render about "
-    "40 % cheaper on the Adreno 840; weaker where several rigid surfaces "
-    "cross. Changing it rebuilds ZeroFG.",
-    "Vulkan");
-DEFINE_bool(
-    zerofg_zero_quarter_base, true,
-    "x4's quarter phases from the dense-flow base (MFG test branch): only "
-    "the middle frame of a pair is Zero's layers, the two quarters are "
-    "ReallyZero's picture. Changing it rebuilds ZeroFG.",
     "Vulkan");
 DEFINE_uint32(
     zerofg_multiplier, 2,

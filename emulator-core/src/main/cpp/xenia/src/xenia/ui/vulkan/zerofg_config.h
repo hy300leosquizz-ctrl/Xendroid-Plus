@@ -20,19 +20,13 @@ DECLARE_bool(zerofg_vsync_retire);
 DECLARE_bool(zerofg_mfg_tick_retire);
 // MFG: the most outputs per pair the user allows (2, 3 or 4; an internal build with kZeroFGMfgMaxN 4 reads it).
 DECLARE_uint32(zerofg_multiplier);
-// Zero's switches (MFG test branch), zerofg::CreateInfo::zero_options: a change rebuilds ZeroFG.
-DECLARE_bool(zerofg_zero_light);
-DECLARE_bool(zerofg_zero_quarter_base);
-
 namespace xe::ui::vulkan {
 
 enum class ZeroFGSelection { kOff, kZero, kReallyZero };
 
-// zerofg::kZeroLight 1, zerofg::kZeroQuarterBase 2.
-inline uint32_t ZeroFGZeroOptions() {
-  return (cvars::zerofg_zero_light ? 1u : 0u) |
-         (cvars::zerofg_zero_quarter_base ? 2u : 0u);
-}
+// zerofg::CreateInfo::zero_options. The owner, 2026-11-21: ReallyZero (RZ+) is the product's Zero; the old Zero stays as "Heavy Zero"
+// for his tests, in full: no Zero light (kZeroLight) and no x4 quarters from the base (kZeroQuarterBase), both retired with their switches.
+inline uint32_t ZeroFGZeroOptions() { return 0u; }
 
 inline ZeroFGSelection StartupZeroFGSelection() {
   const std::string& mode = cvars::zerofg_mode;

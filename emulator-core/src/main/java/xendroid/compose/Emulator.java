@@ -85,9 +85,6 @@ public class Emulator extends xendroid.emulator.Emulator{
     // MFG: the multiplier ceiling, 2 to 4 (internal test branch); read by the presenter at its next reanchor.
     public native void set_zerofg_multiplier(int n);
     public native int zerofg_multiplier();
-    // Zero's switches (MFG test branch): bit 1 Zero light, bit 2 x4's quarters from the base. A change rebuilds ZeroFG.
-    public native void set_zerofg_zero_options(int options);
-    public native int zerofg_zero_options();
     public native boolean zerofg_main_surface_active();
     public native double output_fps();
     public native long[] presentation_state();
