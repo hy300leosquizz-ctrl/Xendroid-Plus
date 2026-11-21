@@ -16,9 +16,9 @@ object SettingsSchema {
 
         SettingsCategory("ZeroFG", listOf(
             l("Vulkan", "zerofg_mode", "Frame generation (ZeroFG)", "off",
-                "off" to "Off", "reallyzero" to "Zero", "zero" to "Heavy Zero (test)"),
+                "off" to "Off", "reallyzero" to "On"),
             l("Vulkan", "zerofg_multiplier", "Frame generation multiplier", "2",
-                "2" to "x2", "3" to "x3 (internal test)", "4" to "x4 (internal test)"),
+                "2" to "x2", "3" to "x3", "4" to "x4"),
             b("Vulkan", "zerofg_mfg_tick_retire", "MFG: keep latency from getting stuck (internal test)", true),
             b("Vulkan", "zerofg_vsync_retire", "MFG: drop a late generated frame to keep latency (internal test)", false),
         )),

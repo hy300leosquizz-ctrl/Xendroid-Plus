@@ -3285,7 +3285,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 }
             }),
             InGameAction.ZEROFG to MenuValue(options = listOf(off,
-                stringResource(R.string.menu_zerofg_reallyzero), stringResource(R.string.menu_zerofg_zero)),
+                stringResource(R.string.menu_zerofg_reallyzero)),
                 selected = zeroFgMode.value.value, own = ZEROFG_KEY in own,
                 note = if (zeroFgMode.value != ZeroFgMode.OFF) zeroFgStatus() else null),
             InGameAction.ZEROFG_MULTIPLIER to MenuValue(text = "x${zeroFgMultiplier.intValue}",

@@ -114,7 +114,7 @@ DEFINE_bool(
     "Vulkan");
 DEFINE_bool(zerofg_frame_generation, false,
             "Enable the independent ZeroFG presenter.", "Vulkan");
-DEFINE_string(zerofg_mode, "off", "ZeroFG: off, reallyzero (shown as Zero: RZ+, the product), zero (shown as Heavy Zero: the layered RC7 in full, for tests).", "Vulkan");
+DEFINE_string(zerofg_mode, "off", "ZeroFG frame generation: off or on (\"reallyzero\"; earlier names that meant on, \"zero\" included, also turn it on).", "Vulkan");
 DEFINE_bool(zerofg_guest_vblank_pull, true, "Use the validated guest vblank pull while ZeroFG is live.", "Vulkan");
 DEFINE_bool(zerofg_vsync_tight_reach, false, "Optional tight reach; disabled by default.", "Vulkan");
 DEFINE_bool(

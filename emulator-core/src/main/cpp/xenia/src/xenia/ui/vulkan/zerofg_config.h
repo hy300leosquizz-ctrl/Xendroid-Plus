@@ -24,8 +24,7 @@ namespace xe::ui::vulkan {
 
 enum class ZeroFGSelection { kOff, kZero, kReallyZero };
 
-// zerofg::CreateInfo::zero_options. The owner, 2026-11-21: ReallyZero (RZ+) is the product's Zero; the old Zero stays as "Heavy Zero"
-// for his tests, in full: no Zero light (kZeroLight) and no x4 quarters from the base (kZeroQuarterBase), both retired with their switches.
+// zerofg::CreateInfo::zero_options: none (Zero light and the x4 quarters were retired with the old Zero, which no mode selects now).
 inline uint32_t ZeroFGZeroOptions() { return 0u; }
 
 inline ZeroFGSelection StartupZeroFGSelection() {
@@ -33,18 +32,11 @@ inline ZeroFGSelection StartupZeroFGSelection() {
   if (mode == "off") {
     return ZeroFGSelection::kOff;
   }
-  if (mode == "zero" || mode == "rc3") {
-    return ZeroFGSelection::kZero;
-  }
-  if (mode == "reallyzero" || mode == "rc3_lite") {
+  // The owner, 2026-11-21: ZeroFG is On or Off, and On is RZ+ (the core's ReallyZero). Every earlier name that meant on, the old Zero
+  // ("zero", Heavy Zero in the test builds) included, keeps frame generation on with RZ+.
+  if (mode == "reallyzero" || mode == "rc3_lite" || mode == "zero" || mode == "rc3" || mode == "subzero" || mode == "rc1" ||
+      mode == "rc1_golden" || mode == "rc1_test" || mode == "rc2" || (mode.empty() && cvars::zerofg_frame_generation)) {
     return ZeroFGSelection::kReallyZero;
-  }
-  // Earlier releases wrote other variant names (or only the boolean); a
-  // configuration that had frame generation on keeps it on, as Zero.
-  if (mode == "subzero" || mode == "rc1" || mode == "rc1_golden" ||
-      mode == "rc1_test" || mode == "rc2" ||
-      (mode.empty() && cvars::zerofg_frame_generation)) {
-    return ZeroFGSelection::kZero;
   }
   return ZeroFGSelection::kOff;
 }
@@ -61,8 +53,8 @@ inline void RequestZeroFGMode(uint32_t mode) {
 inline ZeroFGSelection GetZeroFGSelection() {
   switch (ZeroFGRuntimeModeOverride().load(std::memory_order_acquire)) {
     case 0: return ZeroFGSelection::kOff;
-    case 1: return ZeroFGSelection::kReallyZero;
-    case 2: return ZeroFGSelection::kZero;
+    case 1:
+    case 2: return ZeroFGSelection::kReallyZero;  // On is RZ+ (see StartupZeroFGSelection)
     default: return StartupZeroFGSelection();
   }
 }
