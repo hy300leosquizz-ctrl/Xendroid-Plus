@@ -1,9 +1,11 @@
 # ZeroFG source snapshot
 
-This directory contains the ZeroFG engine of the MFG development branch `mfg/core` (local, at `3376106`). It is not published yet. It sits on top of v1.1.0 and the
-license commit `10e68b6`. ZeroFG is `Apache-2.0 OR GPL-2.0-or-later` since that commit; it is used here under Apache-2.0, `LICENSE`.
+This directory contains the engine of ZeroFG **v1.2.0** (https://github.com/hy300leosquizz-ctrl/ZeroFG/releases/tag/v1.2.0),
+taken from the MFG branch `mfg/core` at `3376106`, the engine commit of that release (v1.2.0 differs from it only by the version in
+`CMakeLists.txt`). It sits on top of v1.1.0 and the license commit `10e68b6`. ZeroFG is `Apache-2.0 OR GPL-2.0-or-later` since that
+commit; it is used here under Apache-2.0, `LICENSE`.
 
-The branch adds:
+Over v1.1.0 it adds:
 - any phase between the Reals (x3 / x4), with the same-pair contract;
 - Zero's screen by cells (`kHudCells`);
 - Zero's light gain (`kLightGain`);
@@ -19,8 +21,7 @@ The branch adds:
   not to correlate (a wipe interpolates, as Zero's kCutLit).
 
 At the middle, with the switches off (`kHudCells`, `kLightGain`, `kStopStill` 0; `kBaseClean` 1), it is bit-identical to v1.1.0, except on the pairs the old cut rule took for cuts and `kCutLit` or `kCutCost` do not. The engine sources, public headers, shader sources, shipped SPIR-V
-headers, shader compiler and CMake file are that branch's, byte for byte. Until it is published this snapshot is for internal builds, and
-the published v1.1.0 snapshot is `f9b0b5cef`.
+headers, shader compiler and CMake file are that commit's, byte for byte. The v1.1.0 snapshot it replaces was `f9b0b5cef`.
 
 No laboratory recordings, runtime binaries, device identifiers or experimental environment controls are included.
 
@@ -33,11 +34,10 @@ Product mapping in this integration:
 | User choice | Core mode |
 |---|---|
 | Off | Native Xendroid+ presentation |
-| ReallyZero | `zerofg::Mode::kReallyZero` (the dense optical flow) |
-| Zero | `zerofg::Mode::kZero` (RC7, the layered engine) |
+| On, x2 / x3 / x4 | `zerofg::Mode::kReallyZero` (RZ+, the engine of v1.2.0), N - 1 frames between two of the game's |
 
-The integration names them `Mode::kDenseFlow` and `Mode::kRC7`, the same engines
-under their development names. One interpolator serves the selected mode, with
+The layered engine (`zerofg::Mode::kZero`, RC7) is still in the snapshot but no longer offered: RZ+ matches or beats it at a
+fraction of the cost. The integration names the modes `Mode::kDenseFlow` and `Mode::kRC7`, their development names. One interpolator serves the selected mode, with
 per-flight descriptors. Recordings are submitted serially in their recording
 order; an abandoned recording cannot be followed by a retry using its retained
 history. Mode changes drain the old session before recreating generation state.
