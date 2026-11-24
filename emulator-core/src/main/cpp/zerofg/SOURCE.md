@@ -1,11 +1,20 @@
 # ZeroFG source snapshot
 
-This directory contains the engine of ZeroFG **v1.2.0** (https://github.com/hy300leosquizz-ctrl/ZeroFG/releases/tag/v1.2.0),
-taken from the MFG branch `mfg/core` at `3376106`, the engine commit of that release (v1.2.0 differs from it only by the version in
-`CMakeLists.txt`). It sits on top of v1.1.0 and the license commit `10e68b6`. ZeroFG is `Apache-2.0 OR GPL-2.0-or-later` since that
+This directory contains the engine of ZeroFG **1.2.1 (test build)**: the branch `1.2.1` at `4edb614`, on top of the MFG branch
+`mfg/core` at `4f761e8` (1.2g, the HUD layer at every phase), itself on top of the engine of **v1.2.0** (`3376106`,
+https://github.com/hy300leosquizz-ctrl/ZeroFG/releases/tag/v1.2.0). It sits on top of v1.1.0 and the license commit `10e68b6`.
+
+Over v1.2.0, 1.2.1 adds two RZ+ product options (the public API is unchanged):
+- the flow guided by colour at motion edges (`DF_PRODUCT_OPTS 256`): the coarse flow is upsampled by its own picture's colour, so
+  the square blocks of motion at an edge round off;
+- the occlusion halo disguised as the background's motion (`DF_PRODUCT_OPTS 512`): beside a character the camera carries, the
+  cleanup's blur becomes a fill fetched from both Reals along one elected background motion (a new pass, `df_halo`, decides per
+  4 x 4 block), clamped to the colours already around it.
+
+ZeroFG is `Apache-2.0 OR GPL-2.0-or-later` since that
 commit; it is used here under Apache-2.0, `LICENSE`.
 
-Over v1.1.0 it adds:
+The earlier history: over v1.1.0, v1.2.0 adds:
 - any phase between the Reals (x3 / x4), with the same-pair contract;
 - Zero's screen by cells (`kHudCells`);
 - Zero's light gain (`kLightGain`);
@@ -21,7 +30,7 @@ Over v1.1.0 it adds:
   not to correlate (a wipe interpolates, as Zero's kCutLit).
 
 At the middle, with the switches off (`kHudCells`, `kLightGain`, `kStopStill` 0; `kBaseClean` 1), it is bit-identical to v1.1.0, except on the pairs the old cut rule took for cuts and `kCutLit` or `kCutCost` do not. The engine sources, public headers, shader sources, shipped SPIR-V
-headers, shader compiler and CMake file are that commit's, byte for byte. The v1.1.0 snapshot it replaces was `f9b0b5cef`.
+headers, shader compiler and CMake file are those of `4edb614`, byte for byte. The snapshots before it were `3376106` (v1.2.0) and `f9b0b5cef` (v1.1.0).
 
 No laboratory recordings, runtime binaries, device identifiers or experimental environment controls are included.
 
@@ -34,7 +43,7 @@ Product mapping in this integration:
 | User choice | Core mode |
 |---|---|
 | Off | Native Xendroid+ presentation |
-| On, x2 / x3 / x4 | `zerofg::Mode::kReallyZero` (RZ+, the engine of v1.2.0), N - 1 frames between two of the game's |
+| On, x2 / x3 / x4 | `zerofg::Mode::kReallyZero` (RZ+, the engine of 1.2.1), N - 1 frames between two of the game's |
 
 The layered engine (`zerofg::Mode::kZero`, RC7) is still in the snapshot but no longer offered: RZ+ matches or beats it at a
 fraction of the cost. The integration names the modes `Mode::kDenseFlow` and `Mode::kRC7`, their development names. One interpolator serves the selected mode, with
