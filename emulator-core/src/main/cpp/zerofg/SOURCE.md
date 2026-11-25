@@ -1,13 +1,14 @@
 # ZeroFG source snapshot
 
-This directory contains the engine of ZeroFG **1.2.1 (test build)**: the branch `1.2.1` at `4edb614`, on top of the MFG branch
-`mfg/core` at `4f761e8` (1.2g, the HUD layer at every phase), itself on top of the engine of **v1.2.0** (`3376106`,
+This directory contains the engine of ZeroFG **v1.2.1** (`c5e9b64`,
+https://github.com/hy300leosquizz-ctrl/ZeroFG/releases/tag/v1.2.1), on top of the MFG branch `mfg/core` at `4f761e8` (1.2g, the
+HUD layer at every phase), itself on top of the engine of **v1.2.0** (`3376106`,
 https://github.com/hy300leosquizz-ctrl/ZeroFG/releases/tag/v1.2.0). It sits on top of v1.1.0 and the license commit `10e68b6`.
 
 Over v1.2.0, 1.2.1 adds two RZ+ product options (the public API is unchanged):
 - the flow guided by colour at motion edges (`DF_PRODUCT_OPTS 256`): the coarse flow is upsampled by its own picture's colour, so
   the square blocks of motion at an edge round off;
-- the occlusion halo disguised as the background's motion (`DF_PRODUCT_OPTS 512`): beside a character the camera carries, the
+- the **Advanced VTF Filter** (Vector Trail Fill, `DF_PRODUCT_OPTS 512`), the occlusion halo disguised as the background's motion: beside a character the camera carries, the
   cleanup's blur becomes a fill fetched from both Reals along one elected background motion (a new pass, `df_halo`, decides per
   4 x 4 block), clamped to the colours already around it.
 
@@ -30,7 +31,8 @@ The earlier history: over v1.1.0, v1.2.0 adds:
   not to correlate (a wipe interpolates, as Zero's kCutLit).
 
 At the middle, with the switches off (`kHudCells`, `kLightGain`, `kStopStill` 0; `kBaseClean` 1), it is bit-identical to v1.1.0, except on the pairs the old cut rule took for cuts and `kCutLit` or `kCutCost` do not. The engine sources, public headers, shader sources, shipped SPIR-V
-headers, shader compiler and CMake file are those of `4edb614`, byte for byte. The snapshots before it were `3376106` (v1.2.0) and `f9b0b5cef` (v1.1.0).
+headers, shader compiler and CMake file are those of `c5e9b64` (v1.2.1), byte for byte. The snapshots before it were `4edb614` (the 1.2.1
+test build, the same code), `3376106` (v1.2.0) and `f9b0b5cef` (v1.1.0).
 
 No laboratory recordings, runtime binaries, device identifiers or experimental environment controls are included.
 
