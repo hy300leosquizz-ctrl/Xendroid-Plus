@@ -142,7 +142,7 @@ DEFINE_bool(zerofg_frame_generation, false,
             "Enable the independent ZeroFG presenter.", "Vulkan");
 DEFINE_string(zerofg_mode, "off", "ZeroFG frame generation: off or on (\"reallyzero\"; earlier names that meant on, \"zero\" included, also turn it on).", "Vulkan");
 DEFINE_bool(zerofg_guest_vblank_pull, true, "Use the validated guest vblank pull while ZeroFG is live.", "Vulkan");
-DEFINE_bool(zerofg_vsync_tight_reach, false, "Optional tight reach; disabled by default.", "Vulkan");
+DEFINE_bool(zerofg_tight_reach_on, true, "Tight reach (2026-11-27 pacing test, on): the vsync quantizer reaches a vsync with a refresh and 2 ms of lead or the copy tail, whichever is longer, instead of their sum; it falls back to the sum for the session past 5 % late. Renamed from zerofg_vsync_tight_reach, which shipped off.", "Vulkan");
 DEFINE_bool(
     zerofg_free_output, true,
     "Main Surface: the pipeline never waits for the panel. An output is copied "
@@ -175,14 +175,17 @@ DEFINE_bool(
     "frames are never dropped.",
     "Vulkan");
 DEFINE_bool(
-    zerofg_vsync_retire, false,
+    zerofg_pushed_phase_retire, true,
     "Main Surface (MFG test branch, the owner 2026-11-19): when every vsync "
     "already has an output (N x the game's rate = the refresh: x4 30 on "
     "120 Hz, x3 on 90, x2 30 on 60), a late output pushed the vsync "
     "quantizer's phase for good (latency wells of 120-216 ms in Gears of War 3 "
     "at x4). On, a generated frame whose own vsync is already taken while the "
     "phase is pushed (or for the second output in a row) is not shown, and "
-    "the phase steps one refresh back. Reals are never dropped. Read when "
+    "the phase steps one refresh back. Also (2026-11-27) a pushed phase the "
+    "next output could reach one vsync earlier under the tight reach, 8 "
+    "outputs in a row, sheds a refresh the same way. Reals are never "
+    "dropped. Renamed from zerofg_vsync_retire, which shipped off. Read when "
     "ZeroFG's output starts (switch frame generation off and on to apply).",
     "Vulkan");
 DEFINE_uint32(

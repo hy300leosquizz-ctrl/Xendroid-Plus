@@ -479,6 +479,14 @@ struct ZeroFGIndependentPresenter::Impl {
   static constexpr uint32_t kBetterDMinSamples = 32;
   static constexpr size_t kBetterDWindowCapacity = 128;
   static constexpr uint64_t kBetterDFMaxNs = 32000000ull;
+  // The most D may operate at (ApplyBetterDSetpoint): a 20 fps source's need.
+  static constexpr uint64_t kBetterDCeilingNs = 60000000ull;
+  // Vsync snap (ApplyPendingSourcePhaseReanchor): how far past a vsync the first
+  // target plus the egress lead may land and still be pulled back to it, and the
+  // margin it then keeps before that vsync.
+  static constexpr uint64_t kVsyncSnapNs = 3500000ull;
+  static constexpr uint64_t kVsyncSnapMarginNs = 300000ull;
+  static constexpr uint64_t kVsyncSnapSpacingNs = 2000000000ull;
   static constexpr uint32_t kBetterDStepDivisor = 64;
   static constexpr uint32_t kBetterDArmDivisor = 4;
   static constexpr uint64_t kBetterDMarginNs = 1000000ull;
@@ -3133,8 +3141,8 @@ struct ZeroFGIndependentPresenter::Impl {
         // with free output and the vsync quantizer its push stacks on the
         // quantizer's lead (35-75 ms, Arkham 2026-10-07), so it stays off.
         /*apocalypse_guard=*/false, cvars::zerofg_free_output,
-        cvars::zerofg_vsync_quantizer, cvars::zerofg_vsync_tight_reach,
-        cvars::zerofg_vsync_retire,
+        cvars::zerofg_vsync_quantizer, cvars::zerofg_tight_reach_on,
+        cvars::zerofg_pushed_phase_retire,
         [egress_bridge]() { SignalPresenterWake(egress_bridge); });
     const bool egress_started = egress->Start();
     if (egress_started) {
@@ -10507,7 +10515,13 @@ struct ZeroFGIndependentPresenter::Impl {
       ++better_d_f_ceiling_exit_total;
     }
     const uint64_t causal_ns = BetterDCausalNs();
-    const uint64_t d_ns = SaturatingAddNs(causal_ns, better_d_f_ns);
+    // The owner's ceiling (2026-11-27, pacing-shadow test): D never past what a
+    // 20 fps source needs (half its 50 ms pair, the generation and a margin).
+    // An erratic source (Daytona on Xendroid+ at 10-60 fps) taught a need of
+    // 65-86 ms at the median and D 70-110 ms; past the ceiling a late B costs
+    // its pair's synthetic (judder), not every Real's latency.
+    const uint64_t d_ns =
+        std::min(SaturatingAddNs(causal_ns, better_d_f_ns), kBetterDCeilingNs);
     better_d_causal_last_ns = causal_ns;
     latency_required_last_ns = causal_ns;
     operating_latency_ns = d_ns;
@@ -11436,6 +11450,44 @@ struct ZeroFGIndependentPresenter::Impl {
     if (!first_target_ns ||
         first_target_ns == std::numeric_limits<uint64_t>::max()) {
       return false;
+    }
+    // Vsync snap (the owner 2026-11-27, option A): an output shows on the first
+    // vsync at or after its target plus the egress lead. When the lattice's
+    // first target lands that sum just past a vsync (by up to kVsyncSnapNs),
+    // the epoch starts early enough to make that vsync instead: a refresh of
+    // latency for that much less readiness. Never below the ordered floor.
+    if (main_surface_egress) {
+      uint64_t grid_anchor_ns = 0, grid_period_ns = 0, grid_lead_ns = 0;
+      // Only for a steady Source (phase recovery trusts its rate estimate) and
+      // at most once per kVsyncSnapSpacingNs: on Spider-Man (ARMSX2, ~50 fps
+      // wandering, 2026-11-27) the snap made outputs late enough to set phase
+      // recovery reanchoring 4x as often (605 against 142) and the Real age p99
+      // rose 83 -> 96 ms; on Daytona's steady 60 it took 7 ms off the median.
+      const uint64_t snap_now_ns = PresenterMonotonicTimeNs();
+      if (phase_recovery_trusted_period_ns &&
+          snap_now_ns - vsync_snap_last_ns >= kVsyncSnapSpacingNs &&
+          main_surface_egress->VsyncGrid(grid_anchor_ns, grid_period_ns,
+                                         grid_lead_ns)) {
+        const uint64_t due_ns = first_target_ns + grid_lead_ns;
+        const uint64_t past_ns =
+            due_ns >= grid_anchor_ns
+                ? (due_ns - grid_anchor_ns) % grid_period_ns
+                : (grid_period_ns - (grid_anchor_ns - due_ns) % grid_period_ns) %
+                      grid_period_ns;
+        const uint64_t floor_ns =
+            ordered_boundary_ns
+                ? SaturatingAddNs(ordered_boundary_ns, new_output_quantum_ns)
+                : 0;
+        const uint64_t step_ns = past_ns + kVsyncSnapMarginNs;
+        if (past_ns && past_ns <= kVsyncSnapNs && first_target_ns > step_ns &&
+            first_target_ns - step_ns >= std::max(floor_ns, cutover_floor_ns)) {
+          first_target_ns -= step_ns;
+          ++vsync_snap_total;
+          vsync_snap_last_ns = snap_now_ns;
+        } else {
+          ++vsync_snap_skipped_total;
+        }
+      }
     }
     // The reanchor cutover. The first Real committed in the new epoch keeps
     // its predecessor and S(A->B) in the old epoch, so its causal floor is its
@@ -16540,6 +16592,27 @@ struct ZeroFGIndependentPresenter::Impl {
     request.latency_generation = generation;
     request.desired_present_ns = present_not_before_ns;
     request.output_quantum_ns = logical.candidate.semantic_output_quantum_ns;
+    // Shadow reservation (egress, observation only): where this pair's Real B
+    // is due after a Synthetic, and the operated depth D.
+    if (request.synthetic && logical.candidate.mfg_n > logical.candidate.mfg_k) {
+      request.next_real_offset_ns =
+          uint64_t(logical.candidate.mfg_n - logical.candidate.mfg_k) *
+          logical.candidate.semantic_output_quantum_ns;
+    }
+    request.operated_depth_ns = logical.operating_latency_ns;
+    // Better D's split for the summary line (on Reals only, so the quantiles
+    // are taken at the source's rate): the qualified need's median and p95
+    // (0 while the window is not ready) and the margin F.
+    if (!request.synthetic) {
+      if (BetterDWindowReady()) {
+        request.d_need_p50_ns = better_d_need_ns.Quantile(50, 100);
+        request.d_need_p95_ns = better_d_need_ns.Quantile(95, 100);
+        request.d_need_samples = uint32_t(better_d_need_ns.count());
+      }
+      request.d_margin_ns = better_d_f_ns;
+      request.vsync_snaps = vsync_snap_total;
+      request.vsync_snaps_skipped = vsync_snap_skipped_total;
+    }
     request.image = output.image;
     request.post_semaphore = output.post_completion_semaphore;
     request.post_value = output.post_completion_value;
@@ -19844,6 +19917,11 @@ struct ZeroFGIndependentPresenter::Impl {
   uint32_t mfg_short_pending_count = 0;
   bool mfg_short_rest = false;
   uint64_t mfg_short_pair_total = 0;
+  // Vsync snap: reanchors whose first target was pulled back to a vsync, and
+  // those the grid knew of but could not (past the window, or a floor).
+  uint64_t vsync_snap_total = 0;
+  uint64_t vsync_snap_skipped_total = 0;
+  uint64_t vsync_snap_last_ns = 0;
   uint64_t mfg_short_real_only_total = 0;
   uint32_t mfg_desired_n = 0;  // a different N the rule wants, and since when (debounce)
   uint64_t mfg_desired_since_ns = 0;

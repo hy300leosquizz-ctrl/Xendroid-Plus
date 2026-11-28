@@ -15,8 +15,8 @@ DECLARE_bool(zerofg_guest_vblank_pull);
 DECLARE_bool(zerofg_phase_recovery);
 DECLARE_bool(zerofg_free_output);
 DECLARE_bool(zerofg_vsync_quantizer);
-DECLARE_bool(zerofg_vsync_tight_reach);
-DECLARE_bool(zerofg_vsync_retire);
+DECLARE_bool(zerofg_tight_reach_on);
+DECLARE_bool(zerofg_pushed_phase_retire);
 DECLARE_bool(zerofg_mfg_tick_retire);
 // MFG: the most outputs per pair the user allows (2, 3 or 4; an internal build with kZeroFGMfgMaxN 4 reads it).
 DECLARE_uint32(zerofg_multiplier);
